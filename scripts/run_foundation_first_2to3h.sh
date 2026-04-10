@@ -11,16 +11,16 @@ Usage:
 
 Description:
   Foundation-first 2-3 hour launcher:
-    Stage A: no_att foundation short horizon
-    Stage B: no_att foundation longer horizon
-    Stage C: short fix_rule bridge check
-    Stage D: no_att consolidation
-    Stage E: fix_rule verification
+    Stage A: no_att fast-finish foundation
+    Stage B: no_att pressure consolidation
+    Stage C: no_att extension at bridge horizon
+    Stage D: short fix_rule bridge check
+    Stage E: short fix_rule verification
 
 Options:
   --run-id <id>             Master run id. Default: current timestamp.
   --seed <int>              Random seed. Default: 42
-  --headless <0|1>          1=dummy SDL. Default: 1
+  --headless <0|1>          1=dummy SDL, 0=enable pygame render. Default: 1
   --fresh-start             Start Stage A from scratch.
   --clean-model             Delete model/*.pkl before start (use with --fresh-start).
   --keep-checkpoints <int>  Keep latest N checkpoints. Default: 20
@@ -181,6 +181,10 @@ run_stage() {
     --summary_json "$summary_json"
   )
 
+  if [[ "$HEADLESS" == "0" ]]; then
+    cmd+=(--render)
+  fi
+
   if [[ "$stage_tag" == "stageA_noatt_foundation_s300" ]]; then
     if [[ "$FRESH_START" == "1" ]]; then
       cmd+=(--fresh_start)
@@ -198,14 +202,14 @@ if [[ "$CLEAN_MODEL" == "1" ]]; then
 fi
 
 log "start run_id=$RUN_ID seed=$SEED headless=$HEADLESS fresh_start=$FRESH_START keep_checkpoints=$KEEP_CHECKPOINTS"
-log "strategy: no_att foundation -> no_att extension -> short fix bridge -> no_att consolidation -> fix verification"
+log "strategy: stronger no_att foundation -> no_att pressure -> no_att bridge horizon -> short fix bridge -> short fix verification"
 log "target wall-time: about 2-3 hours (machine-dependent)"
 
-run_stage "stageA_noatt_foundation_s300" fix_rule_no_att 80 300 0.00045 0.99 25 0.16 -0.00001
-run_stage "stageB_noatt_extension_s450" fix_rule_no_att 80 450 0.00035 0.99 20 0.12 -0.00001
-run_stage "stageC_fix_bridge_s450" fix_rule 25 450 0.00025 0.99 12 0.20 -0.00001
-run_stage "stageD_noatt_consolidation_s450" fix_rule_no_att 30 450 0.00030 0.99 20 0.10 -0.000008
-run_stage "stageE_fix_verify_s550" fix_rule 45 550 0.00020 0.99 10 0.18 -0.000008
+run_stage "stageA_noatt_foundation_s300" fix_rule_no_att 120 300 0.00040 0.99 20 0.12 -0.000008
+run_stage "stageB_noatt_pressure_s350" fix_rule_no_att 110 350 0.00030 0.99 16 0.08 -0.000006
+run_stage "stageC_noatt_bridgeprep_s450" fix_rule_no_att 70 450 0.00025 0.99 14 0.06 -0.000005
+run_stage "stageD_fix_bridge_s450" fix_rule 18 450 0.00020 0.99 12 0.14 -0.000006
+run_stage "stageE_fix_verify_s550" fix_rule 24 550 0.00018 0.99 10 0.12 -0.000005
 
 log "finished all stages"
 log "master log: $MASTER_LOG"
