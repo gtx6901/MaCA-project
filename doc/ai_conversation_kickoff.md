@@ -31,6 +31,7 @@
 - 单次训练主脚本：`scripts/train_dqn_pipeline.py`
 - 课程式自动训练：`scripts/run_curriculum_autotrain.sh`
 - 2-3 小时基础优先训练封装：`scripts/run_foundation_first_2to3h.sh`
+- 1-2 小时 fix 主导混合训练封装：`scripts/run_fix_mixed_1to2h.sh`
 
 ## 4. 当前已完成的核心改造
 
@@ -56,6 +57,14 @@
   - `ALL fix`: `n=268, win=0.000, avg_steps=373.8, timeout_rate=0.291, reward_last20≈-12098.7`
   - 结论：`fix_rule` 仍未赢，但总奖励显著改善，`-2000` 级惨败占比从 `0.833` 降到 `0.712`，说明结构改动方向正确；下一步应改为 `no_att` 基础优先训练，而不是继续 fix-heavy。
 
+- `run_id=20260410_142256`（超长 foundation-first，GPU headless）
+  - `ALL noatt`: `n=1770, win=0.766, avg_steps=321.0, timeout_rate=0.999, reward_last20≈85812.3`
+  - `ALL fix`: `n=320, win=0.000, avg_steps=252.7, timeout_rate=0.256, reward_last20≈-16778.8`
+  - 结论：长时间纯 `no_att` 预训练会明显强化“生存/拿分”，但没有学到“对真实攻击敌人取胜”；一进入 `fix_rule` 仍会快速崩掉。后续默认方向应改为：
+    - 只保留较短的 `no_att` foundation
+    - 尽快转入 `fix_rule` 主导的交替训练
+    - 不再把 `foundation-first` 作为首选主线
+
 日志位置：
 - `log/overnight_2to3h_20260410_094147.log`
 - `log/auto_curriculum_20260410_094147_phaseA.log`
@@ -69,6 +78,11 @@
 3. 每轮优先只改 `1-3` 个关键参数，避免一次改太多。  
 4. 给我可直接运行的命令（含 `nohup`、`tail -f`、`stop`）。  
 5. 如果要大改（网络结构/奖励函数），先说明理由和风险。  
+
+当前默认建议入口：
+
+- 优先用 `scripts/run_fix_mixed_1to2h.sh` 做新策略验证
+- `scripts/run_foundation_first_1h.sh` / `scripts/run_foundation_first_2to3h.sh` 保留作历史基线，不再作为首选
 
 ## 7. 常用命令模板
 

@@ -186,24 +186,49 @@ analyze_metrics_json() {
   python - "$metrics_csv" <<'PY'
 import csv
 import json
+import os
+import re
 import sys
 
 p = sys.argv[1]
 rows = list(csv.DictReader(open(p)))
 if not rows:
-    print(json.dumps({"epochs": 0, "win_rate_all": 0.0, "win_rate_last10": 0.0, "win_rate_last20": 0.0, "reward_last10": 0.0}))
+    print(json.dumps({
+        "epochs": 0,
+        "win_rate_all": 0.0,
+        "win_rate_last10": 0.0,
+        "win_rate_last20": 0.0,
+        "reward_last10": 0.0,
+        "reward_last20": 0.0,
+        "avg_steps": 0.0,
+        "timeout_rate": 0.0,
+        "totally_lose_rate": 0.0,
+        "lose_rate": 0.0,
+        "draw_rate": 0.0,
+    }))
     raise SystemExit(0)
 
 win = [int(r["red_win"]) for r in rows]
 tr = [float(r["total_reward"]) for r in rows]
+steps = [int(r["steps"]) for r in rows]
+rr = [int(r["red_round_reward"]) for r in rows]
 k10 = min(10, len(rows))
 k20 = min(20, len(rows))
+base = os.path.basename(p)
+m = re.search(r"_s(\d+)\.csv$", base)
+cap = int(m.group(1)) if m else max(steps)
 out = {
     "epochs": len(rows),
     "win_rate_all": sum(win) / len(rows),
     "win_rate_last10": sum(win[-k10:]) / k10,
     "win_rate_last20": sum(win[-k20:]) / k20,
     "reward_last10": sum(tr[-k10:]) / k10,
+    "reward_last20": sum(tr[-k20:]) / k20,
+    "avg_steps": sum(steps) / len(rows),
+    "timeout_rate": sum(1 for s in steps if s >= cap) / len(rows),
+    "totally_lose_rate": sum(1 for x in rr if x == -2000) / len(rows),
+    "lose_rate": sum(1 for x in rr if x == -1000) / len(rows),
+    "draw_rate": sum(1 for x in rr if x == -1500) / len(rows),
 }
 print(json.dumps(out))
 PY
@@ -313,8 +338,14 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
   win_last10="$(json_get "$analysis_json" "win_rate_last10")"
   win_last20="$(json_get "$analysis_json" "win_rate_last20")"
   reward_last10="$(json_get "$analysis_json" "reward_last10")"
+  reward_last20="$(json_get "$analysis_json" "reward_last20")"
+  avg_steps="$(json_get "$analysis_json" "avg_steps")"
+  timeout_rate="$(json_get "$analysis_json" "timeout_rate")"
+  totally_lose_rate="$(json_get "$analysis_json" "totally_lose_rate")"
+  lose_rate="$(json_get "$analysis_json" "lose_rate")"
+  draw_rate="$(json_get "$analysis_json" "draw_rate")"
 
-  echo "[AutoTrain] fix_block_metrics cycle=$cycle max_step=$fix_step win_all=$win_all win_last10=$win_last10 win_last20=$win_last20 reward_last10=$reward_last10" | tee -a "$MASTER_LOG"
+  echo "[AutoTrain] fix_block_metrics cycle=$cycle max_step=$fix_step win_all=$win_all win_last10=$win_last10 win_last20=$win_last20 avg_steps=$avg_steps timeout_rate=$timeout_rate reward_last10=$reward_last10 reward_last20=$reward_last20 totally_lose=$totally_lose_rate lose=$lose_rate draw=$draw_rate" | tee -a "$MASTER_LOG"
 
   pass_gate="$(float_ge "$win_last10" "$GATE_WIN_LAST10")"
   should_ramp=0
