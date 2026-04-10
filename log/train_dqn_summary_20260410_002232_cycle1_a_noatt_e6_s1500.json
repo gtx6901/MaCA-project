@@ -1,0 +1,10 @@
+{
+  "epochs": 6,
+  "map": "maps/1000_1000_fighter10v10.map",
+  "opponent": "fix_rule_no_att",
+  "seed": 42,
+  "metrics_csv": "log/train_dqn_metrics_20260410_002232_cycle1_a_noatt_e6_s1500.csv",
+  "latest_checkpoint": "model/simple/model_000005900.pkl",
+  "fixed_model_path": "model/simple/model.pkl",
+  "elapsed_sec": 69.1
+}
