@@ -7,14 +7,14 @@ cd "$ROOT_DIR"
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/run_foundation_first_2to3h.sh [options]
+  bash scripts/run_foundation_first_1h.sh [options]
 
 Description:
-  Foundation-first 2-3 hour launcher:
+  ~1 hour foundation-first launcher:
     Stage A: no_att fast-finish foundation
     Stage B: no_att pressure consolidation
-    Stage C: no_att extension at bridge horizon
-    Stage D: short fix_rule bridge check
+    Stage C: no_att bridge preparation
+    Stage D: very short fix_rule bridge
     Stage E: short fix_rule verification
 
 Options:
@@ -23,7 +23,7 @@ Options:
   --headless <0|1>          1=dummy SDL, 0=enable pygame render. Default: 1
   --fresh-start             Start Stage A from scratch.
   --clean-model             Delete model/*.pkl before start (use with --fresh-start).
-  --keep-checkpoints <int>  Keep latest N checkpoints. Default: 20
+  --keep-checkpoints <int>  Keep latest N checkpoints. Default: 16
   --help                    Show this help.
 EOF
 }
@@ -33,7 +33,7 @@ SEED=42
 HEADLESS=1
 FRESH_START=0
 CLEAN_MODEL=0
-KEEP_CHECKPOINTS=20
+KEEP_CHECKPOINTS=16
 EST_GPU_HEADLESS_STEPS_PER_MIN="${EST_GPU_HEADLESS_STEPS_PER_MIN:-6500}"
 EST_GPU_GUI_STEPS_PER_MIN="${EST_GPU_GUI_STEPS_PER_MIN:-4000}"
 
@@ -66,11 +66,11 @@ else
 fi
 
 mkdir -p log model/backup model/simple
-MASTER_LOG="log/foundation_first_2to3h_${RUN_ID}.log"
+MASTER_LOG="log/foundation_first_1h_${RUN_ID}.log"
 touch "$MASTER_LOG"
 
 log() {
-  echo "[FoundationFirst] $*" | tee -a "$MASTER_LOG"
+  echo "[Foundation1h] $*" | tee -a "$MASTER_LOG"
 }
 
 format_minutes() {
@@ -89,7 +89,7 @@ log_runtime_budget() {
 
 run_and_log() {
   local -a cmd=("$@")
-  printf '[FoundationFirst] cmd:' | tee -a "$MASTER_LOG"
+  printf '[Foundation1h] cmd:' | tee -a "$MASTER_LOG"
   for item in "${cmd[@]}"; do
     printf ' %q' "$item" | tee -a "$MASTER_LOG"
   done
@@ -138,7 +138,7 @@ path = sys.argv[2]
 summary_path = sys.argv[3]
 rows = list(csv.DictReader(open(path)))
 if not rows:
-    print(f"[FoundationFirst] summary {label}: empty")
+    print(f"[Foundation1h] summary {label}: empty")
     raise SystemExit(0)
 
 steps = [int(r["steps"]) for r in rows]
@@ -148,8 +148,7 @@ rr = [int(r["red_round_reward"]) for r in rows]
 k10 = min(10, len(rows))
 k20 = min(20, len(rows))
 base = os.path.basename(path)
-m = re.search(r"_s(\d+)\.csv$", base)
-cap = int(m.group(1)) if m else max(steps)
+cap = int(re.search(r"_s(\d+)\.csv$", base).group(1))
 timeout_rate = sum(1 for s in steps if s >= cap) / len(rows)
 totally_lose = sum(1 for x in rr if x == -2000) / len(rows)
 lose = sum(1 for x in rr if x == -1000) / len(rows)
@@ -160,7 +159,7 @@ if os.path.exists(summary_path):
         elapsed_sec = float(json.load(f).get("elapsed_sec", 0) or 0)
 steps_per_min = (sum(steps) * 60.0 / elapsed_sec) if elapsed_sec else 0.0
 print(
-    f"[FoundationFirst] summary {label}: "
+    f"[Foundation1h] summary {label}: "
     f"n={len(rows)} win={sum(wins)/len(rows):.3f} "
     f"win_last10={sum(wins[-k10:])/k10:.3f} "
     f"win_last20={sum(wins[-k20:])/k20:.3f} "
@@ -213,10 +212,8 @@ run_stage() {
     cmd+=(--render)
   fi
 
-  if [[ "$stage_tag" == "stageA_noatt_foundation_s300" ]]; then
-    if [[ "$FRESH_START" == "1" ]]; then
-      cmd+=(--fresh_start)
-    fi
+  if [[ "$stage_tag" == "stageA_noatt_foundation_s300" && "$FRESH_START" == "1" ]]; then
+    cmd+=(--fresh_start)
   fi
 
   run_and_log "${cmd[@]}"
@@ -230,14 +227,14 @@ if [[ "$CLEAN_MODEL" == "1" ]]; then
 fi
 
 log "start run_id=$RUN_ID seed=$SEED headless=$HEADLESS fresh_start=$FRESH_START keep_checkpoints=$KEEP_CHECKPOINTS"
-log "strategy: long no_att finish-pressure curriculum with a restrained fix bridge"
-log_runtime_budget 698200
+log "strategy: much longer no_att finish-pressure block with a still-short fix bridge"
+log_runtime_budget 240000
 
-run_stage "stageA_noatt_foundation_s300" fix_rule_no_att 750 300 0.00038 0.99 18 0.10 -0.0000035
-run_stage "stageB_noatt_pressure_s320" fix_rule_no_att 600 320 0.00030 0.99 14 0.08 -0.0000035
-run_stage "stageC_noatt_bridgeprep_s360" fix_rule_no_att 420 360 0.00024 0.99 12 0.06 -0.000003
-run_stage "stageD_fix_bridge_s350" fix_rule 140 350 0.00018 0.99 10 0.11 -0.000003
-run_stage "stageE_fix_verify_s450" fix_rule 180 450 0.00016 0.99 10 0.09 -0.000003
+run_stage "stageA_noatt_foundation_s300" fix_rule_no_att 220 300 0.00035 0.99 18 0.10 -0.000004
+run_stage "stageB_noatt_pressure_s320" fix_rule_no_att 180 320 0.00028 0.99 14 0.08 -0.000004
+run_stage "stageC_noatt_bridgeprep_s360" fix_rule_no_att 140 360 0.00022 0.99 12 0.06 -0.000003
+run_stage "stageD_fix_bridge_s350" fix_rule 60 350 0.00018 0.99 10 0.10 -0.000003
+run_stage "stageE_fix_verify_s450" fix_rule 100 450 0.00016 0.99 10 0.08 -0.000003
 
 log "finished all stages"
 log "master log: $MASTER_LOG"
