@@ -13,6 +13,7 @@ import os
 import glob
 from agent.base_agent import BaseAgent
 from agent.simple import dqn
+from fighter_action_utils import get_support_action
 import interface
 from world import config
 import copy
@@ -78,9 +79,9 @@ class Agent(BaseAgent):
         detector_action = []
         fighter_action = []
         for y in range(self.fighter_num):
-            true_action = np.array([0, 1, 0, 0], dtype=np.int32)
+            radar_point, disturb_point = get_support_action(step_cnt, y)
+            true_action = np.array([0, radar_point, disturb_point, 0], dtype=np.int32)
             if obs_dict['fighter'][y]['alive']:
-                true_action = np.array([0, 1, 0, 0], dtype=np.int32)
                 tmp_img_obs = obs_dict['fighter'][y]['screen']
                 tmp_img_obs = tmp_img_obs.transpose(2, 0, 1)
                 tmp_info_obs = obs_dict['fighter'][y]['info']
@@ -92,5 +93,4 @@ class Agent(BaseAgent):
         fighter_action = np.array(fighter_action)
 
         return detector_action, fighter_action
-
 

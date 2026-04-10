@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+from fighter_action_utils import build_valid_action_masks
+
 
 class NetFighter(nn.Module):
     def __init__(self, n_actions):
@@ -197,8 +199,12 @@ class RLFighter:
             info_obs = info_obs.cuda(non_blocking=True)
 
         batch_size = img_obs.shape[0]
+        valid_action_masks = build_valid_action_masks(info_obs_batch)
         random_mask = (np.random.uniform(size=batch_size) < self.epsilon)
-        actions = np.random.randint(0, self.n_actions, size=batch_size, dtype=np.int32)
+        actions = np.zeros(batch_size, dtype=np.int32)
+        for idx in range(batch_size):
+            valid_indices = np.flatnonzero(valid_action_masks[idx])
+            actions[idx] = int(np.random.choice(valid_indices))
 
         greedy_indices = np.where(~random_mask)[0]
         if greedy_indices.size > 0:
@@ -212,6 +218,10 @@ class RLFighter:
                     img_obs.index_select(0, greedy_idx_tensor),
                     info_obs.index_select(0, greedy_idx_tensor)
                 )
+                greedy_valid_masks = torch.from_numpy(valid_action_masks[greedy_indices])
+                if self.gpu_enable:
+                    greedy_valid_masks = greedy_valid_masks.cuda(non_blocking=True)
+                q_values = q_values.masked_fill(~greedy_valid_masks, -1e9)
                 greedy_actions = torch.argmax(q_values, dim=1)
             self.eval_net.train(prev_mode)
             if self.gpu_enable:
@@ -237,6 +247,7 @@ class RLFighter:
         # Mini-batch sample from replay buffer.
         batch_size = min(self.batch_size, current_size)
         sample_index = np.random.choice(current_size, size=batch_size, replace=False)
+        next_valid_action_masks = build_valid_action_masks(self.s__info_memory[sample_index])
         s_screen_mem = torch.from_numpy(self.s_screen_memory[sample_index])
         s_info_mem = torch.from_numpy(self.s_info_memory[sample_index])
         a_mem = torch.from_numpy(self.a_memory[sample_index]).long().view(batch_size, 1)
@@ -244,6 +255,7 @@ class RLFighter:
         done_mem = torch.from_numpy(self.done_memory[sample_index]).view(batch_size, 1)
         s__screen_mem = torch.from_numpy(self.s__screen_memory[sample_index])
         s__info_mem = torch.from_numpy(self.s__info_memory[sample_index])
+        next_valid_action_masks = torch.from_numpy(next_valid_action_masks)
         if self.gpu_enable:
             s_screen_mem = s_screen_mem.cuda()
             s_info_mem = s_info_mem.cuda()
@@ -252,6 +264,7 @@ class RLFighter:
             done_mem = done_mem.cuda()
             s__screen_mem = s__screen_mem.cuda()
             s__info_mem = s__info_mem.cuda()
+            next_valid_action_masks = next_valid_action_masks.cuda()
 
         if self.reward_clip is not None and self.reward_clip > 0:
             r_mem = torch.clamp(r_mem, min=-float(self.reward_clip), max=float(self.reward_clip))
@@ -260,10 +273,14 @@ class RLFighter:
         q_eval = self.eval_net(s_screen_mem, s_info_mem).gather(1, a_mem)  # shape (batch, 1)
         with torch.no_grad():
             if self.double_dqn:
-                next_act = self.eval_net(s__screen_mem, s__info_mem).argmax(dim=1, keepdim=True)
+                next_eval = self.eval_net(s__screen_mem, s__info_mem)
+                next_eval = next_eval.masked_fill(~next_valid_action_masks, -1e9)
+                next_act = next_eval.argmax(dim=1, keepdim=True)
                 q_next = self.target_net(s__screen_mem, s__info_mem).gather(1, next_act)
             else:
-                q_next = self.target_net(s__screen_mem, s__info_mem).max(1)[0].view(batch_size, 1)
+                next_target = self.target_net(s__screen_mem, s__info_mem)
+                next_target = next_target.masked_fill(~next_valid_action_masks, -1e9)
+                q_next = next_target.max(1)[0].view(batch_size, 1)
             q_target = r_mem + (1.0 - done_mem) * self.gamma * q_next
         loss = self.loss_func(q_eval, q_target)
 

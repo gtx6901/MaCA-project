@@ -125,9 +125,8 @@ data
 *.pkl
 /tournament/result
 
-  # Local training artifacts
-  log/
-  model/simple/
-  model/backup/
-  .codex
-
+# Local training artifacts
+log/
+model/simple/
+model/backup/
+.codex

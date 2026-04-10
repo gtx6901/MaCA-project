@@ -30,7 +30,7 @@
 - 模型与学习器：`dqn.py`
 - 单次训练主脚本：`scripts/train_dqn_pipeline.py`
 - 课程式自动训练：`scripts/run_curriculum_autotrain.sh`
-- 2-3 小时训练封装：`scripts/run_overnight_2to3h.sh`
+- 2-3 小时基础优先训练封装：`scripts/run_foundation_first_2to3h.sh`
 
 ## 4. 当前已完成的核心改造
 
@@ -39,12 +39,22 @@
 - 训练流程增加 `--min_replay_size` 预热门槛。
 - 自动训练脚本支持 checkpoint 清理与保留上限。
 - 新增 `--noatt-epochs-after-first`，可在首轮后跳过 `no_att` block。
+- 支持动作改为训练/推理一致的确定性策略，避免 hidden-policy mismatch。
+- DQN 增加基于当前 `info` 的有效攻击动作掩码，减少无效探索。
+- 对 fighter 单体死亡样本使用 terminal 截断，避免死亡后继续 bootstrap。
 
 ## 5. 最近一轮训练结果（重点）
 
-最近 `run_id=20260410_094147` 的汇总：
-- `ALL noatt`: `n=36, win=0.417, avg_steps=500.0, timeout_rate=1.000`
-- `ALL fix`: `n=1200, win=0.000, avg_reward=-23936.4, avg_steps=417.9`
+最近需要优先参考两轮结果：
+
+- `run_id=20260410_094147`（旧 fix-heavy 课表）
+  - `ALL noatt`: `n=36, win=0.417, avg_steps=500.0, timeout_rate=1.000`
+  - `ALL fix`: `n=1200, win=0.000, avg_steps=417.9, reward_last20≈-18994.0`
+
+- `run_id=20260410_122530`（引入 action mask / terminal 修正后的半程验证）
+  - `ALL noatt`: `n=2, win=0.500, avg_steps=300.0, timeout_rate=1.000`
+  - `ALL fix`: `n=268, win=0.000, avg_steps=373.8, timeout_rate=0.291, reward_last20≈-12098.7`
+  - 结论：`fix_rule` 仍未赢，但总奖励显著改善，`-2000` 级惨败占比从 `0.833` 降到 `0.712`，说明结构改动方向正确；下一步应改为 `no_att` 基础优先训练，而不是继续 fix-heavy。
 
 日志位置：
 - `log/overnight_2to3h_20260410_094147.log`
@@ -62,29 +72,29 @@
 
 ## 7. 常用命令模板
 
-后台启动（from scratch）：
+后台启动（from scratch，推荐当前默认入口）：
 
 ```bash
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
-nohup bash scripts/run_overnight_2to3h.sh \
+nohup bash scripts/run_foundation_first_2to3h.sh \
   --run-id "$RUN_ID" \
   --headless 1 \
   --fresh-start \
   --clean-model \
-  > "log/overnight_2to3h_${RUN_ID}_launcher.log" 2>&1 &
-echo $! > "log/overnight_2to3h_${RUN_ID}.pid"
+  > "log/foundation_first_2to3h_${RUN_ID}_launcher.log" 2>&1 &
+echo $! > "log/foundation_first_2to3h_${RUN_ID}.pid"
 ```
 
 实时看日志：
 
 ```bash
-tail -f "log/overnight_2to3h_${RUN_ID}.log"
+tail -f "log/foundation_first_2to3h_${RUN_ID}.log"
 ```
 
 停止训练：
 
 ```bash
-kill "$(cat log/overnight_2to3h_${RUN_ID}.pid)"
+kill "$(cat log/foundation_first_2to3h_${RUN_ID}.pid)"
 ```
 
 ---

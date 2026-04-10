@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 import dqn
+from fighter_action_utils import get_support_action
 from interface import Environment
 
 DETECTOR_NUM = 0
@@ -161,8 +162,10 @@ def main():
 
             while True:
                 red_fighter_action = np.zeros((red_fighter_num, 4), dtype=np.int32)
-                red_fighter_action[:, 1] = np.random.randint(1, 11, size=red_fighter_num, dtype=np.int32)
-                red_fighter_action[:, 2] = 11
+                for idx in range(red_fighter_num):
+                    radar_point, disturb_point = get_support_action(step_cnt, idx)
+                    red_fighter_action[idx][1] = radar_point
+                    red_fighter_action[idx][2] = disturb_point
                 alive_indices = []
                 alive_img_obs = []
                 alive_info_obs = []
@@ -196,12 +199,13 @@ def main():
                 for local_i, idx in enumerate(alive_indices):
                     next_img_obs = next_red_obs_dict['fighter'][idx]['screen'].transpose(2, 0, 1)
                     next_info_obs = next_red_obs_dict['fighter'][idx]['info']
+                    next_alive = bool(next_red_obs_dict['fighter'][idx]['alive'])
                     fighter_model.store_transition(
                         {'screen': alive_img_obs[local_i], 'info': alive_info_obs[local_i]},
                         int(batch_actions[local_i]),
                         fighter_reward[idx],
                         {'screen': next_img_obs, 'info': next_info_obs},
-                        done=done,
+                        done=(done or (not next_alive)),
                     )
 
                 if done:
