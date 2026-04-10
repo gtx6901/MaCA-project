@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+train_dir/
 *.py[cod]
 *$py.class
 
