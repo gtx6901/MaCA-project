@@ -1,188 +1,211 @@
-# MaCA 训练后标准流程（Post-Run Playbook）
+# MaCA 训练后标准流程（当前主线：Sample Factory）
 
-目的：每次你说“本轮训练完毕”后，用同一套流程评估结果、决定下一轮配置，尽量自动化。
+目的：每次一轮 `Sample Factory` 训练结束后，都用同一套流程检查 experiment、checkpoint、日志和独立评估结果，然后再决定下一轮怎么改。
 
-## 0. 输入与产物约定
+## 0. 当前适用范围
 
-每轮训练至少产出两个文件：
+本文档适用于当前主线：
 
-- `log/<metrics>.csv`（逐 epoch 指标）
-- `log/<summary>.json`（本轮概览）
+- 训练入口：`scripts/train_sf_maca.py`
+- 冒烟脚本：`scripts/run_sf_maca_gpu_smoke.sh`
+- 基线脚本：`scripts/run_sf_maca_4060_baseline.sh`
+- 评估脚本：`scripts/eval_sf_maca.py`
 
-示例：
+旧 DQN 训练产物格式和这里不同，不再是本文默认对象。
 
-- `log/train_dqn_metrics_stage1_e100.csv`
-- `log/train_dqn_summary_stage1_e100.json`
+## 1. 一轮训练最少要拿到什么
 
-## 0.1 续训规则（重要）
+至少确认下面几类产物存在：
 
-当前训练脚本 `scripts/train_dqn_pipeline.py` 的行为：
+- launcher 日志：`log/<exp_name>.launcher.log`
+- experiment 目录：`train_dir/sample_factory/<exp_name>/`
+- checkpoint 目录：`train_dir/sample_factory/<exp_name>/checkpoint_p0/`
+- 独立评估结果：建议保存成 `log/<exp_name>.eval.json`
 
-- 默认自动续训：若存在 `model/simple/model.pkl`，会自动加载继续训练
-- 显式指定续训：`--resume <checkpoint_path>`
-- 强制从头训练：`--fresh_start`
+## 2. 固定读取顺序
 
-建议：
-- 阶段切换（如 `fix_rule_no_att -> fix_rule`）默认用续训
-- 只有做对照实验时才用 `--fresh_start`
+### 2.1 先确认 experiment 是否真的完成过训练
 
-## 1. 固定读取顺序
+看 launcher 日志里是否出现这些事实：
 
-1. 先读 summary：
+- learner 成功启动
+- policy worker 成功启动
+- 至少发生过一次 optimizer update
+- 至少保存过一个 checkpoint
+
+建议先读日志尾部：
 
 ```bash
-cat log/<summary>.json
+tail -n 80 "log/<exp_name>.launcher.log"
+```
+
+### 2.2 再看 checkpoint
+
+```bash
+ls -lh "train_dir/sample_factory/<exp_name>/checkpoint_p0"
+```
+
+重点确认：
+
+- 是否有 `checkpoint_*.pth`
+- 最新 checkpoint 时间是否合理
+- 是否出现 `done` 文件
+
+### 2.3 再跑独立评估
+
+```bash
+conda run --no-capture-output -n maca-py37-min \
+  python scripts/eval_sf_maca.py \
+  --experiment="<exp_name>" \
+  --train_dir=train_dir/sample_factory \
+  --episodes=30 \
+  --output_json="log/<exp_name>.eval.json"
+```
+
+### 2.4 最后读评估摘要
+
+```bash
+cat "log/<exp_name>.eval.json"
 ```
 
 重点字段：
-- `epochs`
-- `opponent`
-- `latest_checkpoint`
-- `elapsed_sec`
-- 是否续训成功（看训练启动日志是否包含 `Resume training from:`）
 
-2. 再读 metrics 首尾：
+- `summary.win_rate`
+- `summary.round_reward_mean`
+- `summary.opponent_round_reward_mean`
+- `summary.true_reward_mean`
+- `summary.invalid_action_frac_mean`
+- `summary.episode_len_mean`
 
-```bash
-sed -n '1,15p' log/<metrics>.csv
-echo '---'
-tail -n 15 log/<metrics>.csv
-```
+## 3. 当前决策规则
 
-3. 再做统计（建议固定脚本）：
+### A. 可以继续当前配置
 
-```bash
-python - <<'PY'
-import csv, statistics as st
-p='log/<metrics>.csv'
-rows=list(csv.DictReader(open(p)))
-tr=[float(r['total_reward']) for r in rows]
-win=[int(r['red_win']) for r in rows]
-el=[float(r['elapsed_sec']) for r in rows]
-print('epochs',len(rows))
-print('win_rate_all',sum(win)/len(win))
-for k in [10,20,30]:
-    if len(rows)>=k:
-        print(f'win_rate_last{k}',sum(win[-k:])/k)
-        print(f'total_reward_last{k}',sum(tr[-k:])/k)
-print('reward_min/max/mean',min(tr),max(tr),sum(tr)/len(tr))
-if len(tr)>=20:
-    print('reward_std_last20',st.pstdev(tr[-20:]))
-print('epoch_time_mean',sum(el)/len(el))
-PY
-```
+满足以下特征时，优先继续当前配置而不是立刻大改：
 
-## 2. 决策规则（建议）
+- `win_rate` 在最近几轮评估里持续抬升
+- `invalid_action_frac_mean` 很低
+- 训练日志没有长期 learner backlog
+- checkpoint 保存稳定，没有异常退出
 
-### A. 是否进入下一阶段（对手升级）
+### B. 应该先查系统问题
 
-满足以下任意一条可升级：
+优先处理系统层问题，而不是急着调 reward 或网络：
 
-- `win_rate_last20 >= 0.95`
-- 且最近 20 局无明显崩溃（例如连续多局 `red_win=0`）
+- launcher 日志反复出现 learner backlog / accumulated too much experience
+- checkpoint 保存失败
+- 训练一恢复就立刻退出
+- 评估脚本无法加载最新 checkpoint
 
-升级方式：
-- 从 `--opponent fix_rule_no_att` 进入 `--opponent fix_rule`
-- 先小规模 20~30 epoch 观察，再决定是否继续长训
+### C. 应该调整超参数
 
-### B. 是否继续当前阶段
+在系统链路正常、但效果不理想时，再考虑调参：
 
-出现以下情况建议继续当前阶段：
+- `win_rate` 长期接近 0
+- `episode_len_mean` 长期接近 `max_step`
+- `true_reward_mean` 长期很差
+- reward 在训练日志中剧烈震荡但评估无改善
 
-- `win_rate_last20 < 0.9`
-- 或 `total_reward` 波动仍非常大且存在明显回退
+## 4. 先查哪里，再改哪里
 
-### C. 是否回退参数
+### 4.1 启动与框架参数
 
-- 若胜率下降且波动放大：减小学习率（如 `0.001 -> 0.0005`）
-- 若学习太慢且胜率长期不涨：增加训练强度（减小 `learn_interval`）
+优先入口：
 
-## 3. 可调项总览（含文件位置）
+- `scripts/run_sf_maca_4060_baseline.sh`
+- `marl_env/sample_factory_registration.py`
 
-## 3.1 训练命令参数（首选调参入口）
+常用项：
 
-文件：`scripts/train_dqn_pipeline.py`
+- `num_workers`
+- `rollout`
+- `recurrence`
+- `batch_size`
+- `ppo_epochs`
+- `learning_rate`
+- `gamma`
+- `reward_scale`
+- `reward_clip`
+- `max_policy_lag`
+- `exploration_loss_coeff`
 
-- `--epochs`
-- `--max_step`
-- `--learn_interval`
-- `--batch_size`
-- `--lr`
-- `--gamma`
-- `--epsilon`
-- `--epsilon_increment`
-- `--target_replace_iter`
-- `--memory_size`
-- `--opponent`
-- `--seed`
+### 4.2 环境与观测
 
-## 3.2 模型结构（中等风险）
+文件：
 
-文件：`dqn.py`
+- `marl_env/maca_parallel_env.py`
+- `marl_env/sample_factory_env.py`
+- `fighter_action_utils.py`
 
-- `NetFighter.conv1/conv2`（卷积通道、核大小）
-- `info_fc`（信息向量维度）
-- `feature_fc`（全连接层宽度、dropout）
-- 优化器（RMSprop/Adam）
+常看点：
 
-说明：改模型结构后，历史 checkpoint 常常不能直接复用。
+- 动作 mask 是否合理
+- `measurements` 是否和模型输入一致
+- 死亡飞机槽位处理
+- 非法动作兜底比例
 
-## 3.3 观测构造（高影响）
+### 4.3 奖励
 
-文件：`obs_construct/simple/construct.py`
+文件：
 
-可调：
-- `img_obs_reduce_ratio`
-- fighter `info` 维度与定义
-- 图像通道编码方式
+- `configuration/reward.py`
 
-注意：改观测后要同步检查 `dqn.py` 输入维度（例如 `in_channels` 与 `info_fc` 输入）。
+当前代码中关键事实：
 
-## 3.4 奖励（高影响）
+- `reward_strike_act_valid = 5`
+- `reward_strike_act_invalid = -8`
+- `reward_totally_win = 8000`
+- `reward_totally_lose = -2000`
 
-接口读取位置：训练中通过 `env.get_reward()` 使用（`scripts/train_dqn_pipeline.py`）。
+改奖励前先确认：训练信号问题是否真的来自 reward，而不是来自吞吐、动作掩码或评估方式。
 
-底层奖励逻辑在环境内核模块中（`environment/world/*`）。
+## 5. Resume / 继续训练检查清单
 
-注意：奖励设计变动会直接改变学习目标，需单独记录实验编号。
+恢复训练前固定检查：
 
-## 4. 每轮结束后的标准动作清单
+1. `EXP_NAME` 是否和旧 experiment 完全一致。
+2. experiment 目录下是否有 `done` 文件。
+3. 新设定的 `train_for_env_steps` 是否大于旧 checkpoint 已达到的 env steps。
+4. 观测维度是否发生变化。
+5. 当前代码 patch 是否仍与旧 checkpoint 兼容。
 
-1. 归档结果文件（metrics + summary + checkpoint 名）
-2. 计算固定统计（全局、last10/20/30）
-3. 根据第 2 节规则决定：
-- 继续当前阶段
-- 升级对手
-- 微调超参数
-4. 确认下一轮启动模式：
-- 续训：默认即可，或显式 `--resume model/simple/model.pkl`
-- 从头：显式加 `--fresh_start`
-5. 只改 1~2 个关键参数再开下一轮（避免变量过多）
-6. 记录本轮配置与结论（建议追加到 `chat_summary.md`）
+如果 observation space、模型结构或动作定义已经改动，优先 fresh start。
 
-## 5. 自动化建议（最小可落地）
+## 6. 每轮结束后的标准动作
 
-建议新增一个脚本（例如 `scripts/analyze_training_metrics.py`），固定输出：
+1. 记录 experiment 名称、训练脚本、关键超参数。
+2. 归档 launcher 日志路径。
+3. 确认最新 checkpoint 路径。
+4. 跑固定 episode 数的独立评估。
+5. 记录 `win_rate`、`true_reward_mean`、`invalid_action_frac_mean`、`episode_len_mean`。
+6. 只改 1 到 3 个关键参数再开下一轮。
+7. 把结论写回 `doc/` 或 `chat_summary.md`。
 
-- win_rate_all / last10 / last20 / last30
-- reward min/max/mean/std
-- epoch_time mean/min/max
-- 推荐动作（继续/升级/回退）
+## 7. 推荐命令模板
 
-这样每轮只需：
+### 查看 experiment checkpoint
 
 ```bash
-python scripts/analyze_training_metrics.py --metrics log/<metrics>.csv --summary log/<summary>.json
+ls -lh "train_dir/sample_factory/<exp_name>/checkpoint_p0"
 ```
 
-## 6. 当前项目的阶段建议（基于 stage1_e100）
+### 查看 done 文件
 
-已观察到：
-- `win_rate_all = 0.95`
-- `win_rate_last20 = 1.0`
+```bash
+find "train_dir/sample_factory/<exp_name>" -maxdepth 2 -name done -o -name "*.pth"
+```
 
-建议：
-1. 进入阶段 2（攻击型对手 `fix_rule`）
-2. 先跑 30 epoch 观察稳定性
-3. 阶段 2 使用续训模式（不要 `--fresh_start`）
-4. 若胜率掉到 <0.7，再回到 no_att 混训（例如 2:1 轮换）
+### 跑评估并落盘
+
+```bash
+conda run --no-capture-output -n maca-py37-min \
+  python scripts/eval_sf_maca.py \
+  --experiment="<exp_name>" \
+  --train_dir=train_dir/sample_factory \
+  --episodes=30 \
+  --output_json="log/<exp_name>.eval.json"
+```
+
+## 8. 当前最重要的实践规则
+
+不要只依据训练 reward 做结论。对于当前主线，独立评估结果的优先级高于训练过程里的局部 reward 波动。

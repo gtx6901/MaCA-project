@@ -12,8 +12,13 @@ from fighter_action_utils import ACTION_NUM, ATTACK_IND_NUM
 from marl_env.maca_parallel_env import EnvConfig, MaCAParallelEnv
 
 
-_MEASUREMENTS_SCALE = np.asarray([359.0, 4.0, 4.0, 1500.0, 10.0, 180.0], dtype=np.float32)
-_MEASUREMENTS_BIAS = np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+# Heading is a circular quantity: 0° and 360° are identical directions.
+# We encode it as (sin, cos) to preserve circular topology instead of linear
+# scaling, which would make 359° and 1° appear maximally different to the net.
+# The remaining 5 fields (missiles ×2, distance, target id, bearing) are scaled
+# linearly.  Total measurement vector dim = 2 + 5 = 7.
+_MEASUREMENTS_REST_SCALE = np.asarray([4.0, 4.0, 1500.0, 10.0, 180.0], dtype=np.float32)
+_MEASUREMENT_DIM = 7
 
 
 class SampleFactoryMaCAEnv(gym.Env):
@@ -31,14 +36,13 @@ class SampleFactoryMaCAEnv(gym.Env):
         self.is_multiagent = True
 
         screen_shape = self.maca_env.observation_spec["screen_shape"]
-        info_shape = self.maca_env.observation_spec["info_shape"]
         obs_shape = (screen_shape[2], screen_shape[0], screen_shape[1])
 
         self.action_space = spaces.Discrete(self.maca_env.action_space_n)
         self.observation_space = spaces.Dict(
             {
                 "obs": spaces.Box(low=0, high=255, shape=obs_shape, dtype=np.uint8),
-                "measurements": spaces.Box(low=-10.0, high=10.0, shape=info_shape, dtype=np.float32),
+                "measurements": spaces.Box(low=-2.0, high=2.0, shape=(_MEASUREMENT_DIM,), dtype=np.float32),
                 "action_mask": spaces.Box(low=0, high=1, shape=(ACTION_NUM,), dtype=np.uint8),
                 "is_alive": spaces.Box(low=0, high=1, shape=(1,), dtype=np.uint8),
             }
@@ -59,6 +63,7 @@ class SampleFactoryMaCAEnv(gym.Env):
             render=cfg.maca_render,
             random_pos=cfg.maca_random_pos,
             random_seed=-1,
+            include_global_state=False,
         )
 
     def seed(self, seed: Optional[int] = None) -> List[int]:
@@ -94,16 +99,21 @@ class SampleFactoryMaCAEnv(gym.Env):
 
         info_list = []
         for idx, agent_id in enumerate(self.maca_env.agents):
-            agent_info = dict(infos[agent_id])
-            agent_info.setdefault("num_frames", 1)
+            raw_info = infos[agent_id]
+            agent_info = {
+                "is_active": raw_info["is_active"],
+                "num_frames": 1,
+                "round_reward": float(raw_info.get("round_reward", 0.0)),
+                "opponent_round_reward": float(raw_info.get("opponent_round_reward", 0.0)),
+            }
             if dones[idx]:
                 agent_info["true_reward"] = float(self._episode_returns[idx])
                 agent_info["episode_extra_stats"] = {
-                    "round_reward": float(agent_info.get("round_reward", 0.0)),
-                    "opponent_round_reward": float(agent_info.get("opponent_round_reward", 0.0)),
+                    "round_reward": agent_info["round_reward"],
+                    "opponent_round_reward": agent_info["opponent_round_reward"],
                     "invalid_action_frac": float(self._invalid_action_counts[idx]) / float(max(self._episode_len, 1)),
                     "episode_len": float(self._episode_len),
-                    "win_flag": float(agent_info.get("round_reward", 0.0) > agent_info.get("opponent_round_reward", 0.0)),
+                    "win_flag": float(agent_info["round_reward"] > agent_info["opponent_round_reward"]),
                 }
             info_list.append(agent_info)
 
@@ -127,8 +137,7 @@ class SampleFactoryMaCAEnv(gym.Env):
         return [self._format_agent_obs(obs_dict[agent_id]) for agent_id in self.maca_env.agents]
 
     def _format_agent_obs(self, agent_obs: Dict[str, np.ndarray]):
-        screen = np.asarray(agent_obs["screen"], dtype=np.uint8)
-        screen = np.transpose(screen, (2, 0, 1))
+        screen = np.moveaxis(agent_obs["screen"], -1, 0)
         measurements = self._normalize_measurements(agent_obs["info"])
         action_mask = np.asarray(agent_obs["action_mask"], dtype=np.uint8)
         is_alive = np.asarray([agent_obs["alive"]], dtype=np.uint8)
@@ -141,7 +150,12 @@ class SampleFactoryMaCAEnv(gym.Env):
 
     def _normalize_measurements(self, info_vec: np.ndarray) -> np.ndarray:
         info_vec = np.asarray(info_vec, dtype=np.float32)
-        return (info_vec - _MEASUREMENTS_BIAS) / _MEASUREMENTS_SCALE
+        # Encode heading (degrees, 0-360) as (sin, cos) so that 0° and 360°
+        # map to the same point and 359° is adjacent to 1°.
+        course_rad = float(info_vec[0]) * (np.pi / 180.0)
+        sin_cos = np.asarray([np.sin(course_rad), np.cos(course_rad)], dtype=np.float32)
+        rest = info_vec[1:] / _MEASUREMENTS_REST_SCALE
+        return np.concatenate([sin_cos, rest])
 
     @staticmethod
     def _sanitize_action(action: int, valid_mask: np.ndarray) -> int:

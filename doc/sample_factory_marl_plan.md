@@ -1,79 +1,93 @@
 # Sample Factory MARL Plan
 
-This document fixes the next technical direction for MaCA on a single `RTX 4060 8GB`.
+This document records the current engineering plan for MaCA on a single GPU host.
 
 ## Goal
 
-Train a fighter policy that can achieve non-trivial win rate against `fix_rule`, then extend to stronger opponent pools.
+Train a shared red-fighter policy against `fix_rule` with a stable, reproducible `Sample Factory` pipeline, then iterate through evaluation-driven tuning.
 
-## Why We Are Changing Direction
+## Current Direction
 
-Recent runs show a repeatable failure mode:
+The project has already switched its mainline to:
 
-- `fix_rule_no_att` can be learned.
-- `fix_rule` remains near-zero win rate.
-- Longer `no_att` pretraining improves survival and score, but does not transfer to real combat.
+- environment: custom multi-agent wrapper in `marl_env/maca_parallel_env.py`
+- framework: `Sample Factory 1.x`
+- algorithm: `APPO` with `V-trace`
+- policy: shared fighter policy
+- memory: `LSTM`
+- action validity: policy-level masking plus env-side fallback
 
-This is not a small hyperparameter problem. The current DQN route is structurally mismatched to:
-
-- multi-agent control
-- partial observability
-- long horizons
-- large discrete action spaces
-- non-stationary opponents
-
-## Target Stack
-
-- Environment API: parallel-style multi-agent wrapper
-- Training framework: `Sample Factory`
-- Algorithm family: `APPO/PPO`
-- Policy layout: shared fighter policy
-- Memory: `LSTM`
-- Invalid moves: action masking at env adapter level
-- Opponent training: fixed rule first, then opponent pool / self-play
-
-## Hardware Constraints
-
-`RTX 4060 8GB` means:
-
-- one shared fighter policy, not per-agent policies
-- compact CNN encoder
-- small recurrent core (`128` hidden size)
-- moderate rollout lengths and batch sizes
-- no heavy centralized image critic at the first stage
+Legacy DQN scripts still exist, but they are no longer the default path for new experiments.
 
 ## Current Status
 
-As of `2026-04-10`, the following pieces are complete:
+As of `2026-04-11`, the following pieces are implemented and wired together:
 
-- parallel multi-agent wrapper for red fighters
-- Sample Factory env adapter
-- compact custom encoder
-- env/model registration and training entry point
-- GPU smoke test on local host completed end-to-end
-- compatibility patches added in `scripts/train_sf_maca.py` for:
-  - shared-memory launch restrictions
-  - single-trajectory squeeze bug in `Sample Factory 1.x`
-  - checkpoint temp filename incompatibility with current `torch`
+- parallel-style red fighter wrapper
+- Sample Factory environment adapter
+- custom encoder for image + measurements
+- env/model registration with MaCA-specific defaults
+- training entry with compatibility patches
+- standalone evaluation script
+- GPU smoke launcher
+- 4060 baseline launcher
 
-Smoke-test success criteria already achieved:
+## Important Code Truths
 
-- learner initializes on GPU
-- policy worker initializes on GPU
-- at least one optimizer step completes
-- checkpoints are saved successfully
-- run exits cleanly
+The following are true in the current codebase and should be treated as source of truth:
+
+- agent count is fixed to 10 red fighters
+- dead fighters stay in the agent set and only allow no-op
+- action space size is `336`
+- action masks are generated from missile count, target id, and distance
+- measurements are now `7`-dimensional, not `6`
+- heading is encoded as `sin/cos`, not as a linear scalar
+- `reward_clip` is `50.0`
+- `gamma` is `0.999`
+
+## Current Default Hyperparameters
+
+These are the current defaults in `marl_env/sample_factory_registration.py`, and `scripts/run_sf_maca_4060_baseline.sh` uses the same main settings unless explicitly overridden.
+
+| Parameter | Current value | Notes |
+|---|---|---|
+| `algo` | `APPO` | async PPO with V-trace |
+| `hidden_size` | `256` | single-layer LSTM core |
+| `rollout` | `64` | trajectory chunk length |
+| `recurrence` | `64` | BPTT length |
+| `num_workers` | `8` | current code default |
+| `batch_size` | `5120` | current code default |
+| `ppo_epochs` | `4` | sample reuse per batch |
+| `learning_rate` | `1e-4` | fresh-training default |
+| `gamma` | `0.999` | effective horizon aligned with `max_step=1000` |
+| `reward_scale` | `0.005` | scales raw env rewards |
+| `reward_clip` | `50.0` | preserves fully-winning signal after scaling |
+| `max_policy_lag` | `15` | stale-sample control |
+| `exploration_loss_coeff` | `0.02` | entropy regularization |
+| `keep_checkpoints` | `20` | baseline script default |
+
+## Why Earlier Notes Look Different
+
+Older notes in this repo mentioned settings such as:
+
+- `num_workers = 4`
+- `batch_size = 256`
+- `rollout = 32`
+- `recurrence = 32`
+
+Those were intermediate audit recommendations from an earlier tuning stage. They do not match the current registered defaults or the current baseline launcher anymore. When in doubt, follow the code.
 
 ## Recommended Commands
 
-Quick GPU smoke test:
+### Smoke Test
 
 ```bash
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
-EXP_NAME="sf_maca_gpu_smoke_${RUN_ID}" bash scripts/run_sf_maca_gpu_smoke.sh
+EXP_NAME="sf_maca_gpu_smoke_${RUN_ID}" \
+bash scripts/run_sf_maca_gpu_smoke.sh
 ```
 
-2-hour 4060 baseline against `fix_rule`:
+### Baseline Training
 
 ```bash
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
@@ -82,71 +96,82 @@ TRAIN_SECONDS=7200 \
 bash scripts/run_sf_maca_4060_baseline.sh
 ```
 
+### Evaluation
+
+```bash
+conda run --no-capture-output -n maca-py37-min \
+  python scripts/eval_sf_maca.py \
+  --experiment="$EXP_NAME" \
+  --train_dir=train_dir/sample_factory \
+  --episodes=30
+```
+
 ## Work Phases
 
-### Phase 1: Standardize the Environment
+### Phase 1: Environment Standardization
 
 Deliverables:
 
-- `marl_env/maca_parallel_env.py`
-- fixed fighter agent ids
-- dict observations per fighter
-- per-agent rewards
+- fixed red fighter slots
+- dict observations
 - action masks
-- inactive-agent handling for dead fighters
-- global low-dimensional state export
+- dead-agent handling
 
 Status:
 
 - complete
 
-### Phase 2: Add a Framework Adapter
+### Phase 2: Framework Adapter
 
 Deliverables:
 
-- Sample Factory multi-agent adapter
-- observation/action specs compatible with the framework
-- smoke-test launch path
+- Sample Factory env wrapper
+- compatible observation/action specs
+- stable reset/step behavior
 
 Status:
 
 - complete
 
-### Phase 3: Build the First PPO/APPO Baseline
+### Phase 3: Baseline Training Loop
 
-Initial choices:
+Deliverables:
 
-- shared policy for all red fighters
-- compact CNN + info MLP + LSTM
-- fixed opponent `fix_rule`
-- no dependency on long DQN-style `no_att` pretraining
+- GPU smoke path
+- 4060 baseline launcher
+- checkpoint save compatibility
+- action mask patch
+- evaluation script
 
 Status:
 
-- baseline launch script prepared
-- smoke path verified
-- full training still needs iterative evaluation and tuning
+- complete, but still being tuned
 
-### Phase 4: Improve Generalization
+### Phase 4: Evaluation-Driven Tuning
 
-Deliverables:
+Focus:
+
+- compare worker count and batch size against learner backlog
+- monitor invalid action fraction
+- track win rate with fixed evaluation episodes
+- tune against `fix_rule`, not only against training reward
+
+Status:
+
+- active
+
+### Phase 5: Generalization
+
+Possible next steps:
 
 - opponent pool
-- periodic evaluation against fixed snapshots
-- learned-vs-learned only after rule-opponent baseline works
+- periodic cross-checkpoint evaluation
+- self-play only after fixed-opponent baseline is reliable
 
 Status:
 
 - pending
 
-### Phase 5: Optional Advanced Tuning
+## Practical Rule
 
-Only after Phase 4 works:
-
-- PBT for reward shaping / entropy / lr
-- stronger recurrent models
-- richer critic state
-
-Status:
-
-- pending
+For this repo, "baseline" means "the path that can be launched, resumed, checkpointed, and independently evaluated today", not "the best-known policy already found". This document should therefore follow the current scripts, not older tuning notes.

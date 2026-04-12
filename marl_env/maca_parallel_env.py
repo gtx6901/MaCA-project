@@ -43,10 +43,11 @@ class EnvConfig:
     map_path: str = "maps/1000_1000_fighter10v10.map"
     red_obs_ind: str = "simple"
     opponent: str = "fix_rule"
-    max_step: int = 650
+    max_step: int = 1000
     render: bool = False
     random_pos: bool = False
     random_seed: int = -1
+    include_global_state: bool = True
 
 
 class MaCAParallelEnv:
@@ -184,9 +185,12 @@ class MaCAParallelEnv:
         self,
     ) -> Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Dict[str, object]]]:
         red_obs, blue_obs = self._env.get_obs()
-        red_raw_obs, blue_raw_obs = self._env.get_obs_raw()
         self._last_blue_obs = blue_obs
-        global_state = self._build_global_state(red_raw_obs, blue_raw_obs)
+
+        global_state = None
+        if self.config.include_global_state:
+            red_raw_obs, blue_raw_obs = self._env.get_obs_raw()
+            global_state = self._build_global_state(red_raw_obs, blue_raw_obs)
 
         fighter_infos = np.stack([fighter["info"] for fighter in red_obs["fighter"]], axis=0)
         valid_masks = build_valid_action_masks(fighter_infos)
@@ -199,10 +203,10 @@ class MaCAParallelEnv:
             alive = bool(fighter_obs["alive"])
             alive_mask[idx] = alive
 
-            screen = np.asarray(fighter_obs["screen"], dtype=np.float32)
+            screen = np.asarray(fighter_obs["screen"], dtype=np.uint8)
             info_vec = np.asarray(fighter_obs["info"], dtype=np.float32)
             if not alive:
-                screen = np.zeros_like(screen, dtype=np.float32)
+                screen = np.zeros_like(screen, dtype=np.uint8)
                 info_vec = np.zeros_like(info_vec, dtype=np.float32)
                 mask = np.zeros((ACTION_NUM,), dtype=np.bool_)
                 mask[0] = True
@@ -217,10 +221,11 @@ class MaCAParallelEnv:
             }
             infos[agent_id] = {
                 "is_active": alive,
-                "global_state": global_state,
                 "valid_action_mask": mask.astype(np.bool_),
                 "step_count": self._step_count,
             }
+            if global_state is not None:
+                infos[agent_id]["global_state"] = global_state
 
         self._last_alive_mask = alive_mask
         return observations, infos

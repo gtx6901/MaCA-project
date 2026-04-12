@@ -12,7 +12,11 @@ import torch
 
 from sample_factory.algorithms.utils.arguments import parse_args
 from sample_factory.algorithms.appo import learner as learner_module
+from sample_factory.algorithms.appo import model as appo_model
+from sample_factory.algorithms.appo.model_utils import normalize_obs
+from sample_factory.algorithms.utils.action_distributions import get_action_distribution, sample_actions_log_probs
 from sample_factory.run_algorithm import run_algorithm
+from sample_factory.utils.utils import AttrDict
 
 from marl_env.sample_factory_registration import register_maca_components
 
@@ -128,6 +132,95 @@ def _patch_sample_factory_buffer_squeeze():
     learner_module.LearnerWorker._prepare_train_buffer = safe_prepare_train_buffer
 
 
+def _patch_sample_factory_action_masking():
+    """Apply MaCA action masks to policy logits in both actors and learner updates."""
+
+    invalid_logit = -1e9
+
+    def stash_action_mask(actor_critic, obs_dict):
+        action_mask = obs_dict.get("action_mask")
+        actor_critic._last_action_mask = None if action_mask is None else action_mask.bool()
+
+    def mask_action_logits(actor_critic, action_logits):
+        action_mask = getattr(actor_critic, "_last_action_mask", None)
+        actor_critic._last_action_mask = None
+        if action_mask is None:
+            return action_logits
+
+        action_mask = action_mask.to(device=action_logits.device)
+        if action_mask.dtype != torch.bool:
+            action_mask = action_mask > 0
+        if action_mask.shape != action_logits.shape:
+            return action_logits
+
+        has_valid_action = action_mask.any(dim=-1, keepdim=True)
+        if not torch.all(has_valid_action):
+            action_mask = torch.where(has_valid_action, action_mask, torch.ones_like(action_mask))
+
+        return action_logits.masked_fill(~action_mask, invalid_logit)
+
+    def shared_forward_head(self, obs_dict):
+        normalize_obs(obs_dict, self.cfg)
+        stash_action_mask(self, obs_dict)
+        return self.encoder(obs_dict)
+
+    def shared_forward_tail(self, core_output, with_action_distribution=False):
+        values = self.critic_linear(core_output)
+        action_distribution_params, _ = self.action_parameterization(core_output)
+        action_distribution_params = mask_action_logits(self, action_distribution_params)
+        action_distribution = get_action_distribution(self.action_space, raw_logits=action_distribution_params)
+        actions, log_prob_actions = sample_actions_log_probs(action_distribution)
+
+        result = AttrDict(
+            dict(
+                actions=actions,
+                action_logits=action_distribution_params,
+                log_prob_actions=log_prob_actions,
+                values=values,
+            )
+        )
+
+        if with_action_distribution:
+            result.action_distribution = action_distribution
+
+        return result
+
+    def separate_forward_head(self, obs_dict):
+        normalize_obs(obs_dict, self.cfg)
+        stash_action_mask(self, obs_dict)
+        head_outputs = []
+        for encoder in self.encoders:
+            head_outputs.append(encoder(obs_dict))
+        return torch.cat(head_outputs, dim=1)
+
+    def separate_forward_tail(self, core_output, with_action_distribution=False):
+        core_outputs = core_output.chunk(len(self.cores), dim=1)
+        action_distribution_params, _ = self.action_parameterization(core_outputs[0])
+        action_distribution_params = mask_action_logits(self, action_distribution_params)
+        action_distribution = get_action_distribution(self.action_space, raw_logits=action_distribution_params)
+        actions, log_prob_actions = sample_actions_log_probs(action_distribution)
+        values = self.critic_linear(core_outputs[1])
+
+        result = AttrDict(
+            dict(
+                actions=actions,
+                action_logits=action_distribution_params,
+                log_prob_actions=log_prob_actions,
+                values=values,
+            )
+        )
+
+        if with_action_distribution:
+            result.action_distribution = action_distribution
+
+        return result
+
+    appo_model._ActorCriticSharedWeights.forward_head = shared_forward_head
+    appo_model._ActorCriticSharedWeights.forward_tail = shared_forward_tail
+    appo_model._ActorCriticSeparateWeights.forward_head = separate_forward_head
+    appo_model._ActorCriticSeparateWeights.forward_tail = separate_forward_tail
+
+
 def _inject_defaults(argv):
     result = list(argv)
     for flag, value in _DEFAULT_FLAGS.items():
@@ -140,6 +233,7 @@ def main(argv=None):
     torch.multiprocessing.set_sharing_strategy("file_system")
     _patch_sample_factory_checkpoint_save()
     _patch_sample_factory_buffer_squeeze()
+    _patch_sample_factory_action_masking()
     register_maca_components()
     cfg = parse_args(argv=_inject_defaults(sys.argv[1:] if argv is None else argv))
     return run_algorithm(cfg)

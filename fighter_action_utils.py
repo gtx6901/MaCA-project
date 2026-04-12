@@ -5,6 +5,7 @@ FIGHTER_NUM = 10
 COURSE_NUM = 16
 ATTACK_IND_NUM = FIGHTER_NUM * 2 + 1
 ACTION_NUM = COURSE_NUM * ATTACK_IND_NUM
+COURSE_BASE_OFFSETS = np.arange(COURSE_NUM, dtype=np.int64) * ATTACK_IND_NUM
 
 RADAR_POINT_NUM = 10
 DEFAULT_DISTURB_POINT = 11
@@ -46,8 +47,6 @@ def build_valid_action_masks(info_obs_batch):
 
     mask = np.zeros((batch.shape[0], ACTION_NUM), dtype=np.bool_)
     for row_idx, info_obs in enumerate(batch):
-        valid_attack_indices = get_valid_attack_indices(info_obs)
-        for course_idx in range(COURSE_NUM):
-            base = course_idx * ATTACK_IND_NUM
-            mask[row_idx, base + np.asarray(valid_attack_indices, dtype=np.int64)] = True
+        valid_attack_indices = np.asarray(get_valid_attack_indices(info_obs), dtype=np.int64)
+        mask[row_idx, (COURSE_BASE_OFFSETS[:, None] + valid_attack_indices[None, :]).reshape(-1)] = True
     return mask

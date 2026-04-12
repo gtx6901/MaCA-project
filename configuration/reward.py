@@ -17,16 +17,16 @@ class GlobalVar:
     # detector radar see a fighter
     reward_radar_detector_fighter = 20
     # fighter radar see a detector
-    reward_radar_fighter_detector = 50
+    reward_radar_fighter_detector = 8
     # fighter radar see a fighter
-    reward_radar_fighter_fighter = 50
+    reward_radar_fighter_fighter = 8
 
     # Missile hit a detector
     reward_strike_detector_success = 260
     # Missile miss a detector
     reward_strike_detector_fail = -8
     # Missile hit a fighter
-    reward_strike_fighter_success = 420
+    reward_strike_fighter_success = 650
     # Missile miss a fighter
     reward_strike_fighter_fail = -8
 
@@ -36,12 +36,12 @@ class GlobalVar:
     reward_fighter_destroyed = -300
 
     # A valid attack action
-    reward_strike_act_valid = 100
+    reward_strike_act_valid = 0
     # An invalid attack action
     reward_strike_act_invalid = -8
 
     # Keep alive in a step
-    reward_keep_alive_step = -1
+    reward_keep_alive_step = -2
 
     # Round reward：totally win
     reward_totally_win = 8000
