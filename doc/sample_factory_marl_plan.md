@@ -31,6 +31,7 @@ As of `2026-04-11`, the following pieces are implemented and wired together:
 - standalone evaluation script
 - GPU smoke launcher
 - 4060 baseline launcher
+- 4080 fresh-start launcher
 
 ## Important Code Truths
 
@@ -55,8 +56,8 @@ These are the current defaults in `marl_env/sample_factory_registration.py`, and
 | `hidden_size` | `256` | single-layer LSTM core |
 | `rollout` | `64` | trajectory chunk length |
 | `recurrence` | `64` | BPTT length |
-| `num_workers` | `8` | current code default |
-| `batch_size` | `5120` | current code default |
+| `num_workers` | `6` | current code default |
+| `batch_size` | `3840` | current code default |
 | `ppo_epochs` | `4` | sample reuse per batch |
 | `learning_rate` | `1e-4` | fresh-training default |
 | `gamma` | `0.999` | effective horizon aligned with `max_step=1000` |

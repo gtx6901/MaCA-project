@@ -24,11 +24,11 @@ class GlobalVar:
     # Missile hit a detector
     reward_strike_detector_success = 260
     # Missile miss a detector
-    reward_strike_detector_fail = -8
+    reward_strike_detector_fail = -6
     # Missile hit a fighter
-    reward_strike_fighter_success = 650
+    reward_strike_fighter_success = 900
     # Missile miss a fighter
-    reward_strike_fighter_fail = -8
+    reward_strike_fighter_fail = -6
 
     # A detector been destroyed
     reward_detector_destroyed = -50
@@ -36,12 +36,12 @@ class GlobalVar:
     reward_fighter_destroyed = -300
 
     # A valid attack action
-    reward_strike_act_valid = 0
+    reward_strike_act_valid = 2
     # An invalid attack action
-    reward_strike_act_invalid = -8
+    reward_strike_act_invalid = -4
 
     # Keep alive in a step
-    reward_keep_alive_step = -2
+    reward_keep_alive_step = -1
 
     # Round reward：totally win
     reward_totally_win = 8000

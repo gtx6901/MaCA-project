@@ -51,6 +51,8 @@ class SampleFactoryMaCAEnv(gym.Env):
         self._last_obs_dict: Optional[Dict[str, Dict[str, np.ndarray]]] = None
         self._episode_returns = np.zeros(self.num_agents, dtype=np.float32)
         self._invalid_action_counts = np.zeros(self.num_agents, dtype=np.int32)
+        self._fire_action_counts = np.zeros(self.num_agents, dtype=np.int32)
+        self._attack_opportunity_counts = np.zeros(self.num_agents, dtype=np.int32)
         self._episode_len = 0
 
     @staticmethod
@@ -74,6 +76,8 @@ class SampleFactoryMaCAEnv(gym.Env):
         self._last_obs_dict = obs_dict
         self._episode_returns.fill(0.0)
         self._invalid_action_counts.fill(0)
+        self._fire_action_counts.fill(0)
+        self._attack_opportunity_counts.fill(0)
         self._episode_len = 0
         return self._format_obs_list(obs_dict)
 
@@ -85,6 +89,10 @@ class SampleFactoryMaCAEnv(gym.Env):
         for idx, agent_id in enumerate(self.maca_env.agents):
             chosen_action = int(actions[idx])
             valid_mask = self._last_obs_dict[agent_id]["action_mask"]
+            if np.any(valid_mask[1:]):
+                self._attack_opportunity_counts[idx] += 1
+            if (chosen_action % ATTACK_IND_NUM) > 0:
+                self._fire_action_counts[idx] += 1
             safe_action = self._sanitize_action(chosen_action, valid_mask)
             if safe_action != chosen_action:
                 self._invalid_action_counts[idx] += 1
@@ -112,6 +120,9 @@ class SampleFactoryMaCAEnv(gym.Env):
                     "round_reward": agent_info["round_reward"],
                     "opponent_round_reward": agent_info["opponent_round_reward"],
                     "invalid_action_frac": float(self._invalid_action_counts[idx]) / float(max(self._episode_len, 1)),
+                    "fire_action_frac": float(self._fire_action_counts[idx]) / float(max(self._episode_len, 1)),
+                    "attack_opportunity_frac": float(self._attack_opportunity_counts[idx])
+                    / float(max(self._episode_len, 1)),
                     "episode_len": float(self._episode_len),
                     "win_flag": float(agent_info["round_reward"] > agent_info["opponent_round_reward"]),
                 }

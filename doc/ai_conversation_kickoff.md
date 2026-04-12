@@ -1,6 +1,6 @@
 # MaCA 项目对话开场白（2026-04-11）
 
-你现在在项目：`/home/lehan/MaCA-master`。
+你现在在项目：`/root/autodl-tmp/MaCA-project`。
 
 这是一个 MaCA（多智能体空战）强化学习项目。当前主线已经从旧版 DQN 迁移到 `Sample Factory + APPO/PPO + LSTM`，DQN 相关脚本仅作为历史参考保留。
 
@@ -19,6 +19,7 @@
 - 训练入口：`scripts/train_sf_maca.py`
 - GPU 冒烟脚本：`scripts/run_sf_maca_gpu_smoke.sh`
 - 基线训练脚本：`scripts/run_sf_maca_4060_baseline.sh`
+- 4080 fresh-start 脚本：`scripts/run_sf_maca_4080_freshstart.sh`
 - 评估脚本：`scripts/eval_sf_maca.py`
 
 旧 DQN 路线仍在仓库中，但不是当前默认建议：
@@ -71,10 +72,10 @@
 - `MAX_STEP=1000`
 - `TRAIN_SECONDS=7200`
 - `TRAIN_ENV_STEPS=50000000`
-- `NUM_WORKERS=8`
+- `NUM_WORKERS=6`
 - `ROLLOUT=64`
 - `RECURRENCE=64`
-- `BATCH_SIZE=5120`
+- `BATCH_SIZE=3840`
 
 注意：
 
@@ -85,7 +86,7 @@
 
 以 `configuration/reward.py` 和 `fighter_action_utils.py` 为准：
 
-- `reward_strike_act_valid = 5`
+- `reward_strike_act_valid = 0`
 - `reward_strike_act_invalid = -8`
 - `reward_keep_alive_step = -1`
 - `reward_totally_win = 8000`

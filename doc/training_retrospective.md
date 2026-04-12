@@ -4,6 +4,8 @@
 
 将 MaCA 10v10 空战仿真从旧版 DQN 迁移到 **Sample Factory 1.x + APPO/PPO + LSTM** 的多智能体共享策略训练框架。红方 10 架战斗机共享一个策略网络，蓝方为固定规则 (`fix_rule`) 对手。
 
+> 注：本文是阶段性复盘，文中部分参数（例如 `8 workers / batch_size=5120`）对应当时实验，不代表当前脚本默认值。当前默认请以 `marl_env/sample_factory_registration.py` 与 `scripts/run_sf_maca_4060_baseline.sh` 为准（现为 `num_workers=6`、`batch_size=3840`）。
+
 ---
 
 ## 问题与解决方案

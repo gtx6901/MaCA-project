@@ -152,7 +152,7 @@ cat "log/<exp_name>.eval.json"
 
 当前代码中关键事实：
 
-- `reward_strike_act_valid = 5`
+- `reward_strike_act_valid = 0`
 - `reward_strike_act_invalid = -8`
 - `reward_totally_win = 8000`
 - `reward_totally_lose = -2000`

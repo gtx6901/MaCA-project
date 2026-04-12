@@ -302,7 +302,7 @@ $$
 
 `marl_env/sample_factory_model.py` 是自定义 encoder，它回答“这份观测应该怎样编码”。如果以后你想尝试更强的感知结构，这里会是很核心的入口。
 
-`marl_env/sample_factory_registration.py` 则相当于“把环境和默认超参数正式注册进框架”的地方。当前工程中最重要的一批默认值，例如 `hidden_size=256`、`rollout=64`、`recurrence=64`、`num_workers=8`、`batch_size=5120`、`learning_rate=1e-4`、`reward_scale=0.005`、`reward_clip=50.0`、`ppo_epochs=4`、`max_policy_lag=15`，都集中在这里。
+`marl_env/sample_factory_registration.py` 则相当于“把环境和默认超参数正式注册进框架”的地方。当前工程中最重要的一批默认值，例如 `hidden_size=256`、`rollout=64`、`recurrence=64`、`num_workers=6`、`batch_size=3840`、`learning_rate=1e-4`、`reward_scale=0.005`、`reward_clip=50.0`、`ppo_epochs=4`、`max_policy_lag=15`，都集中在这里。
 
 `scripts/train_sf_maca.py` 是实际训练入口。它不只是简单转调 `Sample Factory`，还承担了几个非常关键的兼容与定制任务，包括 checkpoint 临时文件保存补丁、单轨迹 buffer 形状兼容补丁，以及策略层 action masking 补丁。换句话说，它是“原框架”和“当前项目需求”之间真正完成结合的地方。
 
@@ -330,7 +330,7 @@ $$
 
 第一层是系统是否正常启动。环境是否初始化成功，learner 是否成功起，policy worker 是否成功起，checkpoint 是否能保存。这一层如果不过，根本不值得讨论算法行为。第二层是设备是否真的在按预期使用。当前工程里，单独那句 `Queried available GPUs: 0` 并不能直接说明 learner 没用 GPU，你真正要看的是 learner 与 inference worker 是否设置了 `CUDA_VISIBLE_DEVICES`，是否打印出 `Visible devices: 1`，以及后续是否出现 `GPU learner timing` 这样的统计。只有这些组合在一起，才能确认 GPU 真在参与训练。
 
-第三层是吞吐与 learner 负载。当前工程里有一个特别值得警惕的告警：`Learner ... accumulated too much experience`。这说明 actor 采样速度已经明显快于 learner 消化速度，样本会越来越旧，异步训练里的 policy lag 风险随之提高。这个问题往往比“某一段 reward 没涨”更加基础，因为它会从底层破坏训练稳定性。由于当前脚本默认已经是 `num_workers=8`、`batch_size=5120` 这类更激进设置，所以看到这类告警时，优先要检查的就是 worker 数、batch 规模、rollout 长度和 learner 消化能力之间是否失衡。
+第三层是吞吐与 learner 负载。当前工程里有一个特别值得警惕的告警：`Learner ... accumulated too much experience`。这说明 actor 采样速度已经明显快于 learner 消化速度，样本会越来越旧，异步训练里的 policy lag 风险随之提高。这个问题往往比“某一段 reward 没涨”更加基础，因为它会从底层破坏训练稳定性。当前脚本默认是 `num_workers=6`、`batch_size=3840`，若要在更强 GPU（如 4080）上提升利用率，建议循序增加 worker/batch 并持续观察 backlog 与 policy lag。
 
 第四层才是任务表现本身。这里不能只看单点 reward，而应结合滑动平均、最佳窗口、最后阶段表现、checkpoint 保存时刻和独立评估结果一起看。你需要养成一种习惯：区分“某一瞬间碰到了好结果”和“策略整体进入了更好的统计区域”。这也是为什么固定 checkpoint 的独立评估是必要的，因为训练在线日志本来就更嘈杂。
 

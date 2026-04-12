@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from collections import OrderedDict
 
 import numpy as np
@@ -125,6 +126,7 @@ def _inject_eval_args(argv):
 def _parse_cli(argv):
     episodes = 20
     output_json = None
+    progress = True
     passthrough = []
 
     idx = 0
@@ -146,10 +148,20 @@ def _parse_cli(argv):
             output_json = arg.split("=", 1)[1]
             idx += 1
             continue
+        if arg == "--progress":
+            value = argv[idx + 1].strip().lower()
+            progress = value not in {"0", "false", "no", "off"}
+            idx += 2
+            continue
+        if arg.startswith("--progress="):
+            value = arg.split("=", 1)[1].strip().lower()
+            progress = value not in {"0", "false", "no", "off"}
+            idx += 1
+            continue
         passthrough.append(arg)
         idx += 1
 
-    return episodes, output_json, passthrough
+    return episodes, output_json, progress, passthrough
 
 
 def main(argv=None):
@@ -157,7 +169,7 @@ def main(argv=None):
     _patch_sample_factory_action_masking()
 
     raw_argv = sys.argv[1:] if argv is None else argv
-    episodes, output_json, sf_argv = _parse_cli(raw_argv)
+    episodes, output_json, progress, sf_argv = _parse_cli(raw_argv)
     cfg = parse_args(argv=_inject_eval_args(sf_argv), evaluation=True)
     cfg = load_from_checkpoint(cfg)
     cfg.env_frameskip = 1
@@ -181,6 +193,7 @@ def main(argv=None):
     rnn_states = torch.zeros((env.num_agents, get_hidden_size(cfg)), dtype=torch.float32, device=device)
 
     episode_results = []
+    eval_start_time = time.time()
 
     with torch.no_grad():
         while len(episode_results) < episodes:
@@ -206,6 +219,10 @@ def main(argv=None):
                 invalid_action_frac = float(
                     np.mean([stat.get("invalid_action_frac", 0.0) for stat in valid_stats])
                 )
+                fire_action_frac = float(np.mean([stat.get("fire_action_frac", 0.0) for stat in valid_stats]))
+                attack_opportunity_frac = float(
+                    np.mean([stat.get("attack_opportunity_frac", 0.0) for stat in valid_stats])
+                )
                 episode_len = float(np.mean([stat.get("episode_len", 0.0) for stat in valid_stats]))
                 win_flag = float(np.mean([stat.get("win_flag", 0.0) for stat in valid_stats]) > 0.5)
 
@@ -217,9 +234,29 @@ def main(argv=None):
                         "opponent_round_reward": opponent_round_reward,
                         "true_reward_mean": float(np.mean(true_rewards)),
                         "invalid_action_frac_mean": invalid_action_frac,
+                        "fire_action_frac_mean": fire_action_frac,
+                        "attack_opportunity_frac_mean": attack_opportunity_frac,
                         "episode_len_mean": episode_len,
                     }
                 )
+
+                if progress:
+                    latest = episode_results[-1]
+                    elapsed = time.time() - eval_start_time
+                    print(
+                        (
+                            f"[eval] episode {latest['episode']}/{episodes} "
+                            f"win={latest['win']} "
+                            f"len={latest['episode_len_mean']:.0f} "
+                            f"round={latest['round_reward']:.1f} "
+                            f"true={latest['true_reward_mean']:.1f} "
+                            f"invalid={latest['invalid_action_frac_mean']:.4f} "
+                            f"fire={latest.get('fire_action_frac_mean', 0.0):.4f} "
+                            f"opp={latest.get('attack_opportunity_frac_mean', 0.0):.4f} "
+                            f"elapsed={elapsed:.1f}s"
+                        ),
+                        flush=True,
+                    )
 
                 rnn_states.zero_()
 
@@ -239,6 +276,14 @@ def main(argv=None):
         else 0.0,
         invalid_action_frac_mean=float(
             np.mean([row["invalid_action_frac_mean"] for row in episode_results])
+        )
+        if episode_results
+        else 0.0,
+        fire_action_frac_mean=float(np.mean([row["fire_action_frac_mean"] for row in episode_results]))
+        if episode_results
+        else 0.0,
+        attack_opportunity_frac_mean=float(
+            np.mean([row["attack_opportunity_frac_mean"] for row in episode_results])
         )
         if episode_results
         else 0.0,

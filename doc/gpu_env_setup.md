@@ -15,7 +15,7 @@ nvidia-smi
 MaCA 自带 PyArmor 依赖，当前建议继续固定 `Python 3.7`。
 
 ```bash
-cd /home/lehan/MaCA-master
+cd /root/autodl-tmp/MaCA-project
 conda env create -f conda/maca-gpu-dev.yml
 conda activate maca-py37-min
 ```
@@ -31,7 +31,7 @@ conda activate maca-py37-min
 ## 3. 配置运行时变量
 
 ```bash
-cd /home/lehan/MaCA-master
+cd /root/autodl-tmp/MaCA-project
 export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
 ```
 
@@ -63,7 +63,7 @@ python scripts/smoke_test_marl_env.py --steps 5 --opponent fix_rule
 当前最小闭环入口：
 
 ```bash
-cd /home/lehan/MaCA-master
+cd /root/autodl-tmp/MaCA-project
 conda activate maca-py37-min
 export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
 
@@ -90,7 +90,7 @@ bash scripts/run_sf_maca_gpu_smoke.sh
 当前正式入口：
 
 ```bash
-cd /home/lehan/MaCA-master
+cd /root/autodl-tmp/MaCA-project
 conda activate maca-py37-min
 export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
 
@@ -104,10 +104,10 @@ bash scripts/run_sf_maca_4060_baseline.sh
 - `device=gpu`
 - `maca_opponent=fix_rule`
 - `maca_max_step=1000`
-- `num_workers=8`
+- `num_workers=6`
 - `rollout=64`
 - `recurrence=64`
-- `batch_size=5120`
+- `batch_size=3840`
 - `use_rnn=True`
 - `rnn_type=lstm`
 - `gamma=0.999`
@@ -117,7 +117,7 @@ bash scripts/run_sf_maca_4060_baseline.sh
 ## 8. 后台运行模板
 
 ```bash
-cd /home/lehan/MaCA-master
+cd /root/autodl-tmp/MaCA-project
 conda activate maca-py37-min
 export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
 
@@ -139,6 +139,36 @@ tail -f "log/${EXP_NAME}.launcher.log"
 ```bash
 kill "$(cat "log/${EXP_NAME}.pid")"
 ```
+
+## 8.1 4080 fresh-start 训练（高利用率默认）
+
+若运行在 4080，可直接使用新增脚本：
+
+```bash
+cd /root/autodl-tmp/MaCA-project
+conda activate maca-py37-min
+export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
+
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+EXP_NAME="sf_maca_4080_fresh_${RUN_ID}" \
+nohup bash scripts/run_sf_maca_4080_freshstart.sh \
+  > "log/${EXP_NAME}.wrapper.log" 2>&1 &
+```
+
+该脚本默认值（可通过同名环境变量覆盖）：
+
+- `NUM_WORKERS=12`
+- `NUM_ENVS_PER_WORKER=1`
+- `BATCH_SIZE=NUM_WORKERS*ROLLOUT*10`（默认即 `7680`）
+- `ROLLOUT=64`
+- `RECURRENCE=64`
+- `PPO_EPOCHS=6`
+- `TRAIN_IN_BACKGROUND_THREAD=False`（当前代码组合下更稳定，设为 `True` 可能卡在 trajectory buffer 等待）
+- `LEARNER_MAIN_LOOP_NUM_CORES=3`
+- `TRAJ_BUFFERS_EXCESS_RATIO=4.0`
+- `TRAIN_SECONDS=21600`
+- `TRAIN_ENV_STEPS=100000000`
+- `FRESH_START=1`（若 `EXP_NAME` 已存在会删除同名实验目录）
 
 ## 9. 训练后评估
 
@@ -164,7 +194,7 @@ conda run --no-capture-output -n maca-py37-min \
 
 3. `Sample Factory` 能启动但 learner 很慢
 
-- 当前默认 `num_workers=8`、`batch_size=5120` 比较激进。
+- 当前默认 `num_workers=6`、`batch_size=3840`，在 4060 上更稳。
 - 如果日志里持续出现 learner backlog，再考虑下调 worker 数或 batch。
 
 4. 文档里看到旧 DQN 命令

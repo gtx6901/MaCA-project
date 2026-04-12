@@ -89,7 +89,7 @@
 
 ```bash
 RUN_ID=$(date +%Y%m%d_%H%M%S)
-cd /home/lehan/MaCA-master
+cd /root/autodl-tmp/MaCA-project
 conda activate maca-py37-min
 export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
 

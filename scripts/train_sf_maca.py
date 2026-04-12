@@ -13,6 +13,7 @@ import torch
 from sample_factory.algorithms.utils.arguments import parse_args
 from sample_factory.algorithms.appo import learner as learner_module
 from sample_factory.algorithms.appo import model as appo_model
+from sample_factory.algorithms.appo.appo_utils import iterate_recursively, list_of_dicts_to_dict_of_lists
 from sample_factory.algorithms.appo.model_utils import normalize_obs
 from sample_factory.algorithms.utils.action_distributions import get_action_distribution, sample_actions_log_probs
 from sample_factory.run_algorithm import run_algorithm
@@ -67,6 +68,7 @@ def _patch_sample_factory_buffer_squeeze():
 
     def safe_prepare_train_buffer(self, rollouts, macro_batch_size, timing):
         trajectories = [learner_module.AttrDict(r["t"]) for r in rollouts]
+        max_entropy_coeff = getattr(self.cfg, "max_entropy_coeff", 0.0)
 
         with timing.add_time("buffers"):
             buffer = learner_module.AttrDict()
@@ -79,44 +81,24 @@ def _patch_sample_factory_buffer_squeeze():
 
             for key, value in buffer.items():
                 if isinstance(value[0], (dict, OrderedDict)):
-                    buffer[key] = learner_module.list_of_dicts_to_dict_of_lists(value)
+                    buffer[key] = list_of_dicts_to_dict_of_lists(value)
 
-        with timing.add_time("buffer_stack_and_squeeze"):
-            tensors_to_squeeze = {
-                "actions",
-                "log_prob_actions",
-                "policy_version",
-                "policy_id",
-                "values",
-                "rewards",
-                "dones",
-            }
-
-            for dct, key, arr in learner_module.iterate_recursively(buffer):
-                tensor = np.stack(arr)
-                if key in tensors_to_squeeze and tensor.ndim > 2 and tensor.shape[-1] == 1:
-                    tensor = np.squeeze(tensor, axis=-1)
-                dct[key] = tensor
-
-        if self.cfg.max_entropy_coeff != 0.0:
+        if max_entropy_coeff != 0.0:
             with timing.add_time("max_entropy"), torch.no_grad():
-                action_distr_params = buffer.action_logits.reshape((-1, buffer.action_logits.shape[-1]))
+                action_logits = np.concatenate(buffer.action_logits, axis=0)
+                action_distr_params = action_logits.reshape((-1, action_logits.shape[-1]))
                 entropies = learner_module.get_action_distribution(
                     self.action_space, torch.Tensor(action_distr_params)
                 ).entropy().numpy()
                 entropies = entropies.reshape((-1, self.cfg.rollout))
-                buffer.rewards += self.cfg.max_entropy_coeff * entropies
+                for idx, rewards in enumerate(buffer.rewards):
+                    buffer.rewards[idx] = rewards + max_entropy_coeff * entropies[idx]
 
         if not self.cfg.with_vtrace:
             with timing.add_time("calc_gae"):
                 buffer = self._calculate_gae(buffer)
 
         with timing.add_time("batching"):
-            for dct, key, arr in learner_module.iterate_recursively(buffer):
-                envs_dim, time_dim = arr.shape[0:2]
-                new_shape = (envs_dim * time_dim,) + arr.shape[2:]
-                dct[key] = arr.reshape(new_shape)
-
             use_pinned_memory = self.cfg.device == "gpu"
             buffer = self.tensor_batcher.cat(buffer, macro_batch_size, use_pinned_memory, timing)
 
@@ -125,6 +107,23 @@ def _patch_sample_factory_buffer_squeeze():
 
         with timing.add_time("tensors_gpu_float"):
             device_buffer = self._copy_train_data_to_device(buffer)
+
+        with timing.add_time("squeeze"):
+            tensors_to_squeeze = [
+                "actions",
+                "log_prob_actions",
+                "policy_version",
+                "policy_id",
+                "values",
+                "rewards",
+                "dones",
+                "rewards_cpu",
+                "dones_cpu",
+            ]
+            for tensor_name in tensors_to_squeeze:
+                tensor = device_buffer.get(tensor_name, None)
+                if tensor is not None and tensor.ndim > 1 and tensor.shape[-1] == 1:
+                    device_buffer[tensor_name] = tensor.squeeze(-1)
 
         self.tensor_batch_pool.put(buffer)
         return device_buffer
