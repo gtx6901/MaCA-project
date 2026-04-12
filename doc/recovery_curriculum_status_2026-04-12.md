@@ -10,8 +10,14 @@
   - 探索系数：`PHASE1_EXPLORATION=0.06`
 - Phase 2（迁移到真实目标对手）
   - 对手：`fix_rule`
-  - 时长：累计秒数控制，默认 `PHASE2_TRAIN_SECONDS_TOTAL=21600`
-  - 探索系数：`PHASE2_EXPLORATION=0.03`
+  - 时长：默认 `PHASE2_SECONDS=16200`（4.5h）
+  - 探索系数：`PHASE2_EXPLORATION=0.045`（较旧版本 0.03 更高）
+  - 新增脉冲课表：每个 block 先短时 `fix_rule_no_att` 再切回 `fix_rule`
+    - `PHASE2_BLOCK_SECONDS=2700`
+    - `PHASE2_PULSE_SECONDS=900`
+    - `PHASE2_MAIN_SECONDS=1800`
+    - `PHASE2_CYCLES=6`
+    - 作用：在 phase2 持续维持主动攻击行为，减少“会规避但不开火”的回退
 
 辅助守护：`scripts/watch_resume_until_2200.sh`
 
@@ -30,9 +36,11 @@
 
 ### 仍待攻克
 
-- 对 `fix_rule` 仍未破零胜率（当前 `win_rate = 0.0`），但续训后
-  `round_reward_mean` 与 `true_reward_mean` 已较前一轮明显改善。
-- 说明 Phase 2 的迁移方向是对的，但还需要更长时间窗口和更密集评估。
+- 对 `fix_rule` 仍然整体偏弱，但最新暂停复评已偶发破零：
+  - 10 局：`win_rate = 0.10`
+  - 20 局复评：`win_rate = 0.05`
+- 训练趋势仍是正向：生存能力明显提升（早亡局下降），但攻击机会转化仍低。
+- 说明接下来应优先“训练策略微调”，而不是只延长同参训练时长。
 
 ## 3) 关键结果文件
 
@@ -40,9 +48,14 @@
 - `log/sf_maca_recovery_20260412_163435.eval20.fix_rule.json`
 - `log/sf_maca_recovery_20260412_163435.eval20.fix_rule.after1h.json`
 - `log/sf_maca_recovery_20260412_163435.phase2_resume_1h.log`
+- `log/eval_pause_check_latest.json`
+- `log/eval_pause_check_rerun20_20260412_213204.json`
 
 ## 4) 操作建议（当前）
 
-- 继续维持 Phase 2 训练到 `22:00`，再做一次 20 局评估。
-- 若 `win_rate` 仍为 0，但 `true_reward_mean` 持续改善，优先再给 2~4 小时训练窗口。
-- 若出现回报退化且 fire 频率再次塌缩，再回看奖励项与探索系数。
+- 继续训练，但改为“phase2 脉冲课表 + 更高探索系数”的新默认。
+- 固定每 1~2 小时做一次 20 局评估，避免被 5~10 局小样本波动误导。
+- 重点盯两个指标：
+  - `fire_action_frac_mean`
+  - `fire_action_frac_mean / attack_opportunity_frac_mean`
+- 若 2~3 个评估窗口后攻击转化仍不升，再进一步提高攻击相关奖励项权重。

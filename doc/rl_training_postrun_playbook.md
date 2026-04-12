@@ -9,6 +9,8 @@
 - 训练入口：`scripts/train_sf_maca.py`
 - 冒烟脚本：`scripts/run_sf_maca_gpu_smoke.sh`
 - 基线脚本：`scripts/run_sf_maca_4060_baseline.sh`
+- 低显存课表脚本：`scripts/run_sf_maca_4060_8g_curriculum.sh`
+- 恢复课表脚本：`scripts/run_sf_maca_recovery_curriculum.sh`
 - 评估脚本：`scripts/eval_sf_maca.py`
 
 旧 DQN 训练产物格式和这里不同，不再是本文默认对象。
@@ -113,6 +115,8 @@ cat "log/<exp_name>.eval.json"
 优先入口：
 
 - `scripts/run_sf_maca_4060_baseline.sh`
+- `scripts/run_sf_maca_4060_8g_curriculum.sh`
+- `scripts/run_sf_maca_recovery_curriculum.sh`
 - `marl_env/sample_factory_registration.py`
 
 常用项：
@@ -152,8 +156,9 @@ cat "log/<exp_name>.eval.json"
 
 当前代码中关键事实：
 
-- `reward_strike_act_valid = 0`
-- `reward_strike_act_invalid = -8`
+- `reward_strike_fighter_success = 900`
+- `reward_strike_act_valid = 2`
+- `reward_strike_act_invalid = -4`
 - `reward_totally_win = 8000`
 - `reward_totally_lose = -2000`
 

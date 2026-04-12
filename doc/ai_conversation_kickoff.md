@@ -19,6 +19,8 @@
 - 训练入口：`scripts/train_sf_maca.py`
 - GPU 冒烟脚本：`scripts/run_sf_maca_gpu_smoke.sh`
 - 基线训练脚本：`scripts/run_sf_maca_4060_baseline.sh`
+- 低显存训练脚本：`scripts/run_sf_maca_4060_8g_curriculum.sh`
+- 恢复课表脚本：`scripts/run_sf_maca_recovery_curriculum.sh`
 - 4080 fresh-start 脚本：`scripts/run_sf_maca_4080_freshstart.sh`
 - 评估脚本：`scripts/eval_sf_maca.py`
 
@@ -45,7 +47,7 @@
 
 ## 4. 当前代码中的默认训练参数
 
-以 `marl_env/sample_factory_registration.py` 和 `scripts/run_sf_maca_4060_baseline.sh` 为准。
+以 `marl_env/sample_factory_registration.py`、`scripts/run_sf_maca_4060_baseline.sh`、`scripts/run_sf_maca_recovery_curriculum.sh` 为准。
 
 ### 框架注册默认值
 
@@ -86,8 +88,9 @@
 
 以 `configuration/reward.py` 和 `fighter_action_utils.py` 为准：
 
-- `reward_strike_act_valid = 0`
-- `reward_strike_act_invalid = -8`
+- `reward_strike_fighter_success = 900`
+- `reward_strike_act_valid = 2`
+- `reward_strike_act_invalid = -4`
 - `reward_keep_alive_step = -1`
 - `reward_totally_win = 8000`
 - `reward_totally_lose = -2000`
@@ -99,7 +102,7 @@
 ## 6. 当前建议工作方式
 
 1. 先看 `scripts/run_sf_maca_gpu_smoke.sh` 是否能在本机闭环。
-2. 正式训练优先走 `scripts/run_sf_maca_4060_baseline.sh`。
+2. 正式训练优先走 `scripts/run_sf_maca_recovery_curriculum.sh`（通用）或 `scripts/run_sf_maca_4060_8g_curriculum.sh`（8GB 显存）。
 3. 训练结束后必须跑 `scripts/eval_sf_maca.py` 做独立评估。
 4. 调参时优先改 1 到 3 个关键参数，不要一次同时改整组。
 5. 如果结论与文档不一致，优先相信当前代码和脚本。

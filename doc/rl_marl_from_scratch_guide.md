@@ -306,7 +306,7 @@ $$
 
 `scripts/train_sf_maca.py` 是实际训练入口。它不只是简单转调 `Sample Factory`，还承担了几个非常关键的兼容与定制任务，包括 checkpoint 临时文件保存补丁、单轨迹 buffer 形状兼容补丁，以及策略层 action masking 补丁。换句话说，它是“原框架”和“当前项目需求”之间真正完成结合的地方。
 
-`scripts/run_sf_maca_gpu_smoke.sh` 用来验证训练链路能否最小闭环，而 `scripts/run_sf_maca_4060_baseline.sh` 则是正式基线训练脚本。前者是排障工具，后者才是真正拿来做长时间实验的入口。
+`scripts/run_sf_maca_gpu_smoke.sh` 用来验证训练链路能否最小闭环，而正式长训目前建议使用 `scripts/run_sf_maca_recovery_curriculum.sh`（通用恢复课表）或 `scripts/run_sf_maca_4060_8g_curriculum.sh`（8GB 显存约束）。`scripts/run_sf_maca_4060_baseline.sh` 仍可作为单阶段对照基线。
 
 最后，`scripts/eval_sf_maca.py` 则是为了补上训练闭环中的“评估”这一环。它会加载已有 experiment 的配置和最新 checkpoint，在固定对手和固定局数下运行评估，并给出 `win_rate`、`round_reward_mean`、`true_reward_mean`、`invalid_action_frac_mean` 等摘要。理解这一层很重要，因为没有独立评估，训练就只剩 reward 曲线猜谜。
 
@@ -314,9 +314,9 @@ $$
 
 ## 十七、当前正式基线超参数到底在表达什么
 
-如果参数只是被记成一串默认值，那你每次调参都会很被动。更好的方式是给每个参数一个明确的语言解释。当前正式基线里，`num_workers = 8` 表达的是当前脚本默认选择的采样吞吐配置。它不是已经证明最优，而是当前代码真正会启动的默认值；如果后续日志继续表明 learner 积压严重，它就是优先该被重新审视的参数之一。
+如果参数只是被记成一串默认值，那你每次调参都会很被动。更好的方式是给每个参数一个明确的语言解释。当前基线脚本默认里，`num_workers = 6` 表达的是当前脚本默认选择的采样吞吐配置；在 8GB 显存版本中则降到 `num_workers = 4`。它们都不是已经证明最优，而是针对不同硬件预算的起步默认值；如果后续日志继续表明 learner 积压严重，它就是优先该被重新审视的参数之一。
 
-`rollout = 64` 和 `recurrence = 64` 一起决定时序信用分配窗口和 RNN 反向传播长度。相比更短的窗口，这个设置更强调完整战斗过程中的长期依赖，但也会提高 batch 组织和 learner 消化压力。`batch_size = 5120` 同样如此：它是当前代码默认值，不是一个抽象理论上的最佳数字。读到这里要建立一个工程判断习惯：先区分“当前默认值是什么”，再讨论“它是否适合这台机器”。
+`rollout = 64` 和 `recurrence = 64` 一起决定时序信用分配窗口和 RNN 反向传播长度。相比更短的窗口，这个设置更强调完整战斗过程中的长期依赖，但也会提高 batch 组织和 learner 消化压力。当前基线脚本 `batch_size = 3840`，而 8GB 显存脚本进一步压缩到 `batch_size = 1024`；它们都不是抽象理论上的最佳数字，而是面向不同硬件预算的工程折中。读到这里要建立一个工程判断习惯：先区分“当前默认值是什么”，再讨论“它是否适合这台机器”。
 
 `ppo_epochs = 4` 表示每批样本会被重复利用多次，而不是只更新一遍就扔掉。`learning_rate = 1e-4` 则对应当前主线“从零训练也要有足够起步速度”的思路。`gamma = 0.999` 表达的是“任务更偏长期”——需要配合 `max_step=1000` 使有效规划视野覆盖整局。`exploration_loss_coeff = 0.02` 是当前熵正则强度。`max_policy_lag = 15` 体现的是对异步训练中样本新鲜度的更严格控制。最后，`reward_scale = 0.005` 与 `reward_clip = 50.0` 则共同控制训练信号进入优化器前的量级层次，必须一起理解。
 

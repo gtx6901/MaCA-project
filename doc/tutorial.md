@@ -107,6 +107,8 @@ MaCA代码结构与上述模块划分一致，具体如下图：
 - `scripts/train_sf_maca.py`：当前正式训练入口
 - `scripts/run_sf_maca_gpu_smoke.sh`：训练链路冒烟脚本
 - `scripts/run_sf_maca_4060_baseline.sh`：当前基线训练脚本
+- `scripts/run_sf_maca_4060_8g_curriculum.sh`：4060 8G 低显存训练脚本
+- `scripts/run_sf_maca_recovery_curriculum.sh`：恢复课表训练脚本（phase2 脉冲）
 - `scripts/eval_sf_maca.py`：独立评估脚本
 
 如果你的目标是“理解原始 MaCA 接口和数据结构”，继续读本文即可。

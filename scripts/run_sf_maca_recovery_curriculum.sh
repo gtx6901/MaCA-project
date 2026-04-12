@@ -20,6 +20,16 @@ PHASE2_SECONDS="${PHASE2_SECONDS:-16200}"
 PHASE2_OPPONENT="${PHASE2_OPPONENT:-fix_rule}"
 TOTAL_ENV_STEPS="${TOTAL_ENV_STEPS:-100000000}"
 
+# Phase-2 curriculum pulse:
+# inject short fix_rule_no_att blocks to keep proactive attack behavior alive,
+# then consolidate on fix_rule.
+PHASE2_USE_PULSE="${PHASE2_USE_PULSE:-1}"
+PHASE2_BLOCK_SECONDS="${PHASE2_BLOCK_SECONDS:-2700}"
+PHASE2_PULSE_SECONDS="${PHASE2_PULSE_SECONDS:-900}"
+PHASE2_MAIN_SECONDS="${PHASE2_MAIN_SECONDS:-$((PHASE2_BLOCK_SECONDS - PHASE2_PULSE_SECONDS))}"
+PHASE2_CYCLES="${PHASE2_CYCLES:-$((PHASE2_SECONDS / PHASE2_BLOCK_SECONDS))}"
+PHASE2_TRAIN_SECONDS_TOTAL="${PHASE2_TRAIN_SECONDS_TOTAL:-$((PHASE1_SECONDS + PHASE2_SECONDS))}"
+
 NUM_WORKERS="${NUM_WORKERS:-10}"
 NUM_ENVS_PER_WORKER="${NUM_ENVS_PER_WORKER:-1}"
 ROLLOUT="${ROLLOUT:-64}"
@@ -40,7 +50,8 @@ TRAJ_BUFFERS_EXCESS_RATIO="${TRAJ_BUFFERS_EXCESS_RATIO:-4.0}"
 
 # phase-specific entropy to avoid collapse in early stage
 PHASE1_EXPLORATION="${PHASE1_EXPLORATION:-0.06}"
-PHASE2_EXPLORATION="${PHASE2_EXPLORATION:-0.03}"
+PHASE2_EXPLORATION="${PHASE2_EXPLORATION:-0.045}"
+PHASE2_PULSE_EXPLORATION="${PHASE2_PULSE_EXPLORATION:-0.05}"
 
 FRESH_START="${FRESH_START:-1}"
 
@@ -112,10 +123,45 @@ run_phase() {
   "${cmd[@]}" 2>&1 | tee "$log_file"
 }
 
+remove_done_if_exists() {
+  local done_file="${TRAIN_DIR}/${EXP_NAME}/done"
+  if [[ -f "$done_file" ]]; then
+    echo "Removing done file: $done_file"
+    rm -f "$done_file"
+  fi
+}
+
 # Phase 1: easier opponent, stronger entropy
 run_phase "phase1_no_att" "$PHASE1_OPPONENT" "$PHASE1_SECONDS" "$PHASE1_EXPLORATION"
 
-# Phase 2: target opponent, reduced entropy for consolidation
-run_phase "phase2_fixrule" "$PHASE2_OPPONENT" "$PHASE2_SECONDS" "$PHASE2_EXPLORATION"
+# Sample Factory marks experiment as finished by creating a done file.
+# Remove it before phase-2 so we can continue training in the same experiment.
+remove_done_if_exists
+
+if [[ "$PHASE2_USE_PULSE" == "1" ]]; then
+  if [[ "$PHASE2_CYCLES" -lt 1 ]]; then
+    PHASE2_CYCLES=1
+  fi
+  if [[ "$PHASE2_MAIN_SECONDS" -lt 1 ]]; then
+    echo "PHASE2_MAIN_SECONDS must be >= 1, got: $PHASE2_MAIN_SECONDS"
+    exit 1
+  fi
+
+  echo "Phase-2 pulse curriculum enabled: cycles=${PHASE2_CYCLES}, block=${PHASE2_BLOCK_SECONDS}s, pulse=${PHASE2_PULSE_SECONDS}s, main=${PHASE2_MAIN_SECONDS}s"
+  current_target_seconds="$PHASE1_SECONDS"
+
+  for ((cycle=1; cycle<=PHASE2_CYCLES; cycle++)); do
+    current_target_seconds="$((current_target_seconds + PHASE2_PULSE_SECONDS))"
+    run_phase "phase2_pulse_noatt_c${cycle}" "$PHASE1_OPPONENT" "$current_target_seconds" "$PHASE2_PULSE_EXPLORATION"
+    remove_done_if_exists
+
+    current_target_seconds="$((current_target_seconds + PHASE2_MAIN_SECONDS))"
+    run_phase "phase2_fixrule_c${cycle}" "$PHASE2_OPPONENT" "$current_target_seconds" "$PHASE2_EXPLORATION"
+    remove_done_if_exists
+  done
+else
+  # Phase 2: target opponent, reduced entropy for consolidation
+  run_phase "phase2_fixrule" "$PHASE2_OPPONENT" "$PHASE2_TRAIN_SECONDS_TOTAL" "$PHASE2_EXPLORATION"
+fi
 
 echo "Recovery curriculum finished for experiment: $EXP_NAME"

@@ -170,6 +170,62 @@ nohup bash scripts/run_sf_maca_4080_freshstart.sh \
 - `TRAIN_ENV_STEPS=100000000`
 - `FRESH_START=1`（若 `EXP_NAME` 已存在会删除同名实验目录）
 
+## 8.2 恢复课表训练（推荐，含 phase2 脉冲）
+
+当策略出现“生存改善但不开火”时，优先使用恢复课表脚本：
+
+```bash
+cd /root/autodl-tmp/MaCA-project
+conda activate maca-py37-min
+export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
+
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+EXP_NAME="sf_maca_recovery_${RUN_ID}" \
+nohup bash scripts/run_sf_maca_recovery_curriculum.sh \
+  > "log/${EXP_NAME}.launcher.log" 2>&1 &
+```
+
+新默认（脚本 `scripts/run_sf_maca_recovery_curriculum.sh`）：
+
+- `PHASE1_OPPONENT=fix_rule_no_att`
+- `PHASE1_SECONDS=5400`
+- `PHASE1_EXPLORATION=0.06`
+- `PHASE2_OPPONENT=fix_rule`
+- `PHASE2_SECONDS=16200`
+- `PHASE2_USE_PULSE=1`
+- `PHASE2_BLOCK_SECONDS=2700`
+- `PHASE2_PULSE_SECONDS=900`
+- `PHASE2_MAIN_SECONDS=1800`
+- `PHASE2_EXPLORATION=0.045`
+- `PHASE2_PULSE_EXPLORATION=0.05`
+
+## 8.3 4060 8G 低显存启动脚本（新增）
+
+当显存预算约 8GB 时，使用：`scripts/run_sf_maca_4060_8g_curriculum.sh`
+
+```bash
+cd /root/autodl-tmp/MaCA-project
+conda activate maca-py37-min
+export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
+
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+EXP_NAME="sf_maca_4060_8g_curriculum_${RUN_ID}" \
+nohup bash scripts/run_sf_maca_4060_8g_curriculum.sh \
+  > "log/${EXP_NAME}.launcher.log" 2>&1 &
+```
+
+4060 8G 默认参数（显存约束优先）：
+
+- `NUM_WORKERS=4`
+- `ROLLOUT=32`
+- `RECURRENCE=32`
+- `BATCH_SIZE=1024`
+- `HIDDEN_SIZE=192`
+- `PPO_EPOCHS=2`
+- `TRAJ_BUFFERS_EXCESS_RATIO=2.0`
+- `PHASE1_SECONDS=3600`
+- `PHASE2_SECONDS=10800`
+
 ## 9. 训练后评估
 
 ```bash
@@ -200,4 +256,4 @@ conda run --no-capture-output -n maca-py37-min \
 4. 文档里看到旧 DQN 命令
 
 - `scripts/train_dqn_pipeline.py` 仍在仓库，但不是当前默认主线。
-- 现在优先使用 `run_sf_maca_gpu_smoke.sh` 和 `run_sf_maca_4060_baseline.sh`。
+- 现在优先使用 `run_sf_maca_gpu_smoke.sh`、`run_sf_maca_recovery_curriculum.sh`，在 8GB 显存机器上优先 `run_sf_maca_4060_8g_curriculum.sh`。
