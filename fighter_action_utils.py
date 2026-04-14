@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 
 
@@ -14,8 +16,10 @@ SHORT_ATTACK_MAX_DISTANCE = 50.0
 
 
 def get_support_action(step_cnt, fighter_idx):
-    """Use a deterministic radar sweep so training and evaluation match."""
-    radar_point = int((step_cnt + fighter_idx) % RADAR_POINT_NUM) + 1
+    """Use a deterministic but optionally slower radar sweep."""
+    sweep_interval = max(1, int(os.getenv("MACA_SUPPORT_SWEEP_INTERVAL", "1")))
+    radar_phase = int(step_cnt // sweep_interval)
+    radar_point = int((radar_phase + fighter_idx) % RADAR_POINT_NUM) + 1
     return radar_point, DEFAULT_DISTURB_POINT
 
 

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 from os.path import join
 from collections import OrderedDict
@@ -10,6 +11,7 @@ from collections import OrderedDict
 import numpy as np
 import torch
 
+from fighter_action_utils import ATTACK_IND_NUM
 from sample_factory.algorithms.utils.arguments import parse_args
 from sample_factory.algorithms.appo import learner as learner_module
 from sample_factory.algorithms.appo import model as appo_model
@@ -20,6 +22,13 @@ from sample_factory.run_algorithm import run_algorithm
 from sample_factory.utils.utils import AttrDict
 
 from marl_env.sample_factory_registration import register_maca_components
+from marl_env.runtime_tweaks import (
+    buffer_squeeze_patch_enabled,
+    format_runtime_tweaks,
+    get_fire_logit_bias,
+    get_fire_prob_floor,
+    load_runtime_tweaks,
+)
 
 
 _DEFAULT_FLAGS = {
@@ -135,6 +144,16 @@ def _patch_sample_factory_action_masking():
     """Apply MaCA action masks to policy logits in both actors and learner updates."""
 
     invalid_logit = -1e9
+    fire_logit_bias = get_fire_logit_bias()
+    fire_prob_floor = max(0.0, min(0.95, get_fire_prob_floor()))
+
+    def tuple_action_head_sizes(actor_critic):
+        if not hasattr(actor_critic.action_space, "spaces"):
+            return None
+        spaces = getattr(actor_critic.action_space, "spaces", None)
+        if spaces is None:
+            return None
+        return [space.n for space in spaces]
 
     def stash_action_mask(actor_critic, obs_dict):
         action_mask = obs_dict.get("action_mask")
@@ -156,7 +175,71 @@ def _patch_sample_factory_action_masking():
         if not torch.all(has_valid_action):
             action_mask = torch.where(has_valid_action, action_mask, torch.ones_like(action_mask))
 
-        return action_logits.masked_fill(~action_mask, invalid_logit)
+        head_sizes = tuple_action_head_sizes(actor_critic)
+        if head_sizes is not None:
+            split_logits = list(torch.split(action_logits, head_sizes, dim=-1))
+            split_masks = list(torch.split(action_mask, head_sizes, dim=-1))
+            split_logits = [
+                logits.masked_fill(~mask, invalid_logit) for logits, mask in zip(split_logits, split_masks)
+            ]
+
+            attack_logits = split_logits[-1]
+            attack_mask = split_masks[-1]
+            if fire_logit_bias != 0.0 and torch.any(attack_mask[..., 1:]):
+                fire_bias_mask = attack_mask.clone()
+                fire_bias_mask[..., 0] = False
+                attack_logits = attack_logits + fire_bias_mask.to(attack_logits.dtype) * fire_logit_bias
+
+            if fire_prob_floor > 0.0 and attack_logits.shape[-1] > 1:
+                valid_fire = attack_mask.clone()
+                valid_fire[..., 0] = False
+                has_attack_opportunity = valid_fire.any(dim=-1, keepdim=True)
+                if torch.any(has_attack_opportunity):
+                    valid_non_fire = attack_mask.clone()
+                    valid_non_fire[..., 1:] = False
+                    logsum_fire = torch.logsumexp(attack_logits.masked_fill(~valid_fire, invalid_logit), dim=-1)
+                    logsum_non_fire = torch.logsumexp(
+                        attack_logits.masked_fill(~valid_non_fire, invalid_logit), dim=-1
+                    )
+                    target_logit = math.log(fire_prob_floor / max(1e-8, 1.0 - fire_prob_floor))
+                    delta = torch.clamp(target_logit + logsum_non_fire - logsum_fire, min=0.0, max=20.0)
+                    rows = has_attack_opportunity.squeeze(-1) & torch.isfinite(delta)
+                    if torch.any(rows):
+                        attack_logits = attack_logits + valid_fire.to(attack_logits.dtype) * delta.unsqueeze(-1)
+
+            split_logits[-1] = attack_logits
+            return torch.cat(split_logits, dim=-1)
+
+        action_logits = action_logits.masked_fill(~action_mask, invalid_logit)
+        if action_logits.shape[-1] % ATTACK_IND_NUM == 0 and action_logits.shape[-1] > 1:
+            action_indices = torch.arange(action_logits.shape[-1], device=action_logits.device)
+            fire_positions = (action_indices % ATTACK_IND_NUM) > 0
+            valid_fire = action_mask & fire_positions.unsqueeze(0)
+            has_attack_opportunity = valid_fire.any(dim=-1, keepdim=True)
+        else:
+            fire_positions = None
+            valid_fire = None
+            has_attack_opportunity = None
+
+        if fire_logit_bias != 0.0 and valid_fire is not None:
+            if torch.any(has_attack_opportunity):
+                fire_bias_mask = valid_fire & has_attack_opportunity
+                action_logits = action_logits + fire_bias_mask.to(action_logits.dtype) * fire_logit_bias
+
+        if fire_prob_floor > 0.0 and valid_fire is not None:
+            if torch.any(has_attack_opportunity):
+                valid_fire_with_opp = valid_fire & has_attack_opportunity
+                valid_non_fire = action_mask & (~fire_positions).unsqueeze(0)
+                logsum_fire = torch.logsumexp(action_logits.masked_fill(~valid_fire, invalid_logit), dim=-1)
+                logsum_non_fire = torch.logsumexp(action_logits.masked_fill(~valid_non_fire, invalid_logit), dim=-1)
+                target_logit = math.log(fire_prob_floor / max(1e-8, 1.0 - fire_prob_floor))
+                delta = target_logit + logsum_non_fire - logsum_fire
+                delta = torch.clamp(delta, min=0.0, max=20.0)
+                rows = has_attack_opportunity.squeeze(-1) & torch.isfinite(delta)
+                if torch.any(rows):
+                    action_logits = action_logits + valid_fire_with_opp.to(action_logits.dtype) * delta.unsqueeze(-1)
+
+        return action_logits
 
     def shared_forward_head(self, obs_dict):
         normalize_obs(obs_dict, self.cfg)
@@ -229,9 +312,12 @@ def _inject_defaults(argv):
 
 
 def main(argv=None):
+    load_runtime_tweaks()
     torch.multiprocessing.set_sharing_strategy("file_system")
+    print(f"[maca_runtime] {format_runtime_tweaks()}", flush=True)
     _patch_sample_factory_checkpoint_save()
-    _patch_sample_factory_buffer_squeeze()
+    if buffer_squeeze_patch_enabled():
+        _patch_sample_factory_buffer_squeeze()
     _patch_sample_factory_action_masking()
     register_maca_components()
     cfg = parse_args(argv=_inject_defaults(sys.argv[1:] if argv is None else argv))

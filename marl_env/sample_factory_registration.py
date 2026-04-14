@@ -28,6 +28,54 @@ def add_maca_env_args(env, parser):
     p.add_argument("--maca_max_step", default=1000, type=int, help="Episode horizon for MaCA")
     p.add_argument("--maca_render", default=False, type=str2bool, help="Enable the original pygame renderer")
     p.add_argument("--maca_random_pos", default=False, type=str2bool, help="Randomize initial side positions")
+    p.add_argument(
+        "--maca_extended_observation",
+        default=False,
+        type=str2bool,
+        help="Append explicit contact/attack-envelope indicators to fighter measurements",
+    )
+    p.add_argument(
+        "--maca_decoupled_action_heads",
+        default=False,
+        type=str2bool,
+        help="Use tuple action heads: course head + attack head",
+    )
+    p.add_argument(
+        "--maca_adaptive_support_policy",
+        default=False,
+        type=str2bool,
+        help="Use radar/jammer receive history to choose radar and disturb frequencies",
+    )
+    p.add_argument(
+        "--maca_support_search_hold",
+        default=6,
+        type=int,
+        help="How many steps to hold a sampled radar point when no receive cue is available",
+    )
+    p.add_argument(
+        "--maca_radar_tracking_observation",
+        default=False,
+        type=str2bool,
+        help="Append radar receive and target-track memory features to fighter measurements",
+    )
+    p.add_argument(
+        "--maca_track_memory_steps",
+        default=12,
+        type=int,
+        help="How long to keep last seen target track features after contact is lost",
+    )
+    p.add_argument(
+        "--maca_semantic_screen_observation",
+        default=False,
+        type=str2bool,
+        help="Replace raw id/type image planes with semantic occupancy and track-memory planes",
+    )
+    p.add_argument(
+        "--maca_screen_track_memory_steps",
+        default=12,
+        type=int,
+        help="How long to keep image-space enemy track memory after current detections disappear",
+    )
 
 
 def maca_override_defaults(env, parser):

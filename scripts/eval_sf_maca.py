@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import time
 from collections import OrderedDict
@@ -11,6 +12,7 @@ from collections import OrderedDict
 import numpy as np
 import torch
 
+from fighter_action_utils import ATTACK_IND_NUM
 from sample_factory.algorithms.appo import model as appo_model
 from sample_factory.algorithms.appo.actor_worker import transform_dict_observations
 from sample_factory.algorithms.appo.learner import LearnerWorker
@@ -23,12 +25,26 @@ from sample_factory.envs.create_env import create_env
 from sample_factory.utils.utils import AttrDict
 
 from marl_env.sample_factory_registration import register_maca_components
+from marl_env.runtime_tweaks import (
+    format_runtime_tweaks,
+    get_eval_fire_prob_floor,
+    load_runtime_tweaks,
+)
 
 
 def _patch_sample_factory_action_masking():
     """Apply MaCA action masks to policy logits during evaluation."""
 
     invalid_logit = -1e9
+    eval_fire_prob_floor = max(0.0, min(0.95, get_eval_fire_prob_floor()))
+
+    def tuple_action_head_sizes(actor_critic):
+        if not hasattr(actor_critic.action_space, "spaces"):
+            return None
+        spaces = getattr(actor_critic.action_space, "spaces", None)
+        if spaces is None:
+            return None
+        return [space.n for space in spaces]
 
     def stash_action_mask(actor_critic, obs_dict):
         action_mask = obs_dict.get("action_mask")
@@ -50,7 +66,52 @@ def _patch_sample_factory_action_masking():
         if not torch.all(has_valid_action):
             action_mask = torch.where(has_valid_action, action_mask, torch.ones_like(action_mask))
 
-        return action_logits.masked_fill(~action_mask, invalid_logit)
+        head_sizes = tuple_action_head_sizes(actor_critic)
+        if head_sizes is not None:
+            split_logits = list(torch.split(action_logits, head_sizes, dim=-1))
+            split_masks = list(torch.split(action_mask, head_sizes, dim=-1))
+            split_logits = [
+                logits.masked_fill(~mask, invalid_logit) for logits, mask in zip(split_logits, split_masks)
+            ]
+
+            attack_logits = split_logits[-1]
+            attack_mask = split_masks[-1]
+            if eval_fire_prob_floor > 0.0 and attack_logits.shape[-1] > 1:
+                valid_fire = attack_mask.clone()
+                valid_fire[..., 0] = False
+                has_attack_opportunity = valid_fire.any(dim=-1, keepdim=True)
+                if torch.any(has_attack_opportunity):
+                    valid_non_fire = attack_mask.clone()
+                    valid_non_fire[..., 1:] = False
+                    logsum_fire = torch.logsumexp(attack_logits.masked_fill(~valid_fire, invalid_logit), dim=-1)
+                    logsum_non_fire = torch.logsumexp(
+                        attack_logits.masked_fill(~valid_non_fire, invalid_logit), dim=-1
+                    )
+                    target_logit = math.log(eval_fire_prob_floor / max(1e-8, 1.0 - eval_fire_prob_floor))
+                    delta = torch.clamp(target_logit + logsum_non_fire - logsum_fire, min=0.0, max=20.0)
+                    rows = has_attack_opportunity.squeeze(-1) & torch.isfinite(delta)
+                    if torch.any(rows):
+                        attack_logits = attack_logits + valid_fire.to(attack_logits.dtype) * delta.unsqueeze(-1)
+            split_logits[-1] = attack_logits
+            return torch.cat(split_logits, dim=-1)
+
+        action_logits = action_logits.masked_fill(~action_mask, invalid_logit)
+        if eval_fire_prob_floor > 0.0 and action_logits.shape[-1] % ATTACK_IND_NUM == 0 and action_logits.shape[-1] > 1:
+            action_indices = torch.arange(action_logits.shape[-1], device=action_logits.device)
+            fire_positions = (action_indices % ATTACK_IND_NUM) > 0
+            valid_fire = action_mask & fire_positions.unsqueeze(0)
+            has_attack_opportunity = valid_fire.any(dim=-1, keepdim=True)
+            if torch.any(has_attack_opportunity):
+                valid_fire_with_opp = valid_fire & has_attack_opportunity
+                valid_non_fire = action_mask & (~fire_positions).unsqueeze(0)
+                logsum_fire = torch.logsumexp(action_logits.masked_fill(~valid_fire, invalid_logit), dim=-1)
+                logsum_non_fire = torch.logsumexp(action_logits.masked_fill(~valid_non_fire, invalid_logit), dim=-1)
+                target_logit = math.log(eval_fire_prob_floor / max(1e-8, 1.0 - eval_fire_prob_floor))
+                delta = torch.clamp(target_logit + logsum_non_fire - logsum_fire, min=0.0, max=20.0)
+                rows = has_attack_opportunity.squeeze(-1) & torch.isfinite(delta)
+                if torch.any(rows):
+                    action_logits = action_logits + valid_fire_with_opp.to(action_logits.dtype) * delta.unsqueeze(-1)
+        return action_logits
 
     def shared_forward_head(self, obs_dict):
         normalize_obs(obs_dict, self.cfg)
@@ -165,6 +226,8 @@ def _parse_cli(argv):
 
 
 def main(argv=None):
+    load_runtime_tweaks()
+    print(f"[maca_runtime] {format_runtime_tweaks()}", flush=True)
     register_maca_components()
     _patch_sample_factory_action_masking()
 
@@ -220,8 +283,30 @@ def main(argv=None):
                     np.mean([stat.get("invalid_action_frac", 0.0) for stat in valid_stats])
                 )
                 fire_action_frac = float(np.mean([stat.get("fire_action_frac", 0.0) for stat in valid_stats]))
+                executed_fire_action_frac = float(
+                    np.mean([stat.get("executed_fire_action_frac", 0.0) for stat in valid_stats])
+                )
                 attack_opportunity_frac = float(
                     np.mean([stat.get("attack_opportunity_frac", 0.0) for stat in valid_stats])
+                )
+                missed_attack_frac = float(np.mean([stat.get("missed_attack_frac", 0.0) for stat in valid_stats]))
+                course_change_frac = float(np.mean([stat.get("course_change_frac", 0.0) for stat in valid_stats]))
+                course_unique_frac = float(np.mean([stat.get("course_unique_frac", 0.0) for stat in valid_stats]))
+                visible_enemy_count_mean = float(
+                    np.mean([stat.get("visible_enemy_count_mean", 0.0) for stat in valid_stats])
+                )
+                contact_frac = float(np.mean([stat.get("contact_frac", 0.0) for stat in valid_stats]))
+                attack_window_entry_frac = float(
+                    np.mean([stat.get("attack_window_entry_frac", 0.0) for stat in valid_stats])
+                )
+                nearest_enemy_distance_mean = float(
+                    np.mean([stat.get("nearest_enemy_distance_mean", 0.0) for stat in valid_stats])
+                )
+                nearest_enemy_distance_min = float(
+                    np.mean([stat.get("nearest_enemy_distance_min", 0.0) for stat in valid_stats])
+                )
+                engagement_progress_reward_mean = float(
+                    np.mean([stat.get("engagement_progress_reward_mean", 0.0) for stat in valid_stats])
                 )
                 episode_len = float(np.mean([stat.get("episode_len", 0.0) for stat in valid_stats]))
                 win_flag = float(np.mean([stat.get("win_flag", 0.0) for stat in valid_stats]) > 0.5)
@@ -235,7 +320,17 @@ def main(argv=None):
                         "true_reward_mean": float(np.mean(true_rewards)),
                         "invalid_action_frac_mean": invalid_action_frac,
                         "fire_action_frac_mean": fire_action_frac,
+                        "executed_fire_action_frac_mean": executed_fire_action_frac,
                         "attack_opportunity_frac_mean": attack_opportunity_frac,
+                        "missed_attack_frac_mean": missed_attack_frac,
+                        "course_change_frac_mean": course_change_frac,
+                        "course_unique_frac_mean": course_unique_frac,
+                        "visible_enemy_count_mean": visible_enemy_count_mean,
+                        "contact_frac_mean": contact_frac,
+                        "attack_window_entry_frac_mean": attack_window_entry_frac,
+                        "nearest_enemy_distance_mean": nearest_enemy_distance_mean,
+                        "nearest_enemy_distance_min": nearest_enemy_distance_min,
+                        "engagement_progress_reward_mean": engagement_progress_reward_mean,
                         "episode_len_mean": episode_len,
                     }
                 )
@@ -252,7 +347,15 @@ def main(argv=None):
                             f"true={latest['true_reward_mean']:.1f} "
                             f"invalid={latest['invalid_action_frac_mean']:.4f} "
                             f"fire={latest.get('fire_action_frac_mean', 0.0):.4f} "
+                            f"fire_exec={latest.get('executed_fire_action_frac_mean', 0.0):.4f} "
                             f"opp={latest.get('attack_opportunity_frac_mean', 0.0):.4f} "
+                            f"missed={latest.get('missed_attack_frac_mean', 0.0):.4f} "
+                            f"course_change={latest.get('course_change_frac_mean', 0.0):.3f} "
+                            f"course_unique={latest.get('course_unique_frac_mean', 0.0):.3f} "
+                            f"contact={latest.get('contact_frac_mean', 0.0):.3f} "
+                            f"visible_mean={latest.get('visible_enemy_count_mean', 0.0):.3f} "
+                            f"nearest_mean={latest.get('nearest_enemy_distance_mean', 0.0):.1f} "
+                            f"engage_reward={latest.get('engagement_progress_reward_mean', 0.0):.2f} "
                             f"elapsed={elapsed:.1f}s"
                         ),
                         flush=True,
@@ -282,8 +385,46 @@ def main(argv=None):
         fire_action_frac_mean=float(np.mean([row["fire_action_frac_mean"] for row in episode_results]))
         if episode_results
         else 0.0,
+        executed_fire_action_frac_mean=float(
+            np.mean([row["executed_fire_action_frac_mean"] for row in episode_results])
+        )
+        if episode_results
+        else 0.0,
         attack_opportunity_frac_mean=float(
             np.mean([row["attack_opportunity_frac_mean"] for row in episode_results])
+        )
+        if episode_results
+        else 0.0,
+        missed_attack_frac_mean=float(np.mean([row["missed_attack_frac_mean"] for row in episode_results]))
+        if episode_results
+        else 0.0,
+        course_change_frac_mean=float(np.mean([row["course_change_frac_mean"] for row in episode_results]))
+        if episode_results
+        else 0.0,
+        course_unique_frac_mean=float(np.mean([row["course_unique_frac_mean"] for row in episode_results]))
+        if episode_results
+        else 0.0,
+        visible_enemy_count_mean=float(np.mean([row["visible_enemy_count_mean"] for row in episode_results]))
+        if episode_results
+        else 0.0,
+        contact_frac_mean=float(np.mean([row["contact_frac_mean"] for row in episode_results]))
+        if episode_results
+        else 0.0,
+        attack_window_entry_frac_mean=float(
+            np.mean([row["attack_window_entry_frac_mean"] for row in episode_results])
+        )
+        if episode_results
+        else 0.0,
+        nearest_enemy_distance_mean=float(
+            np.mean([row["nearest_enemy_distance_mean"] for row in episode_results])
+        )
+        if episode_results
+        else 0.0,
+        nearest_enemy_distance_min=float(np.mean([row["nearest_enemy_distance_min"] for row in episode_results]))
+        if episode_results
+        else 0.0,
+        engagement_progress_reward_mean=float(
+            np.mean([row["engagement_progress_reward_mean"] for row in episode_results])
         )
         if episode_results
         else 0.0,

@@ -16,6 +16,7 @@ removing agents mid-episode.
 from __future__ import annotations
 
 import importlib
+from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
@@ -25,7 +26,10 @@ from fighter_action_utils import (
     ACTION_NUM,
     ATTACK_IND_NUM,
     COURSE_NUM,
+    DEFAULT_DISTURB_POINT,
+    RADAR_POINT_NUM,
     build_valid_action_masks,
+    get_valid_attack_indices,
     get_support_action,
 )
 
@@ -48,10 +52,18 @@ class EnvConfig:
     random_pos: bool = False
     random_seed: int = -1
     include_global_state: bool = True
+    adaptive_support_policy: bool = False
+    support_search_hold: int = 6
+    semantic_screen_observation: bool = False
+    screen_track_memory_steps: int = 12
 
 
 class MaCAParallelEnv:
     """Parallel-style wrapper over the current MaCA fighter environment."""
+
+    _RAW_SCREEN_CHANNELS = 5
+    _SEMANTIC_SCREEN_CHANNELS = 6
+    _SCREEN_SIZE = 100
 
     def __init__(self, config: Optional[EnvConfig] = None):
         self.config = config or EnvConfig()
@@ -60,8 +72,13 @@ class MaCAParallelEnv:
         self._env = None
         self._opponent_agent = None
         self._last_blue_obs = None
+        self._last_red_obs = None
         self._last_alive_mask = None
         self._step_count = 0
+        self._rng = np.random.RandomState(0)
+        self._support_radar_points = None
+        self._support_hold_steps = None
+        self._semantic_enemy_memory = None
         self._size_x = None
         self._size_y = None
         self.red_detector_num = 0
@@ -71,8 +88,11 @@ class MaCAParallelEnv:
         self.possible_agents: List[str] = []
         self.agents: List[str] = []
         self.action_space_n = ACTION_NUM
+        screen_channels = (
+            self._SEMANTIC_SCREEN_CHANNELS if self.config.semantic_screen_observation else self._RAW_SCREEN_CHANNELS
+        )
         self.observation_spec = {
-            "screen_shape": (100, 100, 5),
+            "screen_shape": (self._SCREEN_SIZE, self._SCREEN_SIZE, screen_channels),
             "info_shape": (6,),
             "action_mask_shape": (ACTION_NUM,),
         }
@@ -81,6 +101,7 @@ class MaCAParallelEnv:
     def _build_env(self, seed: int = -1) -> None:
         self._current_seed = seed
         self._pending_seed = seed
+        self._rng = np.random.RandomState(0 if seed is None or seed < 0 else seed)
         self._opponent_agent = self._load_opponent_agent(self.config.opponent)
         opponent_obs_ind = self._opponent_agent.get_obs_ind()
         self._env = interface.Environment(
@@ -108,6 +129,13 @@ class MaCAParallelEnv:
         self.possible_agents = [f"red_fighter_{idx}" for idx in range(self.red_fighter_num)]
         self.agents = list(self.possible_agents)
         self._last_alive_mask = np.zeros(self.red_fighter_num, dtype=np.bool_)
+        self._support_radar_points = np.asarray(
+            [(idx % RADAR_POINT_NUM) + 1 for idx in range(self.red_fighter_num)], dtype=np.int32
+        )
+        self._support_hold_steps = np.zeros(self.red_fighter_num, dtype=np.int32)
+        self._semantic_enemy_memory = np.zeros(
+            (self.red_fighter_num, self._SCREEN_SIZE, self._SCREEN_SIZE), dtype=np.float32
+        )
 
     @staticmethod
     def _load_opponent_agent(agent_name: str):
@@ -124,6 +152,8 @@ class MaCAParallelEnv:
             self._build_env(seed=self._pending_seed)
         self._env.reset()
         self._step_count = 0
+        if self._semantic_enemy_memory is not None:
+            self._semantic_enemy_memory.fill(0.0)
         observations, infos = self._collect_step_output()
         return observations, infos
 
@@ -185,14 +215,17 @@ class MaCAParallelEnv:
         self,
     ) -> Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Dict[str, object]]]:
         red_obs, blue_obs = self._env.get_obs()
+        self._last_red_obs = red_obs
         self._last_blue_obs = blue_obs
+
+        red_raw_obs, blue_raw_obs = self._env.get_obs_raw()
 
         global_state = None
         if self.config.include_global_state:
-            red_raw_obs, blue_raw_obs = self._env.get_obs_raw()
             global_state = self._build_global_state(red_raw_obs, blue_raw_obs)
 
         fighter_infos = np.stack([fighter["info"] for fighter in red_obs["fighter"]], axis=0)
+        raw_fighter_obs = red_raw_obs["fighter_obs_list"]
         valid_masks = build_valid_action_masks(fighter_infos)
 
         observations: Dict[str, Dict[str, np.ndarray]] = {}
@@ -203,8 +236,20 @@ class MaCAParallelEnv:
             alive = bool(fighter_obs["alive"])
             alive_mask[idx] = alive
 
-            screen = np.asarray(fighter_obs["screen"], dtype=np.uint8)
+            if self.config.semantic_screen_observation:
+                screen = self._build_semantic_screen(idx, raw_fighter_obs, red_raw_obs["joint_obs_dict"])
+            else:
+                screen = np.asarray(fighter_obs["screen"], dtype=np.uint8)
             info_vec = np.asarray(fighter_obs["info"], dtype=np.float32)
+            visible_enemy_count = 0
+            nearest_enemy_distance = 0.0
+            valid_attack_count = 0
+            nearest_enemy_bearing_sin = 0.0
+            nearest_enemy_bearing_cos = 0.0
+            recv_count = 0
+            recv_direction_sin = 0.0
+            recv_direction_cos = 0.0
+            recv_dominant_freq = 0.0
             if not alive:
                 screen = np.zeros_like(screen, dtype=np.uint8)
                 info_vec = np.zeros_like(info_vec, dtype=np.float32)
@@ -212,17 +257,41 @@ class MaCAParallelEnv:
                 mask[0] = True
             else:
                 mask = valid_masks[idx]
+                visible_list = raw_fighter_obs[idx]["r_visible_list"]
+                visible_enemy_count = len(visible_list)
+                nearest_enemy_distance, nearest_enemy_bearing_sin, nearest_enemy_bearing_cos = (
+                    self._extract_nearest_visible_track(raw_fighter_obs[idx], visible_list)
+                )
+                valid_attack_count = max(0, len(get_valid_attack_indices(info_vec)) - 1)
+                recv_count, recv_direction_sin, recv_direction_cos, recv_dominant_freq = self._extract_recv_features(
+                    raw_fighter_obs[idx]["j_recv_list"]
+                )
+            has_attack_opportunity = bool(valid_attack_count > 0)
 
             observations[agent_id] = {
                 "screen": screen,
                 "info": info_vec,
                 "action_mask": mask.astype(np.bool_),
                 "alive": np.asarray(alive, dtype=np.bool_),
+                "visible_enemy_count": np.asarray([visible_enemy_count], dtype=np.float32),
+                "nearest_enemy_distance": np.asarray([nearest_enemy_distance], dtype=np.float32),
+                "has_attack_opportunity": np.asarray([float(has_attack_opportunity)], dtype=np.float32),
+                "nearest_enemy_bearing_sin": np.asarray([nearest_enemy_bearing_sin], dtype=np.float32),
+                "nearest_enemy_bearing_cos": np.asarray([nearest_enemy_bearing_cos], dtype=np.float32),
+                "recv_count": np.asarray([recv_count], dtype=np.float32),
+                "recv_direction_sin": np.asarray([recv_direction_sin], dtype=np.float32),
+                "recv_direction_cos": np.asarray([recv_direction_cos], dtype=np.float32),
+                "recv_dominant_freq": np.asarray([recv_dominant_freq], dtype=np.float32),
             }
             infos[agent_id] = {
                 "is_active": alive,
                 "valid_action_mask": mask.astype(np.bool_),
                 "step_count": self._step_count,
+                "visible_enemy_count": visible_enemy_count,
+                "nearest_enemy_distance": nearest_enemy_distance,
+                "has_attack_opportunity": has_attack_opportunity,
+                "recv_count": recv_count,
+                "recv_dominant_freq": recv_dominant_freq,
             }
             if global_state is not None:
                 infos[agent_id]["global_state"] = global_state
@@ -230,20 +299,174 @@ class MaCAParallelEnv:
         self._last_alive_mask = alive_mask
         return observations, infos
 
+    def _build_semantic_screen(
+        self,
+        fighter_idx: int,
+        raw_fighter_obs: List[Mapping[str, object]],
+        joint_obs_dict: Mapping[str, object],
+    ) -> np.ndarray:
+        screen = np.zeros((self._SCREEN_SIZE, self._SCREEN_SIZE, self._SEMANTIC_SCREEN_CHANNELS), dtype=np.uint8)
+
+        team_visible_targets: List[Mapping[str, object]] = []
+        for fighter in raw_fighter_obs:
+            if fighter["alive"]:
+                team_visible_targets.extend(fighter["r_visible_list"])
+        passive_targets = list(joint_obs_dict.get("passive_detection_enemy_list", []))
+        own_visible_targets = list(raw_fighter_obs[fighter_idx]["r_visible_list"])
+
+        # Channel 0: current self radar contacts
+        self._draw_targets(screen[:, :, 0], own_visible_targets, value=255)
+        # Channel 1: current team active contacts union
+        self._draw_targets(screen[:, :, 1], team_visible_targets, value=255)
+        # Channel 2: current passive detections
+        self._draw_targets(screen[:, :, 2], passive_targets, value=255)
+
+        # Channel 3: decayed enemy track memory from active+passive detections
+        memory = self._semantic_enemy_memory[fighter_idx]
+        decay = 255.0 / float(max(self.config.screen_track_memory_steps, 1))
+        np.maximum(memory - decay, 0.0, out=memory)
+        self._draw_targets(memory, team_visible_targets, value=255.0)
+        self._draw_targets(memory, passive_targets, value=255.0)
+        screen[:, :, 3] = np.asarray(memory, dtype=np.uint8)
+
+        # Channel 4: alive friendly teammates (excluding self)
+        for idx, fighter in enumerate(raw_fighter_obs):
+            if not fighter["alive"] or idx == fighter_idx:
+                continue
+            self._draw_point(screen[:, :, 4], fighter["pos_x"], fighter["pos_y"], value=255)
+
+        # Channel 5: self location
+        self._draw_point(
+            screen[:, :, 5],
+            raw_fighter_obs[fighter_idx]["pos_x"],
+            raw_fighter_obs[fighter_idx]["pos_y"],
+            value=255,
+        )
+        return screen
+
+    def _draw_targets(self, plane: np.ndarray, targets: Iterable[Mapping[str, object]], value: float) -> None:
+        for target in targets:
+            self._draw_point(plane, target["pos_x"], target["pos_y"], value=value)
+
+    def _draw_point(self, plane: np.ndarray, pos_x: float, pos_y: float, value: float) -> None:
+        cell_x = int(float(pos_y) / 10.0)
+        cell_y = int(float(pos_x) / 10.0)
+        x0 = max(cell_x - 1, 0)
+        x1 = min(cell_x + 2, self._SCREEN_SIZE)
+        y0 = max(cell_y - 1, 0)
+        y1 = min(cell_y + 2, self._SCREEN_SIZE)
+        plane[x0:x1, y0:y1] = value
+
     def _decode_red_actions(self, action_dict: Mapping[str, int]) -> np.ndarray:
         fighter_action = np.zeros((self.red_fighter_num, 4), dtype=np.int32)
         for idx, agent_id in enumerate(self.agents):
-            radar_point, disturb_point = get_support_action(self._step_count, idx)
+            fighter_raw_obs = None
+            if self._last_red_obs is not None:
+                fighter_raw_obs = self._last_red_obs["fighter"][idx]
+            radar_point, disturb_point = self._get_support_action(idx, fighter_raw_obs)
             fighter_action[idx][1] = radar_point
             fighter_action[idx][2] = disturb_point
 
             if not self._last_alive_mask[idx]:
                 continue
 
-            action = int(action_dict.get(agent_id, 0))
-            fighter_action[idx][0] = int(360 / COURSE_NUM * int(action / ATTACK_IND_NUM))
-            fighter_action[idx][3] = int(action % ATTACK_IND_NUM)
+            action = action_dict.get(agent_id, 0)
+            if isinstance(action, np.ndarray):
+                action = action.tolist()
+            if isinstance(action, (list, tuple)) and len(action) >= 2:
+                course_action = int(action[0])
+                attack_action = int(action[1])
+            else:
+                flat_action = int(action)
+                course_action = int(flat_action / ATTACK_IND_NUM)
+                attack_action = int(flat_action % ATTACK_IND_NUM)
+
+            fighter_action[idx][0] = int(360 / COURSE_NUM * course_action)
+            fighter_action[idx][3] = attack_action
         return fighter_action
+
+    def _get_support_action(self, fighter_idx: int, fighter_raw_obs: Optional[Mapping[str, object]]):
+        if not self.config.adaptive_support_policy or fighter_raw_obs is None:
+            return get_support_action(self._step_count, fighter_idx)
+
+        recv_list = list(fighter_raw_obs.get("j_recv_list", []))
+        visible_list = list(fighter_raw_obs.get("r_visible_list", []))
+        current_radar_point = int(fighter_raw_obs.get("r_fre_point", 0))
+        if len(visible_list) > 0 and 1 <= current_radar_point <= RADAR_POINT_NUM:
+            radar_point = current_radar_point
+            self._support_radar_points[fighter_idx] = radar_point
+            self._support_hold_steps[fighter_idx] = max(1, int(self.config.support_search_hold))
+        else:
+            if self._support_hold_steps[fighter_idx] <= 0:
+                self._support_radar_points[fighter_idx] = int(self._rng.randint(1, RADAR_POINT_NUM + 1))
+                self._support_hold_steps[fighter_idx] = max(1, int(self.config.support_search_hold))
+            radar_point = int(self._support_radar_points[fighter_idx])
+            self._support_hold_steps[fighter_idx] -= 1
+
+        disturb_point = self._get_disturb_point(recv_list)
+        return radar_point, disturb_point
+
+    @staticmethod
+    def _get_dominant_recv_freq(recv_list: List[Mapping[str, object]]) -> Optional[int]:
+        if len(recv_list) == 1:
+            return int(recv_list[0].get("r_fp", DEFAULT_DISTURB_POINT))
+        if len(recv_list) > 1:
+            freq_counts = Counter(int(item.get("r_fp", DEFAULT_DISTURB_POINT)) for item in recv_list)
+            dominant_freq, dominant_count = freq_counts.most_common(1)[0]
+            if dominant_count * 2 > len(recv_list):
+                return int(dominant_freq)
+        return None
+
+    @staticmethod
+    def _get_disturb_point(recv_list: List[Mapping[str, object]]) -> int:
+        dominant_freq = MaCAParallelEnv._get_dominant_recv_freq(recv_list)
+        return int(dominant_freq) if dominant_freq is not None else DEFAULT_DISTURB_POINT
+
+    @staticmethod
+    def _extract_recv_features(recv_list: List[Mapping[str, object]]):
+        recv_count = len(recv_list)
+        if recv_count <= 0:
+            return 0.0, 0.0, 0.0, 0.0
+
+        dominant_freq = MaCAParallelEnv._get_dominant_recv_freq(recv_list)
+        if dominant_freq is not None:
+            selected = [item for item in recv_list if int(item.get("r_fp", DEFAULT_DISTURB_POINT)) == dominant_freq]
+        else:
+            selected = recv_list
+
+        angles = np.asarray([float(item.get("direction", 0.0)) * (np.pi / 180.0) for item in selected], dtype=np.float32)
+        recv_direction_sin = float(np.mean(np.sin(angles))) if angles.size > 0 else 0.0
+        recv_direction_cos = float(np.mean(np.cos(angles))) if angles.size > 0 else 0.0
+        recv_freq = float(dominant_freq if dominant_freq is not None else selected[0].get("r_fp", 0.0))
+        return float(recv_count), recv_direction_sin, recv_direction_cos, recv_freq
+
+    @staticmethod
+    def _extract_nearest_visible_track(fighter_raw_obs: Mapping[str, object], visible_list: List[Mapping[str, object]]):
+        if len(visible_list) <= 0:
+            return 0.0, 0.0, 0.0
+
+        own_x = float(fighter_raw_obs["pos_x"])
+        own_y = float(fighter_raw_obs["pos_y"])
+        own_course = float(fighter_raw_obs["course"])
+        closest = None
+        closest_dist_sq = None
+        for target in visible_list:
+            dx = float(target["pos_x"]) - own_x
+            dy = float(target["pos_y"]) - own_y
+            dist_sq = dx * dx + dy * dy
+            if closest_dist_sq is None or dist_sq < closest_dist_sq:
+                closest = target
+                closest_dist_sq = dist_sq
+
+        if closest is None or closest_dist_sq is None:
+            return 0.0, 0.0, 0.0
+
+        dx = float(closest["pos_x"]) - own_x
+        dy = float(closest["pos_y"]) - own_y
+        target_bearing = float(np.degrees(np.arctan2(dy, dx)))
+        relative_bearing = ((target_bearing - own_course + 180.0) % 360.0) - 180.0
+        relative_rad = relative_bearing * (np.pi / 180.0)
+        return float(np.sqrt(closest_dist_sq)), float(np.sin(relative_rad)), float(np.cos(relative_rad))
 
     def _build_global_state(self, red_raw_obs: Mapping[str, object], blue_raw_obs: Mapping[str, object]) -> np.ndarray:
         features: List[float] = [self._step_count / float(max(self.config.max_step, 1))]
