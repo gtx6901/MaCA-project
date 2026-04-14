@@ -1,0 +1,9 @@
+Local model artifacts live under `model/`.
+
+Expected usage:
+
+- `model/simple/`: local DQN checkpoints for legacy rule/DQN code paths
+- `model/backup/`: ad-hoc local backups only
+
+These directories are intentionally ignored by git. Only lightweight notes such
+as this README should be tracked.

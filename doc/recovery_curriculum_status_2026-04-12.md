@@ -19,10 +19,12 @@
     - `PHASE2_CYCLES=6`
     - 作用：在 phase2 持续维持主动攻击行为，减少“会规避但不开火”的回退
 
-辅助守护：`scripts/watch_resume_until_2200.sh`
+辅助守护（当前代码）：
 
-- 作用：在 `22:00` 前若训练中断，自动清理 `done` 并续训。
-- 当前实验：`sf_maca_recovery_20260412_163435`
+- `scripts/run_sf_maca_recovery_validation.sh`
+- `scripts/auto_eval_during_training.sh`
+
+当前实验：`sf_maca_recovery_20260412_163435`
 
 ## 2) 到目前为止，哪个环节缓解了问题
 

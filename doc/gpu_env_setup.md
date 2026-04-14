@@ -15,7 +15,7 @@ nvidia-smi
 MaCA 自带 PyArmor 依赖，当前建议继续固定 `Python 3.7`。
 
 ```bash
-cd /root/autodl-tmp/MaCA-project
+cd <repo-root>
 conda env create -f conda/maca-gpu-dev.yml
 conda activate maca-py37-min
 ```
@@ -31,7 +31,7 @@ conda activate maca-py37-min
 ## 3. 配置运行时变量
 
 ```bash
-cd /root/autodl-tmp/MaCA-project
+cd <repo-root>
 export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
 ```
 
@@ -63,7 +63,7 @@ python scripts/smoke_test_marl_env.py --steps 5 --opponent fix_rule
 当前最小闭环入口：
 
 ```bash
-cd /root/autodl-tmp/MaCA-project
+cd <repo-root>
 conda activate maca-py37-min
 export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
 
@@ -90,7 +90,7 @@ bash scripts/run_sf_maca_gpu_smoke.sh
 当前正式入口：
 
 ```bash
-cd /root/autodl-tmp/MaCA-project
+cd <repo-root>
 conda activate maca-py37-min
 export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
 
@@ -104,10 +104,10 @@ bash scripts/run_sf_maca_4060_baseline.sh
 - `device=gpu`
 - `maca_opponent=fix_rule`
 - `maca_max_step=1000`
-- `num_workers=6`
+- `num_workers=8`
 - `rollout=64`
 - `recurrence=64`
-- `batch_size=3840`
+- `batch_size=5120`
 - `use_rnn=True`
 - `rnn_type=lstm`
 - `gamma=0.999`
@@ -117,7 +117,7 @@ bash scripts/run_sf_maca_4060_baseline.sh
 ## 8. 后台运行模板
 
 ```bash
-cd /root/autodl-tmp/MaCA-project
+cd <repo-root>
 conda activate maca-py37-min
 export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
 
@@ -145,7 +145,7 @@ kill "$(cat "log/${EXP_NAME}.pid")"
 若运行在 4080，可直接使用新增脚本：
 
 ```bash
-cd /root/autodl-tmp/MaCA-project
+cd <repo-root>
 conda activate maca-py37-min
 export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
 
@@ -162,7 +162,7 @@ nohup bash scripts/run_sf_maca_4080_freshstart.sh \
 - `BATCH_SIZE=NUM_WORKERS*ROLLOUT*10`（默认即 `7680`）
 - `ROLLOUT=64`
 - `RECURRENCE=64`
-- `PPO_EPOCHS=6`
+- `PPO_EPOCHS=4`
 - `TRAIN_IN_BACKGROUND_THREAD=False`（当前代码组合下更稳定，设为 `True` 可能卡在 trajectory buffer 等待）
 - `LEARNER_MAIN_LOOP_NUM_CORES=3`
 - `TRAJ_BUFFERS_EXCESS_RATIO=4.0`
@@ -175,7 +175,7 @@ nohup bash scripts/run_sf_maca_4080_freshstart.sh \
 当策略出现“生存改善但不开火”时，优先使用恢复课表脚本：
 
 ```bash
-cd /root/autodl-tmp/MaCA-project
+cd <repo-root>
 conda activate maca-py37-min
 export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
 
@@ -204,7 +204,7 @@ nohup bash scripts/run_sf_maca_recovery_curriculum.sh \
 当显存预算约 8GB 时，使用：`scripts/run_sf_maca_4060_8g_curriculum.sh`
 
 ```bash
-cd /root/autodl-tmp/MaCA-project
+cd <repo-root>
 conda activate maca-py37-min
 export PYTHONPATH="$(pwd):$(pwd)/environment:${PYTHONPATH}"
 
@@ -250,7 +250,7 @@ conda run --no-capture-output -n maca-py37-min \
 
 3. `Sample Factory` 能启动但 learner 很慢
 
-- 当前默认 `num_workers=6`、`batch_size=3840`，在 4060 上更稳。
+- 当前默认 `num_workers=8`、`batch_size=5120`，在 4060 上是代码基线值。
 - 如果日志里持续出现 learner backlog，再考虑下调 worker 数或 batch。
 
 4. 文档里看到旧 DQN 命令

@@ -2,6 +2,8 @@
 
 这份文档不是命令手册，而是一份面向当前工程的系统学习笔记。它的目标是把你正在做的这件事，从“一个能跑的训练脚本”，重新还原成一条清晰的知识链：这个问题到底是什么，为什么它自然会走到强化学习，为什么这一类问题会偏向 `PPO / APPO + LSTM` 路线而不是 `DQN`，当前工程中的每个模块在理论上是什么、在直觉上是什么、在代码里又落在哪里，以及你以后应该如何读日志、判断训练状态、理解失败、继续迭代。
 
+> 代码一致性说明（2026-04-13）：本文以“原理讲解”为主。凡涉及当前默认参数、脚本入口与运行守护规则，请以 `doc/sample_factory_marl_plan.md` 和 `doc/critical_engineering_notes.md` 为准。
+
 我会默认你是大三自动化专业学生。也就是说，你大概率学过高等数学、线性代数、概率论、自动控制原理、一些优化与信号系统，也对状态、输入、输出、反馈、目标函数、梯度下降这些概念并不陌生。但我不会假设你已经系统学过强化学习。因此本文的写法会尽量遵循一条自然路径：先从你已经熟悉的控制与优化语言出发，再逐渐引入 RL 的形式化对象，然后再落到当前工程的代码结构和实践细节。这样做的目的很简单，不是减少内容，而是避免一上来就把 `POMDP`、`Advantage`、`GAE`、`PPO clip`、`V-trace`、`action mask`、`policy lag` 这些新词同时压到你头上，让你在心理上产生“每一块都懂一点，但合不起来”的感觉。
 
 如果只用一句话概括这份文档的任务，那就是：把当前这套工程，从“很多 patch 和很多参数”重新讲成一个连续的问题求解过程。
@@ -268,7 +270,7 @@ $$
 
 奖励不是事实，而是接口。它是你和 agent 之间的沟通语言。你真正想说的是“去赢得战斗”，但你没法直接把这一整句话塞进网络里，于是只能拆成一些数字：击中给分，被击毁扣分，赢局给分，平局怎么处理，是否鼓励开火，是否惩罚无效动作，是否有每步存活代价，等等。问题在于，一旦某个 shaping reward 的权重失衡，模型就可能开始钻空子，学会了一个在 reward 上看起来很对，但在真实目标上很歪的行为模式。
 
-当前工程里奖励的事实必须以 `configuration/reward.py` 为准。也就是说，当前代码中 `reward_strike_act_valid` 仍然是 `5`，`reward_draw` 是 `-500`，`reward_totally_win` 是 `8000`，`reward_totally_lose` 是 `-2000`。因此理解 agent 当前行为时，不能套用“合法开火奖励已经被清零”的旧假设，而要承认：当前策略仍然会感受到一个正的合法开火 shaping 信号。
+当前工程里奖励的事实必须以 `configuration/reward.py` 为准。也就是说，当前代码中 `reward_strike_act_valid` 是 `2`，`reward_draw` 是 `-1500`，`reward_totally_win` 是 `8000`，`reward_totally_lose` 是 `-2000`。因此理解 agent 当前行为时，不能套用“合法开火奖励已经被清零”的旧假设，而要承认：当前策略仍然会感受到一个正的合法开火 shaping 信号。
 
 另一个必须一起看的地方是 reward scale 和 clip。当前默认是 `reward_scale = 0.005`、`reward_clip = 50.0`。这组参数并不是随便写的。它们共同决定了：整局赢局、完全胜利、局部击毁、每步代价这些信号进入优化器前的相对量级。如果 scale 太大、clip 太小，普通赢局和完全胜利可能都会被裁到相近的上限，critic 就会失去区分能力；如果 scale 太小，又会让训练信号过弱。因此理解 reward 设计时，不要单看环境原始 reward 数值，而要看“原始奖励—缩放—裁剪”这三层之后的最终训练信号。
 
@@ -302,7 +304,7 @@ $$
 
 `marl_env/sample_factory_model.py` 是自定义 encoder，它回答“这份观测应该怎样编码”。如果以后你想尝试更强的感知结构，这里会是很核心的入口。
 
-`marl_env/sample_factory_registration.py` 则相当于“把环境和默认超参数正式注册进框架”的地方。当前工程中最重要的一批默认值，例如 `hidden_size=256`、`rollout=64`、`recurrence=64`、`num_workers=6`、`batch_size=3840`、`learning_rate=1e-4`、`reward_scale=0.005`、`reward_clip=50.0`、`ppo_epochs=4`、`max_policy_lag=15`，都集中在这里。
+`marl_env/sample_factory_registration.py` 则相当于“把环境和默认超参数正式注册进框架”的地方。当前工程中最重要的一批默认值，例如 `hidden_size=256`、`rollout=64`、`recurrence=64`、`num_workers=8`、`batch_size=5120`、`learning_rate=1e-4`、`reward_scale=0.005`、`reward_clip=50.0`、`ppo_epochs=4`、`max_policy_lag=15`，都集中在这里。
 
 `scripts/train_sf_maca.py` 是实际训练入口。它不只是简单转调 `Sample Factory`，还承担了几个非常关键的兼容与定制任务，包括 checkpoint 临时文件保存补丁、单轨迹 buffer 形状兼容补丁，以及策略层 action masking 补丁。换句话说，它是“原框架”和“当前项目需求”之间真正完成结合的地方。
 
@@ -314,9 +316,9 @@ $$
 
 ## 十七、当前正式基线超参数到底在表达什么
 
-如果参数只是被记成一串默认值，那你每次调参都会很被动。更好的方式是给每个参数一个明确的语言解释。当前基线脚本默认里，`num_workers = 6` 表达的是当前脚本默认选择的采样吞吐配置；在 8GB 显存版本中则降到 `num_workers = 4`。它们都不是已经证明最优，而是针对不同硬件预算的起步默认值；如果后续日志继续表明 learner 积压严重，它就是优先该被重新审视的参数之一。
+如果参数只是被记成一串默认值，那你每次调参都会很被动。更好的方式是给每个参数一个明确的语言解释。当前基线脚本默认里，`num_workers = 8` 表达的是当前脚本默认选择的采样吞吐配置；在 8GB 显存版本中则降到 `num_workers = 4`。它们都不是已经证明最优，而是针对不同硬件预算的起步默认值；如果后续日志继续表明 learner 积压严重，它就是优先该被重新审视的参数之一。
 
-`rollout = 64` 和 `recurrence = 64` 一起决定时序信用分配窗口和 RNN 反向传播长度。相比更短的窗口，这个设置更强调完整战斗过程中的长期依赖，但也会提高 batch 组织和 learner 消化压力。当前基线脚本 `batch_size = 3840`，而 8GB 显存脚本进一步压缩到 `batch_size = 1024`；它们都不是抽象理论上的最佳数字，而是面向不同硬件预算的工程折中。读到这里要建立一个工程判断习惯：先区分“当前默认值是什么”，再讨论“它是否适合这台机器”。
+`rollout = 64` 和 `recurrence = 64` 一起决定时序信用分配窗口和 RNN 反向传播长度。相比更短的窗口，这个设置更强调完整战斗过程中的长期依赖，但也会提高 batch 组织和 learner 消化压力。当前基线脚本 `batch_size = 5120`，而 8GB 显存脚本进一步压缩到 `batch_size = 1024`；它们都不是抽象理论上的最佳数字，而是面向不同硬件预算的工程折中。读到这里要建立一个工程判断习惯：先区分“当前默认值是什么”，再讨论“它是否适合这台机器”。
 
 `ppo_epochs = 4` 表示每批样本会被重复利用多次，而不是只更新一遍就扔掉。`learning_rate = 1e-4` 则对应当前主线“从零训练也要有足够起步速度”的思路。`gamma = 0.999` 表达的是“任务更偏长期”——需要配合 `max_step=1000` 使有效规划视野覆盖整局。`exploration_loss_coeff = 0.02` 是当前熵正则强度。`max_policy_lag = 15` 体现的是对异步训练中样本新鲜度的更严格控制。最后，`reward_scale = 0.005` 与 `reward_clip = 50.0` 则共同控制训练信号进入优化器前的量级层次，必须一起理解。
 
@@ -330,7 +332,7 @@ $$
 
 第一层是系统是否正常启动。环境是否初始化成功，learner 是否成功起，policy worker 是否成功起，checkpoint 是否能保存。这一层如果不过，根本不值得讨论算法行为。第二层是设备是否真的在按预期使用。当前工程里，单独那句 `Queried available GPUs: 0` 并不能直接说明 learner 没用 GPU，你真正要看的是 learner 与 inference worker 是否设置了 `CUDA_VISIBLE_DEVICES`，是否打印出 `Visible devices: 1`，以及后续是否出现 `GPU learner timing` 这样的统计。只有这些组合在一起，才能确认 GPU 真在参与训练。
 
-第三层是吞吐与 learner 负载。当前工程里有一个特别值得警惕的告警：`Learner ... accumulated too much experience`。这说明 actor 采样速度已经明显快于 learner 消化速度，样本会越来越旧，异步训练里的 policy lag 风险随之提高。这个问题往往比“某一段 reward 没涨”更加基础，因为它会从底层破坏训练稳定性。当前脚本默认是 `num_workers=6`、`batch_size=3840`，若要在更强 GPU（如 4080）上提升利用率，建议循序增加 worker/batch 并持续观察 backlog 与 policy lag。
+第三层是吞吐与 learner 负载。当前工程里有一个特别值得警惕的告警：`Learner ... accumulated too much experience`。这说明 actor 采样速度已经明显快于 learner 消化速度，样本会越来越旧，异步训练里的 policy lag 风险随之提高。这个问题往往比“某一段 reward 没涨”更加基础，因为它会从底层破坏训练稳定性。当前基线脚本默认是 `num_workers=8`、`batch_size=5120`，若要在更强 GPU（如 4080）上提升利用率，建议循序增加 worker/batch 并持续观察 backlog 与 policy lag。
 
 第四层才是任务表现本身。这里不能只看单点 reward，而应结合滑动平均、最佳窗口、最后阶段表现、checkpoint 保存时刻和独立评估结果一起看。你需要养成一种习惯：区分“某一瞬间碰到了好结果”和“策略整体进入了更好的统计区域”。这也是为什么固定 checkpoint 的独立评估是必要的，因为训练在线日志本来就更嘈杂。
 

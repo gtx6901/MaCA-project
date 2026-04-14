@@ -1,6 +1,6 @@
 # MaCA 项目对话开场白（2026-04-11）
 
-你现在在项目：`/root/autodl-tmp/MaCA-project`。
+你现在在项目：`/home/lehan/MaCA-master`（或你当前本地仓库根目录）。
 
 这是一个 MaCA（多智能体空战）强化学习项目。当前主线已经从旧版 DQN 迁移到 `Sample Factory + APPO/PPO + LSTM`，DQN 相关脚本仅作为历史参考保留。
 
@@ -40,10 +40,11 @@
 - 训练和评估都会把 `action_mask` 真正作用到 policy logits。
 - 环境层仍保留 `_sanitize_action()` 兜底，避免非法动作导致崩溃。
 - `measurements` 已从旧的线性 6 维改为当前 7 维：`sin(course) + cos(course) + 其余 5 个线性量`。
-- `scripts/train_sf_maca.py` 里包含 3 个兼容补丁：
+- `scripts/train_sf_maca.py` 里包含关键运行时补丁链：
   - checkpoint 临时文件保存补丁
-  - 单轨迹 buffer squeeze 补丁
-  - 动作掩码补丁
+  - 单轨迹 buffer squeeze 补丁（可开关）
+  - 动作掩码补丁（训练/评估一致）
+  - 可选 fire-logit bias（仅训练侧）
 
 ## 4. 当前代码中的默认训练参数
 
@@ -74,10 +75,10 @@
 - `MAX_STEP=1000`
 - `TRAIN_SECONDS=7200`
 - `TRAIN_ENV_STEPS=50000000`
-- `NUM_WORKERS=6`
+- `NUM_WORKERS=8`
 - `ROLLOUT=64`
 - `RECURRENCE=64`
-- `BATCH_SIZE=3840`
+- `BATCH_SIZE=5120`
 
 注意：
 

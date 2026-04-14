@@ -1,86 +1,138 @@
-# Sample Factory MARL Plan
+# Sample Factory MARL Plan (Code-Aligned, 2026-04-13)
 
-This document records the current engineering plan for MaCA on a single GPU host.
+## 1. Scope
 
-## Goal
+This file is the **single source of truth for current training workflow** in this repo.
+If any older document conflicts with this file, trust code + this file.
+For quick handoff reminders, also read `doc/critical_engineering_notes.md`.
 
-Train a shared red-fighter policy against `fix_rule` with a stable, reproducible `Sample Factory` pipeline, then iterate through evaluation-driven tuning.
+Mainline training path:
 
-## Current Direction
+- Environment: `marl_env/maca_parallel_env.py` + `marl_env/sample_factory_env.py`
+- Framework: `Sample Factory 1.x`
+- Algo: `APPO` (`with_vtrace=True`)
+- Policy: shared red fighter policy (`10` fixed fighter slots)
+- Recurrent core: `LSTM`
 
-The project has already switched its mainline to:
+Legacy DQN scripts are kept for history/reproduction only.
 
-- environment: custom multi-agent wrapper in `marl_env/maca_parallel_env.py`
-- framework: `Sample Factory 1.x`
-- algorithm: `APPO` with `V-trace`
-- policy: shared fighter policy
-- memory: `LSTM`
-- action validity: policy-level masking plus env-side fallback
+## 2. Code Truth Snapshot
 
-Legacy DQN scripts still exist, but they are no longer the default path for new experiments.
+### Environment / Action / Observation
 
-## Current Status
+- Red fighter agents are fixed to 10 (`red_fighter_0..9`), dead agents remain in set and only no-op is valid.
+- Action space is `336` (`COURSE_NUM=16`, `ATTACK_IND_NUM=21`, `ACTION_NUM=16*21`).
+- Action legality comes from `fighter_action_utils.py`:
+  - Long missile range threshold: `120.0`
+  - Short missile range threshold: `50.0`
+- Measurement vector is `7`-dim:
+  - heading encoded as `sin/cos` + 5 linear fields
+- Env-side fallback sanitization is active; policy-side action-mask logit patch is also active.
 
-As of `2026-04-11`, the following pieces are implemented and wired together:
+### Reward Baseline (raw env defaults)
 
-- parallel-style red fighter wrapper
-- Sample Factory environment adapter
-- custom encoder for image + measurements
-- env/model registration with MaCA-specific defaults
-- training entry with compatibility patches
-- standalone evaluation script
-- GPU smoke launcher
-- 4060 baseline launcher
-- 4080 fresh-start launcher
+Source: `configuration/reward.py`
 
-## Important Code Truths
+- `reward_strike_fighter_success = 900`
+- `reward_strike_act_valid = 2`
+- `reward_strike_act_invalid = -4`
+- `reward_keep_alive_step = -1`
+- `reward_draw = -1500`
+- `reward_totally_win = 8000`
+- `reward_totally_lose = -2000`
 
-The following are true in the current codebase and should be treated as source of truth:
+Runtime overrides are supported via env vars in `marl_env/runtime_tweaks.py`.
 
-- agent count is fixed to 10 red fighters
-- dead fighters stay in the agent set and only allow no-op
-- action space size is `336`
-- action masks are generated from missile count, target id, and distance
-- measurements are now `7`-dimensional, not `6`
-- heading is encoded as `sin/cos`, not as a linear scalar
-- `reward_clip` is `50.0`
-- `gamma` is `0.999`
+### Eval Metrics Already Implemented
 
-## Current Default Hyperparameters
+`scripts/eval_sf_maca.py` summary includes:
 
-These are the current defaults in `marl_env/sample_factory_registration.py`, and `scripts/run_sf_maca_4060_baseline.sh` uses the same main settings unless explicitly overridden.
+- `win_rate`
+- `round_reward_mean`
+- `opponent_round_reward_mean`
+- `true_reward_mean`
+- `invalid_action_frac_mean`
+- `fire_action_frac_mean`
+- `attack_opportunity_frac_mean`
+- `missed_attack_frac_mean`
+- `episode_len_mean`
 
-| Parameter | Current value | Notes |
-|---|---|---|
-| `algo` | `APPO` | async PPO with V-trace |
-| `hidden_size` | `256` | single-layer LSTM core |
-| `rollout` | `64` | trajectory chunk length |
-| `recurrence` | `64` | BPTT length |
-| `num_workers` | `6` | current code default |
-| `batch_size` | `3840` | current code default |
-| `ppo_epochs` | `4` | sample reuse per batch |
-| `learning_rate` | `1e-4` | fresh-training default |
-| `gamma` | `0.999` | effective horizon aligned with `max_step=1000` |
-| `reward_scale` | `0.005` | scales raw env rewards |
-| `reward_clip` | `50.0` | preserves fully-winning signal after scaling |
-| `max_policy_lag` | `15` | stale-sample control |
-| `exploration_loss_coeff` | `0.02` | entropy regularization |
-| `keep_checkpoints` | `20` | baseline script default |
+## 3. Current Default Hyperparameters
 
-## Why Earlier Notes Look Different
+### Registration defaults (`marl_env/sample_factory_registration.py`)
 
-Older notes in this repo mentioned settings such as:
+- `num_workers=8`
+- `rollout=64`
+- `recurrence=64`
+- `batch_size=5120`
+- `ppo_epochs=4`
+- `hidden_size=256`
+- `learning_rate=1e-4`
+- `gamma=0.999`
+- `reward_scale=0.005`
+- `reward_clip=50.0`
+- `max_policy_lag=15`
+- `exploration_loss_coeff=0.02`
 
-- `num_workers = 4`
-- `batch_size = 256`
-- `rollout = 32`
-- `recurrence = 32`
+### 4060 baseline launcher (`scripts/run_sf_maca_4060_baseline.sh`)
 
-Those were intermediate audit recommendations from an earlier tuning stage. They do not match the current registered defaults or the current baseline launcher anymore. When in doubt, follow the code.
+Default effective values match the same core profile:
 
-## Recommended Commands
+- `num_workers=8`
+- `rollout=64`
+- `recurrence=64`
+- `batch_size=5120`
+- `train_in_background_thread=False`
+- opponent `fix_rule`
 
-### Smoke Test
+### Takeover / validation tuned defaults (`2026-04-13` hotfix)
+
+For `scripts/run_sf_maca_takeover_night.sh` -> `scripts/run_sf_maca_recovery_validation.sh`:
+
+- `reward_scale=0.002`
+- `exploration_loss_coeff=0.06`
+- `MACA_MISSED_ATTACK_PENALTY=25`
+- `MACA_FIRE_LOGIT_BIAS=1.6` (takeover) / `1.2` (validation fallback)
+- monitor thresholds:
+  - `MACA_AUTO_EVAL_LOW_FIRE_THRESHOLD=0.001`
+  - `MACA_AUTO_EVAL_MIN_FIRE_OPP_RATIO=0.002`
+  - `MACA_AUTO_EVAL_ANOMALY_FIRE_THRESHOLD=0.001`
+
+## 4. Resume vs Fresh-Start Rule
+
+### Use `resume` when:
+
+- same observation/action/model definitions
+- same experiment goal (`fix_rule` track continuation)
+- you want incremental gain from existing checkpoint
+
+### Use `fresh_start` when:
+
+- model architecture changed
+- observation schema changed
+- action semantics changed
+- reward shaping changed substantially (distribution shift for critic/policy)
+
+Current recovery/takeover scripts are explicitly **resume-oriented**:
+
+- `scripts/run_sf_maca_recovery_validation.sh`
+- `scripts/run_sf_maca_takeover_night.sh`
+
+## 5. Stability Guards in Current Resume Workflow
+
+Implemented checks in recovery validation flow:
+
+- resume experiment path existence check
+- latest checkpoint existence + parsable env-step check
+- env-step headroom check before run
+- minimum env-step delta check after run
+- `done` file removal before continuation
+- online auto-eval monitor process
+- low-fire and low fire-to-opportunity ratio guardrails
+
+## 6. Recommended Commands
+
+### Smoke
 
 ```bash
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
@@ -97,6 +149,12 @@ TRAIN_SECONDS=7200 \
 bash scripts/run_sf_maca_4060_baseline.sh
 ```
 
+### Resume Validation / Takeover
+
+```bash
+bash scripts/run_sf_maca_takeover_night.sh
+```
+
 ### Evaluation
 
 ```bash
@@ -104,75 +162,18 @@ conda run --no-capture-output -n maca-py37-min \
   python scripts/eval_sf_maca.py \
   --experiment="$EXP_NAME" \
   --train_dir=train_dir/sample_factory \
-  --episodes=30
+  --episodes=30 \
+  --maca_opponent=fix_rule \
+  --output_json="log/${EXP_NAME}.eval30.fix_rule.json"
 ```
 
-## Work Phases
+## 7. Practical Rule
 
-### Phase 1: Environment Standardization
+For this repo, “baseline” means:
 
-Deliverables:
+1. can launch
+2. can resume
+3. can checkpoint safely
+4. can be independently evaluated with fixed settings
 
-- fixed red fighter slots
-- dict observations
-- action masks
-- dead-agent handling
-
-Status:
-
-- complete
-
-### Phase 2: Framework Adapter
-
-Deliverables:
-
-- Sample Factory env wrapper
-- compatible observation/action specs
-- stable reset/step behavior
-
-Status:
-
-- complete
-
-### Phase 3: Baseline Training Loop
-
-Deliverables:
-
-- GPU smoke path
-- 4060 baseline launcher
-- checkpoint save compatibility
-- action mask patch
-- evaluation script
-
-Status:
-
-- complete, but still being tuned
-
-### Phase 4: Evaluation-Driven Tuning
-
-Focus:
-
-- compare worker count and batch size against learner backlog
-- monitor invalid action fraction
-- track win rate with fixed evaluation episodes
-- tune against `fix_rule`, not only against training reward
-
-Status:
-
-- active
-
-### Phase 5: Generalization
-
-Possible next steps:
-
-- opponent pool
-- periodic cross-checkpoint evaluation
-- self-play only after fixed-opponent baseline is reliable
-
-Status:
-
-- pending
-
-## Practical Rule
-
-For this repo, "baseline" means "the path that can be launched, resumed, checkpointed, and independently evaluated today", not "the best-known policy already found". This document should therefore follow the current scripts, not older tuning notes.
+It does **not** mean “already optimal policy.”

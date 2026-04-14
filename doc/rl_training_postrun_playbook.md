@@ -11,6 +11,8 @@
 - 基线脚本：`scripts/run_sf_maca_4060_baseline.sh`
 - 低显存课表脚本：`scripts/run_sf_maca_4060_8g_curriculum.sh`
 - 恢复课表脚本：`scripts/run_sf_maca_recovery_curriculum.sh`
+- 恢复验证脚本：`scripts/run_sf_maca_recovery_validation.sh`
+- 接管夜训脚本：`scripts/run_sf_maca_takeover_night.sh`
 - 评估脚本：`scripts/eval_sf_maca.py`
 
 旧 DQN 训练产物格式和这里不同，不再是本文默认对象。
@@ -77,6 +79,9 @@ cat "log/<exp_name>.eval.json"
 - `summary.opponent_round_reward_mean`
 - `summary.true_reward_mean`
 - `summary.invalid_action_frac_mean`
+- `summary.fire_action_frac_mean`
+- `summary.attack_opportunity_frac_mean`
+- `summary.missed_attack_frac_mean`
 - `summary.episode_len_mean`
 
 ## 3. 当前决策规则

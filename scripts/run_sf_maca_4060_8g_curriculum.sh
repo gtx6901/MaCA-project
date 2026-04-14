@@ -12,6 +12,7 @@ MAX_STEP="${MAX_STEP:-1000}"
 SEED="${SEED:-1}"
 
 # Two-stage total schedule (4h default): 1h no_att + 3h pulsed fix_rule
+# Each phase duration here is an incremental wall-clock budget for that phase.
 PHASE1_SECONDS="${PHASE1_SECONDS:-3600}"
 PHASE1_OPPONENT="${PHASE1_OPPONENT:-fix_rule_no_att}"
 PHASE2_SECONDS="${PHASE2_SECONDS:-10800}"
@@ -135,14 +136,11 @@ fi
 run_phase "phase1_no_att" "$PHASE1_OPPONENT" "$PHASE1_SECONDS" "$PHASE1_EXPLORATION"
 remove_done_if_exists
 
-current_target_seconds="$PHASE1_SECONDS"
 for ((cycle=1; cycle<=PHASE2_CYCLES; cycle++)); do
-	current_target_seconds="$((current_target_seconds + PHASE2_PULSE_SECONDS))"
-	run_phase "phase2_pulse_noatt_c${cycle}" "$PHASE1_OPPONENT" "$current_target_seconds" "$PHASE2_PULSE_EXPLORATION"
+	run_phase "phase2_pulse_noatt_c${cycle}" "$PHASE1_OPPONENT" "$PHASE2_PULSE_SECONDS" "$PHASE2_PULSE_EXPLORATION"
 	remove_done_if_exists
 
-	current_target_seconds="$((current_target_seconds + PHASE2_MAIN_SECONDS))"
-	run_phase "phase2_fixrule_c${cycle}" "$PHASE2_OPPONENT" "$current_target_seconds" "$PHASE2_EXPLORATION"
+	run_phase "phase2_fixrule_c${cycle}" "$PHASE2_OPPONENT" "$PHASE2_MAIN_SECONDS" "$PHASE2_EXPLORATION"
 	remove_done_if_exists
 done
 
