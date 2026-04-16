@@ -10,6 +10,7 @@ TRAIN_DIR="${TRAIN_DIR:-train_dir/sample_factory}"
 ENV_NAME="${ENV_NAME:-maca_aircombat}"
 MAX_STEP="${MAX_STEP:-1000}"
 SEED="${SEED:-1}"
+DEVICE="${DEVICE:-gpu}"
 
 # About 8h total:
 # warmup 45m (no_att) + 6h pulse blocks + final 75m fix_rule consolidation.
@@ -21,6 +22,7 @@ PHASE2_MAIN_SECONDS="${PHASE2_MAIN_SECONDS:-3000}"
 PHASE3_SECONDS="${PHASE3_SECONDS:-4500}"
 PHASE3_OPPONENT="${PHASE3_OPPONENT:-fix_rule}"
 TOTAL_ENV_STEPS="${TOTAL_ENV_STEPS:-180000000}"
+MIN_PHASE_ENV_STEP_HEADROOM="${MIN_PHASE_ENV_STEP_HEADROOM:-500000}"
 
 NUM_WORKERS="${NUM_WORKERS:-10}"
 NUM_ENVS_PER_WORKER="${NUM_ENVS_PER_WORKER:-1}"
@@ -54,6 +56,23 @@ MACA_RADAR_TRACKING_OBSERVATION="${MACA_RADAR_TRACKING_OBSERVATION:-False}"
 MACA_TRACK_MEMORY_STEPS="${MACA_TRACK_MEMORY_STEPS:-12}"
 MACA_SEMANTIC_SCREEN_OBSERVATION="${MACA_SEMANTIC_SCREEN_OBSERVATION:-False}"
 MACA_SCREEN_TRACK_MEMORY_STEPS="${MACA_SCREEN_TRACK_MEMORY_STEPS:-12}"
+MACA_RELATIVE_MOTION_OBSERVATION="${MACA_RELATIVE_MOTION_OBSERVATION:-False}"
+MACA_DELTA_COURSE_ACTION="${MACA_DELTA_COURSE_ACTION:-False}"
+MACA_COURSE_DELTA_DEG="${MACA_COURSE_DELTA_DEG:-45}"
+MACA_TACTICAL_MODE_OBSERVATION="${MACA_TACTICAL_MODE_OBSERVATION:-False}"
+MACA_COURSE_PRIOR_OBSERVATION="${MACA_COURSE_PRIOR_OBSERVATION:-False}"
+MACA_COURSE_PRIOR_STRENGTH="${MACA_COURSE_PRIOR_STRENGTH:-0.0}"
+MACA_COURSE_HOLD_STEPS="${MACA_COURSE_HOLD_STEPS:-1}"
+MACA_MAX_COURSE_CHANGE_BINS="${MACA_MAX_COURSE_CHANGE_BINS:-15}"
+MACA_LOCK_STATE_OBSERVATION="${MACA_LOCK_STATE_OBSERVATION:-False}"
+MACA_TEAM_STATUS_OBSERVATION="${MACA_TEAM_STATUS_OBSERVATION:-False}"
+MACA_THREAT_STATE_OBSERVATION="${MACA_THREAT_STATE_OBSERVATION:-False}"
+MACA_INTERCEPT_COURSE_ASSIST="${MACA_INTERCEPT_COURSE_ASSIST:-False}"
+MACA_INTERCEPT_COURSE_BLEND="${MACA_INTERCEPT_COURSE_BLEND:-0.0}"
+MACA_INTERCEPT_BREAK_HOLD_BINS="${MACA_INTERCEPT_BREAK_HOLD_BINS:-0}"
+MACA_INTERCEPT_LEAD_DEG="${MACA_INTERCEPT_LEAD_DEG:-20}"
+MACA_COMMIT_DISTANCE="${MACA_COMMIT_DISTANCE:-140}"
+MACA_ATTACK_PRIOR_STRENGTH="${MACA_ATTACK_PRIOR_STRENGTH:-0.0}"
 
 mkdir -p log "$TRAIN_DIR"
 
@@ -64,21 +83,49 @@ fi
 
 export PYTHONPATH="$ROOT_DIR:$ROOT_DIR/environment${PYTHONPATH:+:$PYTHONPATH}"
 export MACA_ENABLE_SF_BUFFER_SQUEEZE_PATCH="${MACA_ENABLE_SF_BUFFER_SQUEEZE_PATCH:-0}"
-export MACA_REWARD_RADAR_FIGHTER_DETECTOR="${MACA_REWARD_RADAR_FIGHTER_DETECTOR:-8}"
-export MACA_REWARD_RADAR_FIGHTER_FIGHTER="${MACA_REWARD_RADAR_FIGHTER_FIGHTER:-8}"
-export MACA_REWARD_STRIKE_FIGHTER_SUCCESS="${MACA_REWARD_STRIKE_FIGHTER_SUCCESS:-1200}"
-export MACA_REWARD_STRIKE_FIGHTER_FAIL="${MACA_REWARD_STRIKE_FIGHTER_FAIL:--2}"
-export MACA_REWARD_STRIKE_ACT_VALID="${MACA_REWARD_STRIKE_ACT_VALID:-40}"
-export MACA_REWARD_KEEP_ALIVE_STEP="${MACA_REWARD_KEEP_ALIVE_STEP:--2}"
-export MACA_REWARD_DRAW="${MACA_REWARD_DRAW:--2000}"
-export MACA_MISSED_ATTACK_PENALTY="${MACA_MISSED_ATTACK_PENALTY:-60}"
+export MACA_REWARD_RADAR_FIGHTER_DETECTOR="${MACA_REWARD_RADAR_FIGHTER_DETECTOR:-0}"
+export MACA_REWARD_RADAR_FIGHTER_FIGHTER="${MACA_REWARD_RADAR_FIGHTER_FIGHTER:-0}"
+export MACA_REWARD_STRIKE_FIGHTER_SUCCESS="${MACA_REWARD_STRIKE_FIGHTER_SUCCESS:-900}"
+export MACA_REWARD_STRIKE_FIGHTER_FAIL="${MACA_REWARD_STRIKE_FIGHTER_FAIL:--6}"
+export MACA_REWARD_STRIKE_ACT_VALID="${MACA_REWARD_STRIKE_ACT_VALID:-0}"
+export MACA_REWARD_KEEP_ALIVE_STEP="${MACA_REWARD_KEEP_ALIVE_STEP:--1}"
+export MACA_REWARD_DRAW="${MACA_REWARD_DRAW:--1500}"
+export MACA_MISSED_ATTACK_PENALTY="${MACA_MISSED_ATTACK_PENALTY:-0}"
 export MACA_FIRE_LOGIT_BIAS="${MACA_FIRE_LOGIT_BIAS:-0.0}"
-export MACA_FIRE_PROB_FLOOR="${MACA_FIRE_PROB_FLOOR:-0.03}"
+export MACA_FIRE_PROB_FLOOR="${MACA_FIRE_PROB_FLOOR:-0.0}"
 export MACA_EVAL_FIRE_PROB_FLOOR="${MACA_EVAL_FIRE_PROB_FLOOR:-0.0}"
-export MACA_CONTACT_REWARD="${MACA_CONTACT_REWARD:-20}"
-export MACA_PROGRESS_REWARD_SCALE="${MACA_PROGRESS_REWARD_SCALE:-0.5}"
+export MACA_CONTACT_REWARD="${MACA_CONTACT_REWARD:-0}"
+export MACA_PROGRESS_REWARD_SCALE="${MACA_PROGRESS_REWARD_SCALE:-0}"
 export MACA_PROGRESS_REWARD_CAP="${MACA_PROGRESS_REWARD_CAP:-20}"
-export MACA_ATTACK_WINDOW_REWARD="${MACA_ATTACK_WINDOW_REWARD:-30}"
+export MACA_ATTACK_WINDOW_REWARD="${MACA_ATTACK_WINDOW_REWARD:-0}"
+export MACA_FRIENDLY_ATTRITION_PENALTY="${MACA_FRIENDLY_ATTRITION_PENALTY:-0}"
+export MACA_ENEMY_ATTRITION_REWARD="${MACA_ENEMY_ATTRITION_REWARD:-0}"
+export MACA_ATTACK_PRIOR_STRENGTH
+
+latest_env_steps() {
+  local checkpoint_dir="${TRAIN_DIR}/${EXP_NAME}/checkpoint_p0"
+  local latest_checkpoint
+
+  if [[ ! -d "$checkpoint_dir" ]]; then
+    echo 0
+    return
+  fi
+
+  latest_checkpoint="$(find "$checkpoint_dir" -maxdepth 1 -type f -name 'checkpoint_*.pth' | sort | tail -n 1)"
+  if [[ -z "$latest_checkpoint" ]]; then
+    echo 0
+    return
+  fi
+
+  local checkpoint_name
+  checkpoint_name="$(basename "$latest_checkpoint")"
+  if [[ "$checkpoint_name" =~ ^checkpoint_[0-9]+_([0-9]+)\.pth$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return
+  fi
+
+  echo 0
+}
 
 run_phase() {
   local phase_tag="$1"
@@ -86,6 +133,14 @@ run_phase() {
   local cumulative_train_seconds="$3"
   local exploration="$4"
   local log_file="log/${EXP_NAME}.${phase_tag}.log"
+  local current_env_steps
+  current_env_steps="$(latest_env_steps)"
+  local headroom=$((TOTAL_ENV_STEPS - current_env_steps))
+
+  if (( headroom < MIN_PHASE_ENV_STEP_HEADROOM )); then
+    echo "Skipping ${phase_tag}: insufficient env-step headroom (${headroom} < ${MIN_PHASE_ENV_STEP_HEADROOM}, current=${current_env_steps}, cap=${TOTAL_ENV_STEPS})"
+    return 2
+  fi
 
   local -a cmd=(
     conda run --no-capture-output -n maca-py37-min python scripts/train_sf_maca.py
@@ -93,7 +148,7 @@ run_phase() {
     --env="$ENV_NAME"
     --experiment="$EXP_NAME"
     --train_dir="$TRAIN_DIR"
-    --device=gpu
+    --device="$DEVICE"
     --seed="$SEED"
     --num_workers="$NUM_WORKERS"
     --num_envs_per_worker="$NUM_ENVS_PER_WORKER"
@@ -136,6 +191,23 @@ run_phase() {
     --maca_track_memory_steps="$MACA_TRACK_MEMORY_STEPS"
     --maca_semantic_screen_observation="$MACA_SEMANTIC_SCREEN_OBSERVATION"
     --maca_screen_track_memory_steps="$MACA_SCREEN_TRACK_MEMORY_STEPS"
+    --maca_relative_motion_observation="$MACA_RELATIVE_MOTION_OBSERVATION"
+    --maca_delta_course_action="$MACA_DELTA_COURSE_ACTION"
+    --maca_course_delta_deg="$MACA_COURSE_DELTA_DEG"
+    --maca_tactical_mode_observation="$MACA_TACTICAL_MODE_OBSERVATION"
+    --maca_course_prior_observation="$MACA_COURSE_PRIOR_OBSERVATION"
+    --maca_course_prior_strength="$MACA_COURSE_PRIOR_STRENGTH"
+    --maca_course_hold_steps="$MACA_COURSE_HOLD_STEPS"
+    --maca_max_course_change_bins="$MACA_MAX_COURSE_CHANGE_BINS"
+    --maca_lock_state_observation="$MACA_LOCK_STATE_OBSERVATION"
+    --maca_team_status_observation="$MACA_TEAM_STATUS_OBSERVATION"
+    --maca_threat_state_observation="$MACA_THREAT_STATE_OBSERVATION"
+    --maca_intercept_course_assist="$MACA_INTERCEPT_COURSE_ASSIST"
+    --maca_intercept_course_blend="$MACA_INTERCEPT_COURSE_BLEND"
+    --maca_intercept_break_hold_bins="$MACA_INTERCEPT_BREAK_HOLD_BINS"
+    --maca_intercept_lead_deg="$MACA_INTERCEPT_LEAD_DEG"
+    --maca_commit_distance="$MACA_COMMIT_DISTANCE"
+    --maca_attack_prior_strength="$MACA_ATTACK_PRIOR_STRENGTH"
   )
 
   echo "=== ${phase_tag} | opponent=${opponent} | train_for_seconds=${cumulative_train_seconds} | exploration=${exploration} ==="
@@ -158,20 +230,20 @@ remove_done_if_exists() {
 current_target_seconds=0
 
 current_target_seconds=$((current_target_seconds + PHASE1_SECONDS))
-run_phase "phase1_noatt_warmup" "$PHASE1_OPPONENT" "$current_target_seconds" "$PHASE1_EXPLORATION"
+run_phase "phase1_noatt_warmup" "$PHASE1_OPPONENT" "$current_target_seconds" "$PHASE1_EXPLORATION" || exit $?
 remove_done_if_exists
 
 for ((cycle=1; cycle<=PHASE2_CYCLES; cycle++)); do
   current_target_seconds=$((current_target_seconds + PHASE2_PULSE_SECONDS))
-  run_phase "phase2_pulse_noatt_c${cycle}" "$PHASE1_OPPONENT" "$current_target_seconds" "$PHASE2_PULSE_EXPLORATION"
+  run_phase "phase2_pulse_noatt_c${cycle}" "$PHASE1_OPPONENT" "$current_target_seconds" "$PHASE2_PULSE_EXPLORATION" || exit $?
   remove_done_if_exists
 
   current_target_seconds=$((current_target_seconds + PHASE2_MAIN_SECONDS))
-  run_phase "phase2_fixrule_c${cycle}" "fix_rule" "$current_target_seconds" "$PHASE2_MAIN_EXPLORATION"
+  run_phase "phase2_fixrule_c${cycle}" "fix_rule" "$current_target_seconds" "$PHASE2_MAIN_EXPLORATION" || exit $?
   remove_done_if_exists
 done
 
 current_target_seconds=$((current_target_seconds + PHASE3_SECONDS))
-run_phase "phase3_fixrule_consolidate" "$PHASE3_OPPONENT" "$current_target_seconds" "$PHASE3_EXPLORATION"
+run_phase "phase3_fixrule_consolidate" "$PHASE3_OPPONENT" "$current_target_seconds" "$PHASE3_EXPLORATION" || exit $?
 
 echo "Decoupled 8h curriculum finished for experiment: $EXP_NAME"

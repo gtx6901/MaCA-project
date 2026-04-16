@@ -25,6 +25,7 @@ from marl_env.sample_factory_registration import register_maca_components
 from marl_env.runtime_tweaks import (
     buffer_squeeze_patch_enabled,
     format_runtime_tweaks,
+    get_attack_prior_strength,
     get_fire_logit_bias,
     get_fire_prob_floor,
     load_runtime_tweaks,
@@ -144,6 +145,7 @@ def _patch_sample_factory_action_masking():
     """Apply MaCA action masks to policy logits in both actors and learner updates."""
 
     invalid_logit = -1e9
+    attack_prior_strength = max(0.0, get_attack_prior_strength())
     fire_logit_bias = get_fire_logit_bias()
     fire_prob_floor = max(0.0, min(0.95, get_fire_prob_floor()))
 
@@ -155,13 +157,21 @@ def _patch_sample_factory_action_masking():
             return None
         return [space.n for space in spaces]
 
-    def stash_action_mask(actor_critic, obs_dict):
+    def stash_action_context(actor_critic, obs_dict):
         action_mask = obs_dict.get("action_mask")
         actor_critic._last_action_mask = None if action_mask is None else action_mask.bool()
+        course_prior = obs_dict.get("course_prior")
+        actor_critic._last_course_prior = course_prior
+        attack_prior = obs_dict.get("attack_prior")
+        actor_critic._last_attack_prior = attack_prior
 
     def mask_action_logits(actor_critic, action_logits):
         action_mask = getattr(actor_critic, "_last_action_mask", None)
         actor_critic._last_action_mask = None
+        course_prior = getattr(actor_critic, "_last_course_prior", None)
+        actor_critic._last_course_prior = None
+        attack_prior = getattr(actor_critic, "_last_attack_prior", None)
+        actor_critic._last_attack_prior = None
         if action_mask is None:
             return action_logits
 
@@ -182,9 +192,25 @@ def _patch_sample_factory_action_masking():
             split_logits = [
                 logits.masked_fill(~mask, invalid_logit) for logits, mask in zip(split_logits, split_masks)
             ]
+            if len(split_logits) >= 2 and course_prior is not None:
+                course_logits = split_logits[0]
+                course_mask = split_masks[0]
+                course_prior_strength = max(0.0, float(getattr(actor_critic.cfg, "maca_course_prior_strength", 0.0)))
+                if course_prior_strength > 0.0:
+                    course_prior = course_prior.to(device=course_logits.device, dtype=course_logits.dtype)
+                    if course_prior.shape == course_logits.shape:
+                        course_logits = course_logits + course_prior_strength * course_prior
+                        course_logits = course_logits.masked_fill(~course_mask, invalid_logit)
+                        split_logits[0] = course_logits
 
             attack_logits = split_logits[-1]
             attack_mask = split_masks[-1]
+            attack_prior_weight = max(attack_prior_strength, float(getattr(actor_critic.cfg, "maca_attack_prior_strength", 0.0)))
+            if attack_prior_weight > 0.0 and attack_prior is not None:
+                attack_prior = attack_prior.to(device=attack_logits.device, dtype=attack_logits.dtype)
+                if attack_prior.shape == attack_logits.shape:
+                    attack_logits = attack_logits + attack_prior_weight * attack_prior
+                    attack_logits = attack_logits.masked_fill(~attack_mask, invalid_logit)
             if fire_logit_bias != 0.0 and torch.any(attack_mask[..., 1:]):
                 fire_bias_mask = attack_mask.clone()
                 fire_bias_mask[..., 0] = False
@@ -243,7 +269,7 @@ def _patch_sample_factory_action_masking():
 
     def shared_forward_head(self, obs_dict):
         normalize_obs(obs_dict, self.cfg)
-        stash_action_mask(self, obs_dict)
+        stash_action_context(self, obs_dict)
         return self.encoder(obs_dict)
 
     def shared_forward_tail(self, core_output, with_action_distribution=False):
@@ -269,7 +295,7 @@ def _patch_sample_factory_action_masking():
 
     def separate_forward_head(self, obs_dict):
         normalize_obs(obs_dict, self.cfg)
-        stash_action_mask(self, obs_dict)
+        stash_action_context(self, obs_dict)
         head_outputs = []
         for encoder in self.encoders:
             head_outputs.append(encoder(obs_dict))
@@ -303,6 +329,55 @@ def _patch_sample_factory_action_masking():
     appo_model._ActorCriticSeparateWeights.forward_tail = separate_forward_tail
 
 
+def _patch_sample_factory_explained_variance_logging():
+    """Add critic explained variance to SF train summaries and learner logs."""
+
+    original_record_summaries = learner_module.LearnerWorker._record_summaries
+
+    def patched_record_summaries(self, train_loop_vars):
+        stats = original_record_summaries(self, train_loop_vars)
+        var = train_loop_vars
+
+        try:
+            targets = var.targets.detach().float()
+            values = var.values.detach().float()
+            valid_mask = var.valids.to(device=targets.device, dtype=torch.bool)
+
+            if valid_mask.shape != targets.shape:
+                valid_mask = valid_mask.reshape_as(targets)
+
+            if torch.any(valid_mask):
+                valid_targets = targets[valid_mask]
+                valid_values = values[valid_mask]
+            else:
+                valid_targets = targets.reshape(-1)
+                valid_values = values.reshape(-1)
+
+            target_var = torch.var(valid_targets, unbiased=False)
+            if torch.isfinite(target_var) and target_var.item() > 1e-8:
+                residual_var = torch.var(valid_targets - valid_values, unbiased=False)
+                explained_variance = 1.0 - (residual_var / target_var)
+            else:
+                explained_variance = torch.zeros((), device=valid_targets.device)
+
+            stats["explained_variance"] = float(explained_variance.item())
+            stats["value_target_mean"] = float(valid_targets.mean().item())
+            stats["value_target_std"] = float(valid_targets.std(unbiased=False).item())
+
+            learner_module.log.info(
+                "Train summaries: explained_variance=%.4f value_loss=%.4f policy_loss=%.4f",
+                stats["explained_variance"],
+                float(stats.get("value_loss", 0.0)),
+                float(stats.get("policy_loss", 0.0)),
+            )
+        except Exception as exc:
+            learner_module.log.warning("Failed to compute explained variance: %s", exc)
+
+        return stats
+
+    learner_module.LearnerWorker._record_summaries = patched_record_summaries
+
+
 def _inject_defaults(argv):
     result = list(argv)
     for flag, value in _DEFAULT_FLAGS.items():
@@ -319,6 +394,7 @@ def main(argv=None):
     if buffer_squeeze_patch_enabled():
         _patch_sample_factory_buffer_squeeze()
     _patch_sample_factory_action_masking()
+    _patch_sample_factory_explained_variance_logging()
     register_maca_components()
     cfg = parse_args(argv=_inject_defaults(sys.argv[1:] if argv is None else argv))
     return run_algorithm(cfg)

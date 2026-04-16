@@ -17,13 +17,24 @@ This directory now mixes three kinds of material:
   - `ai_conversation_kickoff.md`
   - `rl_marl_from_scratch_guide.md`
 
-For current Sample Factory recovery work, start with:
+For current active training work, start with:
 
 1. `sample_factory_marl_plan.md`
 2. `critical_engineering_notes.md`
 3. `rl_training_postrun_playbook.md`
+4. `medium_upgrade_plan_2026-04-14.md`
 
 Math/reference scratch files:
 
 - `appo_vtrace_math_fasttrack.md`
 - `appo_vtrace_formula_sheet.tex`
+
+Current active execution / audit record:
+
+- `medium_upgrade_plan_2026-04-14.md`
+
+Current default training lane:
+
+- custom lightweight MAPPO trainer under `scripts/train_mappo_maca.py`
+- structured env wrapper under `marl_env/mappo_env.py`
+- centralized critic model under `marl_env/mappo_model.py`

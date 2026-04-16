@@ -76,6 +76,108 @@ def add_maca_env_args(env, parser):
         type=int,
         help="How long to keep image-space enemy track memory after current detections disappear",
     )
+    p.add_argument(
+        "--maca_relative_motion_observation",
+        default=False,
+        type=str2bool,
+        help="Append target closure/bearing-rate/track-streak features to fighter measurements",
+    )
+    p.add_argument(
+        "--maca_delta_course_action",
+        default=False,
+        type=str2bool,
+        help="Interpret course action as a signed heading delta around current course",
+    )
+    p.add_argument(
+        "--maca_course_delta_deg",
+        default=45.0,
+        type=float,
+        help="Max absolute heading delta represented by the course action bins",
+    )
+    p.add_argument(
+        "--maca_tactical_mode_observation",
+        default=False,
+        type=str2bool,
+        help="Append a cheap search/reacquire/pursue/attack mode one-hot to fighter measurements",
+    )
+    p.add_argument(
+        "--maca_course_prior_observation",
+        default=False,
+        type=str2bool,
+        help="Expose a heuristic pursuit prior over course bins for soft action-logit biasing",
+    )
+    p.add_argument(
+        "--maca_course_prior_strength",
+        default=0.0,
+        type=float,
+        help="Strength of the soft course-logit bias derived from the heuristic pursuit prior",
+    )
+    p.add_argument(
+        "--maca_course_hold_steps",
+        default=1,
+        type=int,
+        help="How many env steps to hold an executed course command before allowing another change",
+    )
+    p.add_argument(
+        "--maca_max_course_change_bins",
+        default=15,
+        type=int,
+        help="Maximum number of course bins the executed command may jump in a single step",
+    )
+    p.add_argument(
+        "--maca_lock_state_observation",
+        default=False,
+        type=str2bool,
+        help="Append lock-loss / closure-health indicators to fighter measurements",
+    )
+    p.add_argument(
+        "--maca_team_status_observation",
+        default=False,
+        type=str2bool,
+        help="Append red/blue alive-destroyed counts and attrition balance to fighter measurements",
+    )
+    p.add_argument(
+        "--maca_threat_state_observation",
+        default=False,
+        type=str2bool,
+        help="Append receive-pressure and attrition-disadvantage indicators to fighter measurements",
+    )
+    p.add_argument(
+        "--maca_intercept_course_assist",
+        default=False,
+        type=str2bool,
+        help="Blend pursue/reacquire course commands toward a heuristic intercept bin before env execution",
+    )
+    p.add_argument(
+        "--maca_intercept_course_blend",
+        default=0.0,
+        type=float,
+        help="Base blend factor for heuristic intercept course assistance",
+    )
+    p.add_argument(
+        "--maca_intercept_break_hold_bins",
+        default=0,
+        type=int,
+        help="Allow intercept guidance to break course hold if it disagrees by at least this many bins",
+    )
+    p.add_argument(
+        "--maca_intercept_lead_deg",
+        default=20.0,
+        type=float,
+        help="Max heuristic lead angle added when contact exists but closure is poor",
+    )
+    p.add_argument(
+        "--maca_commit_distance",
+        default=140.0,
+        type=float,
+        help="Distance threshold used by optional attack-prior heuristics",
+    )
+    p.add_argument(
+        "--maca_attack_prior_strength",
+        default=0.0,
+        type=float,
+        help="Strength of the heuristic fire-prior logits when attack opportunities are available",
+    )
 
 
 def maca_override_defaults(env, parser):

@@ -56,6 +56,8 @@ class EnvConfig:
     support_search_hold: int = 6
     semantic_screen_observation: bool = False
     screen_track_memory_steps: int = 12
+    delta_course_action: bool = False
+    course_delta_deg: float = 45.0
 
 
 class MaCAParallelEnv:
@@ -73,6 +75,8 @@ class MaCAParallelEnv:
         self._opponent_agent = None
         self._last_blue_obs = None
         self._last_red_obs = None
+        self._last_red_raw_obs = None
+        self._last_blue_raw_obs = None
         self._last_alive_mask = None
         self._step_count = 0
         self._rng = np.random.RandomState(0)
@@ -210,6 +214,16 @@ class MaCAParallelEnv:
     def close(self) -> None:
         self._env = None
         self._last_blue_obs = None
+        self._last_blue_raw_obs = None
+        self._last_red_obs = None
+        self._last_red_raw_obs = None
+
+    def get_raw_snapshot(self):
+        """Expose the latest raw red/blue observations for custom trainers."""
+        return self._last_red_raw_obs, self._last_blue_raw_obs
+
+    def get_map_size(self):
+        return self._size_x, self._size_y
 
     def _collect_step_output(
         self,
@@ -219,6 +233,8 @@ class MaCAParallelEnv:
         self._last_blue_obs = blue_obs
 
         red_raw_obs, blue_raw_obs = self._env.get_obs_raw()
+        self._last_red_raw_obs = red_raw_obs
+        self._last_blue_raw_obs = blue_raw_obs
 
         global_state = None
         if self.config.include_global_state:
@@ -227,6 +243,10 @@ class MaCAParallelEnv:
         fighter_infos = np.stack([fighter["info"] for fighter in red_obs["fighter"]], axis=0)
         raw_fighter_obs = red_raw_obs["fighter_obs_list"]
         valid_masks = build_valid_action_masks(fighter_infos)
+        red_alive_count = sum(1 for fighter in red_raw_obs["fighter_obs_list"] if fighter["alive"])
+        blue_alive_count = sum(1 for fighter in blue_raw_obs["fighter_obs_list"] if fighter["alive"])
+        red_destroyed_count = self.red_fighter_num - red_alive_count
+        blue_destroyed_count = self.blue_fighter_num - blue_alive_count
 
         observations: Dict[str, Dict[str, np.ndarray]] = {}
         infos: Dict[str, Dict[str, object]] = {}
@@ -282,6 +302,10 @@ class MaCAParallelEnv:
                 "recv_direction_sin": np.asarray([recv_direction_sin], dtype=np.float32),
                 "recv_direction_cos": np.asarray([recv_direction_cos], dtype=np.float32),
                 "recv_dominant_freq": np.asarray([recv_dominant_freq], dtype=np.float32),
+                "red_fighter_alive_count": np.asarray([red_alive_count], dtype=np.float32),
+                "red_fighter_destroyed_count": np.asarray([red_destroyed_count], dtype=np.float32),
+                "blue_fighter_alive_count": np.asarray([blue_alive_count], dtype=np.float32),
+                "blue_fighter_destroyed_count": np.asarray([blue_destroyed_count], dtype=np.float32),
             }
             infos[agent_id] = {
                 "is_active": alive,
@@ -292,6 +316,10 @@ class MaCAParallelEnv:
                 "has_attack_opportunity": has_attack_opportunity,
                 "recv_count": recv_count,
                 "recv_dominant_freq": recv_dominant_freq,
+                "red_fighter_alive_count": red_alive_count,
+                "red_fighter_destroyed_count": red_destroyed_count,
+                "blue_fighter_alive_count": blue_alive_count,
+                "blue_fighter_destroyed_count": blue_destroyed_count,
             }
             if global_state is not None:
                 infos[agent_id]["global_state"] = global_state
@@ -359,10 +387,12 @@ class MaCAParallelEnv:
 
     def _decode_red_actions(self, action_dict: Mapping[str, int]) -> np.ndarray:
         fighter_action = np.zeros((self.red_fighter_num, 4), dtype=np.int32)
+        delta_course_enabled = bool(self.config.delta_course_action)
+        max_course_delta = max(1e-6, float(self.config.course_delta_deg))
         for idx, agent_id in enumerate(self.agents):
             fighter_raw_obs = None
-            if self._last_red_obs is not None:
-                fighter_raw_obs = self._last_red_obs["fighter"][idx]
+            if self._last_red_raw_obs is not None:
+                fighter_raw_obs = self._last_red_raw_obs["fighter_obs_list"][idx]
             radar_point, disturb_point = self._get_support_action(idx, fighter_raw_obs)
             fighter_action[idx][1] = radar_point
             fighter_action[idx][2] = disturb_point
@@ -381,7 +411,16 @@ class MaCAParallelEnv:
                 course_action = int(flat_action / ATTACK_IND_NUM)
                 attack_action = int(flat_action % ATTACK_IND_NUM)
 
-            fighter_action[idx][0] = int(360 / COURSE_NUM * course_action)
+            if delta_course_enabled and fighter_raw_obs is not None:
+                current_course = float(fighter_raw_obs["course"])
+                if COURSE_NUM <= 1:
+                    course_delta = 0.0
+                else:
+                    normalized = float(course_action) / float(COURSE_NUM - 1)
+                    course_delta = (normalized * 2.0 - 1.0) * max_course_delta
+                fighter_action[idx][0] = int((current_course + course_delta) % 360.0)
+            else:
+                fighter_action[idx][0] = int(360 / COURSE_NUM * course_action)
             fighter_action[idx][3] = attack_action
         return fighter_action
 

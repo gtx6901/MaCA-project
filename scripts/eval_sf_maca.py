@@ -27,6 +27,7 @@ from sample_factory.utils.utils import AttrDict
 from marl_env.sample_factory_registration import register_maca_components
 from marl_env.runtime_tweaks import (
     format_runtime_tweaks,
+    get_attack_prior_strength,
     get_eval_fire_prob_floor,
     load_runtime_tweaks,
 )
@@ -36,6 +37,7 @@ def _patch_sample_factory_action_masking():
     """Apply MaCA action masks to policy logits during evaluation."""
 
     invalid_logit = -1e9
+    attack_prior_strength = max(0.0, get_attack_prior_strength())
     eval_fire_prob_floor = max(0.0, min(0.95, get_eval_fire_prob_floor()))
 
     def tuple_action_head_sizes(actor_critic):
@@ -46,13 +48,19 @@ def _patch_sample_factory_action_masking():
             return None
         return [space.n for space in spaces]
 
-    def stash_action_mask(actor_critic, obs_dict):
+    def stash_action_context(actor_critic, obs_dict):
         action_mask = obs_dict.get("action_mask")
         actor_critic._last_action_mask = None if action_mask is None else action_mask.bool()
+        actor_critic._last_course_prior = obs_dict.get("course_prior")
+        actor_critic._last_attack_prior = obs_dict.get("attack_prior")
 
     def mask_action_logits(actor_critic, action_logits):
         action_mask = getattr(actor_critic, "_last_action_mask", None)
         actor_critic._last_action_mask = None
+        course_prior = getattr(actor_critic, "_last_course_prior", None)
+        actor_critic._last_course_prior = None
+        attack_prior = getattr(actor_critic, "_last_attack_prior", None)
+        actor_critic._last_attack_prior = None
         if action_mask is None:
             return action_logits
 
@@ -73,9 +81,25 @@ def _patch_sample_factory_action_masking():
             split_logits = [
                 logits.masked_fill(~mask, invalid_logit) for logits, mask in zip(split_logits, split_masks)
             ]
+            if len(split_logits) >= 2 and course_prior is not None:
+                course_logits = split_logits[0]
+                course_mask = split_masks[0]
+                course_prior_strength = max(0.0, float(getattr(actor_critic.cfg, "maca_course_prior_strength", 0.0)))
+                if course_prior_strength > 0.0:
+                    course_prior = course_prior.to(device=course_logits.device, dtype=course_logits.dtype)
+                    if course_prior.shape == course_logits.shape:
+                        course_logits = course_logits + course_prior_strength * course_prior
+                        course_logits = course_logits.masked_fill(~course_mask, invalid_logit)
+                        split_logits[0] = course_logits
 
             attack_logits = split_logits[-1]
             attack_mask = split_masks[-1]
+            attack_prior_weight = max(attack_prior_strength, float(getattr(actor_critic.cfg, "maca_attack_prior_strength", 0.0)))
+            if attack_prior_weight > 0.0 and attack_prior is not None:
+                attack_prior = attack_prior.to(device=attack_logits.device, dtype=attack_logits.dtype)
+                if attack_prior.shape == attack_logits.shape:
+                    attack_logits = attack_logits + attack_prior_weight * attack_prior
+                    attack_logits = attack_logits.masked_fill(~attack_mask, invalid_logit)
             if eval_fire_prob_floor > 0.0 and attack_logits.shape[-1] > 1:
                 valid_fire = attack_mask.clone()
                 valid_fire[..., 0] = False
@@ -115,7 +139,7 @@ def _patch_sample_factory_action_masking():
 
     def shared_forward_head(self, obs_dict):
         normalize_obs(obs_dict, self.cfg)
-        stash_action_mask(self, obs_dict)
+        stash_action_context(self, obs_dict)
         return self.encoder(obs_dict)
 
     def shared_forward_tail(self, core_output, with_action_distribution=False):
@@ -141,7 +165,7 @@ def _patch_sample_factory_action_masking():
 
     def separate_forward_head(self, obs_dict):
         normalize_obs(obs_dict, self.cfg)
-        stash_action_mask(self, obs_dict)
+        stash_action_context(self, obs_dict)
         head_outputs = []
         for encoder in self.encoders:
             head_outputs.append(encoder(obs_dict))
@@ -310,6 +334,19 @@ def main(argv=None):
                 )
                 episode_len = float(np.mean([stat.get("episode_len", 0.0) for stat in valid_stats]))
                 win_flag = float(np.mean([stat.get("win_flag", 0.0) for stat in valid_stats]) > 0.5)
+                red_fighter_alive_end = float(np.mean([stat.get("red_fighter_alive_end", 0.0) for stat in valid_stats]))
+                red_fighter_destroyed_end = float(
+                    np.mean([stat.get("red_fighter_destroyed_end", 0.0) for stat in valid_stats])
+                )
+                blue_fighter_alive_end = float(
+                    np.mean([stat.get("blue_fighter_alive_end", 0.0) for stat in valid_stats])
+                )
+                blue_fighter_destroyed_end = float(
+                    np.mean([stat.get("blue_fighter_destroyed_end", 0.0) for stat in valid_stats])
+                )
+                fighter_destroy_balance_end = float(
+                    np.mean([stat.get("fighter_destroy_balance_end", 0.0) for stat in valid_stats])
+                )
 
                 episode_results.append(
                     {
@@ -332,6 +369,11 @@ def main(argv=None):
                         "nearest_enemy_distance_min": nearest_enemy_distance_min,
                         "engagement_progress_reward_mean": engagement_progress_reward_mean,
                         "episode_len_mean": episode_len,
+                        "red_fighter_alive_end_mean": red_fighter_alive_end,
+                        "red_fighter_destroyed_end_mean": red_fighter_destroyed_end,
+                        "blue_fighter_alive_end_mean": blue_fighter_alive_end,
+                        "blue_fighter_destroyed_end_mean": blue_fighter_destroyed_end,
+                        "fighter_destroy_balance_end_mean": fighter_destroy_balance_end,
                     }
                 )
 
@@ -355,6 +397,8 @@ def main(argv=None):
                             f"contact={latest.get('contact_frac_mean', 0.0):.3f} "
                             f"visible_mean={latest.get('visible_enemy_count_mean', 0.0):.3f} "
                             f"nearest_mean={latest.get('nearest_enemy_distance_mean', 0.0):.1f} "
+                            f"red_down={latest.get('red_fighter_destroyed_end_mean', 0.0):.1f} "
+                            f"blue_down={latest.get('blue_fighter_destroyed_end_mean', 0.0):.1f} "
                             f"engage_reward={latest.get('engagement_progress_reward_mean', 0.0):.2f} "
                             f"elapsed={elapsed:.1f}s"
                         ),
@@ -425,6 +469,27 @@ def main(argv=None):
         else 0.0,
         engagement_progress_reward_mean=float(
             np.mean([row["engagement_progress_reward_mean"] for row in episode_results])
+        )
+        if episode_results
+        else 0.0,
+        red_fighter_alive_end_mean=float(np.mean([row["red_fighter_alive_end_mean"] for row in episode_results]))
+        if episode_results
+        else 0.0,
+        red_fighter_destroyed_end_mean=float(
+            np.mean([row["red_fighter_destroyed_end_mean"] for row in episode_results])
+        )
+        if episode_results
+        else 0.0,
+        blue_fighter_alive_end_mean=float(np.mean([row["blue_fighter_alive_end_mean"] for row in episode_results]))
+        if episode_results
+        else 0.0,
+        blue_fighter_destroyed_end_mean=float(
+            np.mean([row["blue_fighter_destroyed_end_mean"] for row in episode_results])
+        )
+        if episode_results
+        else 0.0,
+        fighter_destroy_balance_end_mean=float(
+            np.mean([row["fighter_destroy_balance_end_mean"] for row in episode_results])
         )
         if episode_results
         else 0.0,

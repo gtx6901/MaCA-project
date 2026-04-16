@@ -68,6 +68,9 @@ def load_runtime_tweaks() -> Dict[str, object]:
         "progress_reward_scale": _parse_float_env("MACA_PROGRESS_REWARD_SCALE", 0.0),
         "progress_reward_cap": _parse_float_env("MACA_PROGRESS_REWARD_CAP", 20.0),
         "attack_window_reward": _parse_float_env("MACA_ATTACK_WINDOW_REWARD", 0.0),
+        "friendly_attrition_penalty": _parse_float_env("MACA_FRIENDLY_ATTRITION_PENALTY", 0.0),
+        "enemy_attrition_reward": _parse_float_env("MACA_ENEMY_ATTRITION_REWARD", 0.0),
+        "attack_prior_strength": _parse_float_env("MACA_ATTACK_PRIOR_STRENGTH", 0.0),
         "enable_buffer_squeeze_patch": _parse_bool_env("MACA_ENABLE_SF_BUFFER_SQUEEZE_PATCH", False),
     }
     return _CACHE
@@ -103,6 +106,18 @@ def get_progress_reward_cap() -> float:
 
 def get_attack_window_reward() -> float:
     return float(load_runtime_tweaks()["attack_window_reward"])
+
+
+def get_friendly_attrition_penalty() -> float:
+    return float(load_runtime_tweaks()["friendly_attrition_penalty"])
+
+
+def get_enemy_attrition_reward() -> float:
+    return float(load_runtime_tweaks()["enemy_attrition_reward"])
+
+
+def get_attack_prior_strength() -> float:
+    return float(load_runtime_tweaks()["attack_prior_strength"])
 
 
 def buffer_squeeze_patch_enabled() -> bool:
