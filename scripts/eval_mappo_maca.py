@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -12,11 +13,18 @@ from typing import Optional
 import numpy as np
 import torch
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+ENV_DIR = ROOT_DIR / "environment"
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+if str(ENV_DIR) not in sys.path:
+    sys.path.insert(0, str(ENV_DIR))
+
 from marl_env.mappo_env import MAPPOMaCAConfig, MAPPOMaCAEnv
 from marl_env.mappo_model import MAPPOModelConfig, TeamActorCritic
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiment", type=str, required=True)
     parser.add_argument("--train_dir", type=str, default="train_dir/mappo")
@@ -29,7 +37,7 @@ def parse_args():
     parser.add_argument("--maca_opponent", type=str, default=None)
     parser.add_argument("--maca_render", type=str, default="False")
     parser.add_argument("--seed", type=int, default=1)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def str2bool(value: str) -> bool:
@@ -123,8 +131,8 @@ def select_actions(model, obs, actor_h, device, deterministic: bool):
     return np.stack([course_action.cpu().numpy(), attack_action.cpu().numpy()], axis=-1), next_actor_h.cpu().numpy()
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
     device = device_from_arg(args.device)
     deterministic = str2bool(args.deterministic)
     progress = str2bool(args.progress)

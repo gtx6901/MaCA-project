@@ -1,33 +1,22 @@
 # Script Guide
 
-The repo now has two training lanes:
+The repository keeps one active training lane: recurrent MAPPO with a centralized team critic.
 
-- legacy / audited-only: the old Sample Factory APPO stack
-- active / default: the new lightweight MaCA MAPPO lane with centralized team critic
+Primary entrypoints:
 
-Active MAPPO entrypoints:
+- `train.py`: config-driven training entrypoint
+- `evaluate.py`: config-driven evaluation entrypoint
+- `train_mappo_maca.py`: low-level recurrent MAPPO trainer
+- `eval_mappo_maca.py`: low-level checkpoint evaluator
+- `run_mappo_maca_train.sh`: shared shell launcher for MAPPO profiles
+- `run_mappo_maca_4060_library_long.sh`: 4060 long-duration profile
+- `run_mappo_maca_4060_overnight.sh`: 4060 overnight profile
+- `run_mappo_maca_4080_server_scale.sh`: 4080 larger-scale profile
+- `collect_teacher_maca.py`: teacher trajectory collection for BC warm start
+- `pretrain_bc_maca.py`: actor warm start by behavior cloning
 
-- `train_mappo_maca.py`: custom team-critic PPO trainer for MaCA, now with rollout-level multiprocess collectors, recurrent actor, and centralized learner
-- `eval_mappo_maca.py`: checkpoint evaluation entrypoint for the MAPPO lane
-- `run_mappo_maca_train.sh`: shared launcher used by all MAPPO profiles
-
-Supported MAPPO launcher profiles:
-
-- `run_mappo_maca_4060_library_long.sh`: 4060 8G low-power long-duration training
-- `run_mappo_maca_4060_overnight.sh`: 4060 8G full-power overnight training
-- `run_mappo_maca_4080_server_scale.sh`: 4080 32G larger-scale training
-
-Legacy Sample Factory entrypoints are kept for audit / regression comparison:
-
-- `train_sf_maca.py`
-- `eval_sf_maca.py`
-- `run_maca_4060_library_long.sh`
-- `run_maca_4060_overnight.sh`
-- `run_maca_4080_server_scale.sh`
-
-Engineering rules for new scripts:
+Engineering rules:
 
 - keep one shared launcher plus one profile per hardware lane
-- keep train / eval entrypoints separate from launcher profiles
-- do not add one-off recovery wrappers back into `scripts/`
-- document launcher changes in `doc/medium_upgrade_plan_2026-04-14.md`
+- keep train and eval entrypoints separate from launcher profiles
+- do not reintroduce deprecated non-MAPPO training wrappers into `scripts/`

@@ -5,11 +5,10 @@
 MaCA 环境为研究利用人工智能方法解决大规模多智能体分布式对抗问题提供了很好的支撑，专门面向多智能体深度强化学习开放了 RL-API 接口。环境支持使用 Python 语言进行算法实现，并支持Tensorflow、Pytorch 等常用深度学习框架的集成调用。
 
 > 说明（当前仓库补充）：
-> 本文主要介绍原始 MaCA 环境本身，仍然有效；但当前仓库已经额外新增了一套面向现代强化学习框架的工程层，主线不再是文中旧的 DQN 示例，而是 `Sample Factory + APPO/PPO + LSTM`。如果你是为了继续本仓库当前训练工作，请同时阅读：
-> - `doc/sample_factory_marl_plan.md`
+> 本文主要介绍原始 MaCA 环境本身，仍然有效；但当前仓库的训练主线已经切换到 `recurrent MAPPO + centralized critic`。如果你是为了继续本仓库当前训练工作，请同时阅读：
+> - `doc/MaCA_MAPPO_Action_Plan.md`
 > - `doc/gpu_env_setup.md`
-> - `doc/rl_training_postrun_playbook.md`
-> - `doc/ai_conversation_kickoff.md`
+> - `README.md`
 
 ## 2 MaCA安装
 ### 2.1 系统要求
@@ -98,21 +97,20 @@ MaCA代码结构与上述模块划分一致，具体如下图：
 
 ### 4.1.1 当前仓库新增的强化学习工程模块
 
-在原始 MaCA 结构之外，本仓库当前还新增了以下主线模块：
+在原始 MaCA 结构之外，本仓库当前新增的主线模块如下：
 
-- `marl_env/maca_parallel_env.py`：把 MaCA 包成固定 10 个红方战斗机槽位的并行多智能体环境
-- `marl_env/sample_factory_env.py`：把上层环境适配到 `Sample Factory 1.x`
-- `marl_env/sample_factory_model.py`：当前主线自定义 encoder
-- `marl_env/sample_factory_registration.py`：注册环境、encoder 与默认超参数
-- `scripts/train_sf_maca.py`：当前正式训练入口
-- `scripts/run_sf_maca_gpu_smoke.sh`：训练链路冒烟脚本
-- `scripts/run_sf_maca_4060_baseline.sh`：当前基线训练脚本
-- `scripts/run_sf_maca_4060_8g_curriculum.sh`：4060 8G 低显存训练脚本
-- `scripts/run_sf_maca_recovery_curriculum.sh`：恢复课表训练脚本（phase2 脉冲）
-- `scripts/eval_sf_maca.py`：独立评估脚本
+- `marl_env/maca_parallel_env.py`：并行多智能体环境包装
+- `marl_env/mappo_env.py`：结构化局部观测、全局状态与目标级动作合法性包装
+- `marl_env/mappo_model.py`：共享参数 recurrent actor 与 centralized critic
+- `scripts/train.py`：配置驱动训练入口
+- `scripts/evaluate.py`：配置驱动评估入口
+- `scripts/train_mappo_maca.py`：底层 recurrent MAPPO 训练器
+- `scripts/eval_mappo_maca.py`：底层 MAPPO 检查点评估器
+- `scripts/collect_teacher_maca.py`：规则教师数据采集
+- `scripts/pretrain_bc_maca.py`：行为克隆 warm start
 
 如果你的目标是“理解原始 MaCA 接口和数据结构”，继续读本文即可。
-如果你的目标是“基于当前仓库继续训练策略”，请以上述新增模块为主。
+如果你的目标是“基于当前仓库继续训练策略”，请以上述 MAPPO 模块为主。
 
 ### 4.2 环境调用接口说明
 MaCA环境的接口定义在[interface.py ](/environment/interface.py )文件的Environment类中，其接口函数如下：

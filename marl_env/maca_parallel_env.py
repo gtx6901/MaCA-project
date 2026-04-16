@@ -84,6 +84,8 @@ class MaCAParallelEnv:
         self._rng = np.random.RandomState(0)
         self._support_radar_points = None
         self._support_hold_steps = None
+        self._support_disturb_points = None
+        self._support_disturb_hold_steps = None
         self._semantic_enemy_memory = None
         self._size_x = None
         self._size_y = None
@@ -139,6 +141,8 @@ class MaCAParallelEnv:
             [(idx % RADAR_POINT_NUM) + 1 for idx in range(self.red_fighter_num)], dtype=np.int32
         )
         self._support_hold_steps = np.zeros(self.red_fighter_num, dtype=np.int32)
+        self._support_disturb_points = np.full(self.red_fighter_num, DEFAULT_DISTURB_POINT, dtype=np.int32)
+        self._support_disturb_hold_steps = np.zeros(self.red_fighter_num, dtype=np.int32)
         self._semantic_enemy_memory = np.zeros(
             (self.red_fighter_num, self._SCREEN_SIZE, self._SCREEN_SIZE), dtype=np.float32
         )
@@ -403,11 +407,15 @@ class MaCAParallelEnv:
         fighter_action = np.zeros((self.red_fighter_num, 4), dtype=np.int32)
         delta_course_enabled = bool(self.config.delta_course_action)
         max_course_delta = max(1e-6, float(self.config.course_delta_deg))
+        fighter_raw_obs_list = None
+        if self._last_red_raw_obs is not None:
+            fighter_raw_obs_list = self._last_red_raw_obs["fighter_obs_list"]
+        support_actions = self._plan_team_support_actions(fighter_raw_obs_list)
         for idx, agent_id in enumerate(self.agents):
             fighter_raw_obs = None
-            if self._last_red_raw_obs is not None:
-                fighter_raw_obs = self._last_red_raw_obs["fighter_obs_list"][idx]
-            radar_point, disturb_point = self._get_support_action(idx, fighter_raw_obs)
+            if fighter_raw_obs_list is not None:
+                fighter_raw_obs = fighter_raw_obs_list[idx]
+            radar_point, disturb_point = support_actions[idx]
             fighter_action[idx][1] = radar_point
             fighter_action[idx][2] = disturb_point
 
@@ -438,26 +446,99 @@ class MaCAParallelEnv:
             fighter_action[idx][3] = attack_action
         return fighter_action
 
-    def _get_support_action(self, fighter_idx: int, fighter_raw_obs: Optional[Mapping[str, object]]):
-        if not self.config.adaptive_support_policy or fighter_raw_obs is None:
-            return get_support_action(self._step_count, fighter_idx)
+    def _plan_team_support_actions(
+        self, fighter_raw_obs_list: Optional[List[Mapping[str, object]]]
+    ) -> np.ndarray:
+        """Plan radar/jamming as a team-level rule policy.
 
-        recv_list = list(fighter_raw_obs.get("j_recv_list", []))
-        visible_list = list(fighter_raw_obs.get("r_visible_list", []))
-        current_radar_point = int(fighter_raw_obs.get("r_fre_point", 0))
-        if len(visible_list) > 0 and 1 <= current_radar_point <= RADAR_POINT_NUM:
-            radar_point = current_radar_point
-            self._support_radar_points[fighter_idx] = radar_point
-            self._support_hold_steps[fighter_idx] = max(1, int(self.config.support_search_hold))
-        else:
-            if self._support_hold_steps[fighter_idx] <= 0:
-                self._support_radar_points[fighter_idx] = int(self._rng.randint(1, RADAR_POINT_NUM + 1))
-                self._support_hold_steps[fighter_idx] = max(1, int(self.config.support_search_hold))
-            radar_point = int(self._support_radar_points[fighter_idx])
-            self._support_hold_steps[fighter_idx] -= 1
+        The goal is to keep electronic warfare outside the learned policy:
 
-        disturb_point = self._get_disturb_point(recv_list)
-        return radar_point, disturb_point
+        - when a fighter has contact, retain the radar frequency that already
+          produced the contact to avoid breaking lock unnecessarily
+        - otherwise, spread the squad over all radar points with a deterministic
+          full-band sweep rather than random search
+        - if a fighter receives hostile emissions, jam the dominant local
+          frequency immediately
+        - if there is no local threat but the team sees clear hostile frequency
+          concentration, assign support jamming on those team-dominant bands
+        """
+
+        support_actions = np.zeros((self.red_fighter_num, 2), dtype=np.int32)
+        base_hold = max(1, int(self.config.support_search_hold))
+
+        if fighter_raw_obs_list is None:
+            for fighter_idx in range(self.red_fighter_num):
+                support_actions[fighter_idx] = get_support_action(self._step_count, fighter_idx)
+            return support_actions
+
+        if not self.config.adaptive_support_policy:
+            for fighter_idx, fighter_raw_obs in enumerate(fighter_raw_obs_list):
+                radar_point, disturb_point = get_support_action(self._step_count, fighter_idx)
+                if fighter_raw_obs is not None:
+                    disturb_point = self._get_disturb_point(list(fighter_raw_obs.get("j_recv_list", [])))
+                support_actions[fighter_idx] = (radar_point, disturb_point)
+            return support_actions
+
+        team_freq_counts: Counter = Counter()
+        for fighter_raw_obs in fighter_raw_obs_list:
+            if fighter_raw_obs is None or not fighter_raw_obs.get("alive", False):
+                continue
+            recv_list = list(fighter_raw_obs.get("j_recv_list", []))
+            for item in recv_list:
+                freq = int(item.get("r_fp", DEFAULT_DISTURB_POINT))
+                if 1 <= freq <= RADAR_POINT_NUM:
+                    team_freq_counts[freq] += 1
+        team_dominant_freqs = [freq for freq, _count in team_freq_counts.most_common()]
+
+        search_phase = int(self._step_count // base_hold)
+        search_stride = 3  # coprime with 10; gives full-band coverage over 10 fighters.
+
+        for fighter_idx, fighter_raw_obs in enumerate(fighter_raw_obs_list):
+            if fighter_raw_obs is None or not fighter_raw_obs.get("alive", False):
+                support_actions[fighter_idx] = (int(self._support_radar_points[fighter_idx]), DEFAULT_DISTURB_POINT)
+                self._support_disturb_points[fighter_idx] = DEFAULT_DISTURB_POINT
+                self._support_disturb_hold_steps[fighter_idx] = 0
+                continue
+
+            recv_list = list(fighter_raw_obs.get("j_recv_list", []))
+            visible_list = list(fighter_raw_obs.get("r_visible_list", []))
+            current_radar_point = int(fighter_raw_obs.get("r_fre_point", 0))
+
+            if len(visible_list) > 0 and 1 <= current_radar_point <= RADAR_POINT_NUM:
+                radar_point = current_radar_point
+                self._support_radar_points[fighter_idx] = radar_point
+                self._support_hold_steps[fighter_idx] = base_hold
+            elif self._support_hold_steps[fighter_idx] > 0 and 1 <= self._support_radar_points[fighter_idx] <= RADAR_POINT_NUM:
+                radar_point = int(self._support_radar_points[fighter_idx])
+                self._support_hold_steps[fighter_idx] -= 1
+            else:
+                radar_point = int(((search_phase + fighter_idx * search_stride) % RADAR_POINT_NUM) + 1)
+                self._support_radar_points[fighter_idx] = radar_point
+                self._support_hold_steps[fighter_idx] = max(0, base_hold - 1)
+
+            own_dominant_freq = self._get_dominant_recv_freq(recv_list)
+            if own_dominant_freq is not None and 1 <= own_dominant_freq <= RADAR_POINT_NUM:
+                disturb_point = int(own_dominant_freq)
+                self._support_disturb_points[fighter_idx] = disturb_point
+                self._support_disturb_hold_steps[fighter_idx] = base_hold
+            elif len(visible_list) > 0 and team_dominant_freqs:
+                disturb_point = int(team_dominant_freqs[fighter_idx % len(team_dominant_freqs)])
+                self._support_disturb_points[fighter_idx] = disturb_point
+                self._support_disturb_hold_steps[fighter_idx] = max(1, base_hold // 2)
+            elif (
+                self._support_disturb_hold_steps[fighter_idx] > 0
+                and 1 <= self._support_disturb_points[fighter_idx] <= RADAR_POINT_NUM
+            ):
+                disturb_point = int(self._support_disturb_points[fighter_idx])
+                self._support_disturb_hold_steps[fighter_idx] -= 1
+            else:
+                disturb_point = DEFAULT_DISTURB_POINT
+                self._support_disturb_points[fighter_idx] = disturb_point
+                self._support_disturb_hold_steps[fighter_idx] = 0
+
+            support_actions[fighter_idx] = (radar_point, disturb_point)
+
+        return support_actions
 
     @staticmethod
     def _get_dominant_recv_freq(recv_list: List[Mapping[str, object]]) -> Optional[int]:

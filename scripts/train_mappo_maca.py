@@ -7,6 +7,7 @@ import argparse
 import json
 import multiprocessing as mp
 import random
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -16,6 +17,14 @@ import numpy as np
 import torch
 from torch import nn
 from torch.distributions import Categorical
+from torch.utils.tensorboard import SummaryWriter
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+ENV_DIR = ROOT_DIR / "environment"
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+if str(ENV_DIR) not in sys.path:
+    sys.path.insert(0, str(ENV_DIR))
 
 from marl_env.mappo_env import MAPPOMaCAConfig, MAPPOMaCAEnv
 from marl_env.mappo_model import MAPPOModelConfig, TeamActorCritic
@@ -67,7 +76,7 @@ def str2bool(value) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiment", type=str, default="maca_mappo_recurrent")
     parser.add_argument("--train_dir", type=str, default="train_dir/mappo")
@@ -99,6 +108,11 @@ def parse_args():
     parser.add_argument("--save_every_sec", type=int, default=900)
     parser.add_argument("--log_every_sec", type=int, default=30)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--tensorboard", type=str2bool, default=True)
+    parser.add_argument("--eval_every_env_steps", type=int, default=1_000_000)
+    parser.add_argument("--eval_episodes", type=int, default=20)
+    parser.add_argument("--eval_deterministic", type=str2bool, default=True)
+    parser.add_argument("--eval_opponent", type=str, default=None)
 
     # P1: team + agent-aware credit blending
     parser.add_argument("--team_adv_weight", type=float, default=1.0)
@@ -126,7 +140,7 @@ def parse_args():
     parser.add_argument("--maca_attack_window_reward", type=float, default=0.1)
     parser.add_argument("--maca_agent_aux_reward_scale", type=float, default=0.0)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.chunk_len <= 0:
         raise ValueError("chunk_len must be > 0")
     if args.burn_in < 0:
@@ -156,6 +170,10 @@ def experiment_dir(args) -> Path:
 
 def checkpoint_dir(args) -> Path:
     return experiment_dir(args) / "checkpoint"
+
+
+def eval_dir(args) -> Path:
+    return experiment_dir(args) / "eval"
 
 
 def latest_checkpoint(args) -> Optional[Path]:
@@ -217,6 +235,14 @@ def load_checkpoint(args, model, optimizer, value_normalizer=None):
         print("[checkpoint] value normalizer restored", flush=True)
     print("[checkpoint] resumed from %s" % ckpt_path, flush=True)
     return int(state.get("env_steps", 0)), int(state.get("update_idx", 0))
+
+
+def build_summary_writer(args):
+    if not args.tensorboard:
+        return None
+    log_dir = experiment_dir(args) / "tb"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return SummaryWriter(log_dir=str(log_dir))
 
 def masked_categorical(logits: torch.Tensor, masks: torch.Tensor) -> Categorical:
     invalid_logit = torch.finfo(logits.dtype).min
@@ -529,6 +555,102 @@ def summarize_episode_stats(episodes):
     return summary
 
 
+def log_summary(writer: Optional[SummaryWriter], prefix: str, summary: Dict[str, float], step: int) -> None:
+    if writer is None:
+        return
+    for key, value in summary.items():
+        if key == "episodes":
+            continue
+        try:
+            writer.add_scalar("%s/%s" % (prefix, key), float(value), step)
+        except Exception:
+            continue
+
+
+def select_eval_actions(model, obs, actor_h, device, deterministic: bool):
+    local_obs = torch.as_tensor(obs["local_obs"], dtype=torch.float32, device=device)
+    agent_ids = torch.as_tensor(obs["agent_ids"], dtype=torch.long, device=device)
+    attack_masks = torch.as_tensor(obs["attack_masks"], dtype=torch.bool, device=device)
+    actor_h_t = torch.as_tensor(actor_h, dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        course_logits, _attack_logits_unused, next_actor_h = model.actor_step(local_obs, agent_ids, actor_h_t)
+        if deterministic:
+            course_action = torch.argmax(course_logits, dim=-1)
+        else:
+            course_action = torch.distributions.Categorical(logits=course_logits).sample()
+
+        attack_logits = model.attack_logits(next_actor_h, course_action)
+        invalid_logit = torch.finfo(attack_logits.dtype).min
+        attack_logits = attack_logits.masked_fill(~attack_masks, invalid_logit)
+        if deterministic:
+            attack_action = torch.argmax(attack_logits, dim=-1)
+        else:
+            attack_action = torch.distributions.Categorical(logits=attack_logits).sample()
+
+    actions = np.stack([course_action.cpu().numpy(), attack_action.cpu().numpy()], axis=-1)
+    return actions, next_actor_h.cpu().numpy()
+
+
+def run_evaluation(model, device, args, env_steps: int):
+    eval_opponent = args.eval_opponent or args.maca_opponent
+    eval_config = MAPPOMaCAConfig(
+        map_path=args.maca_map_path,
+        red_obs_ind=args.maca_red_obs_ind,
+        opponent=eval_opponent,
+        max_step=args.maca_max_step,
+        render=False,
+        random_pos=args.maca_random_pos,
+        random_seed=args.seed + 900000 + int(env_steps),
+        adaptive_support_policy=args.maca_adaptive_support_policy,
+        support_search_hold=args.maca_support_search_hold,
+        delta_course_action=args.maca_delta_course_action,
+        course_delta_deg=args.maca_course_delta_deg,
+        max_visible_enemies=args.maca_max_visible_enemies,
+        friendly_attrition_penalty=args.maca_friendly_attrition_penalty,
+        enemy_attrition_reward=args.maca_enemy_attrition_reward,
+        track_memory_steps=args.maca_track_memory_steps,
+        contact_reward=args.maca_contact_reward,
+        progress_reward_scale=args.maca_progress_reward_scale,
+        progress_reward_cap=args.maca_progress_reward_cap,
+        attack_window_reward=args.maca_attack_window_reward,
+        agent_aux_reward_scale=args.maca_agent_aux_reward_scale,
+    )
+    env = MAPPOMaCAEnv(eval_config)
+    actor_h = np.zeros((env.num_agents, model.actor_hidden_dim), dtype=np.float32)
+    episode_results = []
+    start_time = time.time()
+
+    try:
+        obs = env.reset(seed=eval_config.random_seed)
+        while len(episode_results) < args.eval_episodes:
+            actions, actor_h = select_eval_actions(model, obs, actor_h, device, args.eval_deterministic)
+            obs, _reward, done, info = env.step(actions)
+            if not done:
+                continue
+            episode_results.append(info["episode_extra_stats"])
+            actor_h.fill(0.0)
+            obs = env.reset(seed=eval_config.random_seed + len(episode_results))
+    finally:
+        env.close()
+
+    summary = summarize_episode_stats(episode_results)
+    payload = {
+        "env_steps": int(env_steps),
+        "episodes": int(args.eval_episodes),
+        "maca_opponent": eval_opponent,
+        "deterministic": bool(args.eval_deterministic),
+        "eval_wall_time_sec": float(time.time() - start_time),
+        "summary": summary,
+        "episodes_detail": episode_results,
+    }
+    eval_output_dir = eval_dir(args)
+    eval_output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = eval_output_dir / ("eval_%09d.json" % int(env_steps))
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    return payload, output_path
+
+
 def rollout(collectors: CollectorPool, actor_state: dict, model, device, args, episode_stats, value_normalizer=None):
     worker_results = collectors.collect(actor_state, args.rollout)
 
@@ -777,12 +899,13 @@ def ppo_update(model, optimizer, buffer, advantages_team, advantages_aux, return
     }
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
     device = device_from_arg(args.device)
     set_seed(args.seed)
 
     collectors = CollectorPool(args)
+    writer = build_summary_writer(args)
     initial_obs = collectors.reset(seed=args.seed)
     local_obs_dim = initial_obs[0]["local_obs"].shape[1]
     global_state_dim = initial_obs[0]["global_state"].shape[0]
@@ -814,6 +937,11 @@ def main():
 
     last_log_time = time.time()
     last_save_time = time.time()
+    if args.eval_every_env_steps > 0:
+        interval = int(args.eval_every_env_steps)
+        next_eval_env_steps = ((env_steps // interval) + 1) * interval
+    else:
+        next_eval_env_steps = -1
     episode_stats = deque(maxlen=100)
 
     try:
@@ -850,6 +978,15 @@ def main():
                 summary = summarize_episode_stats(list(episode_stats))
                 reward_mean = summary.get("round_reward_mean", 0.0)
                 win_rate = summary.get("win_rate", 0.0)
+                log_summary(writer, "train_episode", summary, env_steps)
+                if writer is not None:
+                    writer.add_scalar("train/policy_loss", float(stats.get("policy_loss", 0.0)), env_steps)
+                    writer.add_scalar("train/value_loss", float(stats.get("value_loss", 0.0)), env_steps)
+                    writer.add_scalar("train/entropy", float(stats.get("entropy", 0.0)), env_steps)
+                    writer.add_scalar("train/sample_fps", float(sample_fps), env_steps)
+                    writer.add_scalar("train/active_samples", float(stats.get("active_samples", 0)), env_steps)
+                    writer.add_scalar("train/grad_steps", float(stats.get("grad_steps", 0)), env_steps)
+                    writer.flush()
                 print(
                     "[train] env_steps=%d update=%d reward_mean=%.2f win_rate=%.3f fps=%.1f policy_loss=%.4f value_loss=%.4f entropy=%.4f active=%d grad_steps=%d"
                     % (
@@ -872,9 +1009,32 @@ def main():
                 save_checkpoint(args, model, optimizer, env_steps, update_idx, value_normalizer)
                 last_save_time = time.time()
 
+            if args.eval_episodes > 0 and args.eval_every_env_steps > 0 and env_steps >= next_eval_env_steps:
+                payload, output_path = run_evaluation(model, device, args, env_steps)
+                eval_summary = payload.get("summary", {})
+                log_summary(writer, "eval", eval_summary, env_steps)
+                if writer is not None:
+                    writer.add_scalar("eval/eval_wall_time_sec", float(payload["eval_wall_time_sec"]), env_steps)
+                    writer.flush()
+                print(
+                    "[eval] env_steps=%d win_rate=%.3f destroy_balance=%.3f red_down=%.3f blue_down=%.3f saved=%s"
+                    % (
+                        env_steps,
+                        float(eval_summary.get("win_rate", 0.0)),
+                        float(eval_summary.get("fighter_destroy_balance_end_mean", 0.0)),
+                        float(eval_summary.get("red_fighter_destroyed_end_mean", 0.0)),
+                        float(eval_summary.get("blue_fighter_destroyed_end_mean", 0.0)),
+                        output_path,
+                    ),
+                    flush=True,
+                )
+                next_eval_env_steps += int(args.eval_every_env_steps)
+
         save_checkpoint(args, model, optimizer, env_steps, update_idx, value_normalizer)
     finally:
         collectors.close()
+        if writer is not None:
+            writer.close()
 
 
 if __name__ == "__main__":

@@ -6,10 +6,18 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import sys
 from pathlib import Path
 from typing import Mapping
 
 import numpy as np
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+ENV_DIR = ROOT_DIR / "environment"
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+if str(ENV_DIR) not in sys.path:
+    sys.path.insert(0, str(ENV_DIR))
 
 from fighter_action_utils import ATTACK_IND_NUM, COURSE_NUM
 from marl_env.mappo_env import MAPPOMaCAConfig, MAPPOMaCAEnv

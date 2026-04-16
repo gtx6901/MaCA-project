@@ -1,0 +1,63 @@
+train:
+  experiment: mappo_maca_fixrule_main
+  train_dir: train_dir/mappo
+  device: gpu
+  seed: 1
+  num_envs: 8
+  num_workers: 4
+  rollout: 128
+  chunk_len: 16
+  burn_in: 8
+  train_for_env_steps: 60000000
+  ppo_epochs: 5
+  num_mini_batches: 4
+  learning_rate: 0.0003
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip_ratio: 0.1
+  value_loss_coeff: 0.5
+  entropy_coeff: 0.01
+  max_grad_norm: 5.0
+  hidden_size: 256
+  role_embed_dim: 8
+  course_embed_dim: 16
+  save_every_sec: 900
+  log_every_sec: 30
+  tensorboard: true
+  resume: false
+
+env:
+  map_path: maps/1000_1000_fighter10v10.map
+  red_obs_ind: simple
+  opponent: fix_rule
+  max_step: 1000
+  render: false
+  random_pos: false
+  adaptive_support_policy: true
+  support_search_hold: 6
+  delta_course_action: true
+  course_delta_deg: 45.0
+  max_visible_enemies: 4
+  friendly_attrition_penalty: 200.0
+  enemy_attrition_reward: 100.0
+  track_memory_steps: 12
+  contact_reward: 0.1
+  progress_reward_scale: 0.002
+  progress_reward_cap: 20.0
+  attack_window_reward: 0.1
+  agent_aux_reward_scale: 0.0
+
+eval:
+  every_env_steps: 1000000
+  episodes: 20
+  deterministic: true
+  opponent: fix_rule
+
+bc_warm_start:
+  enabled: false
+  teacher_agent: fix_rule
+  teacher_episodes: 200
+  dataset_path: null
+  epochs: 8
+  batch_size: 8192
+  learning_rate: 0.0003
