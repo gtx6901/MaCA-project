@@ -33,8 +33,12 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--teacher_agent", type=str, default="fix_rule")
     parser.add_argument("--episodes", type=int, default=200)
+    parser.add_argument("--max_attempt_episodes", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--output_path", type=str, default="exports/teacher_maca_dataset.npz")
+    parser.add_argument("--wins_only", type=str2bool, default=False)
+    parser.add_argument("--min_destroy_balance", type=float, default=None)
+    parser.add_argument("--min_round_reward", type=float, default=None)
 
     parser.add_argument("--maca_map_path", type=str, default="maps/1000_1000_fighter10v10.map")
     parser.add_argument("--maca_red_obs_ind", type=str, default="simple")
@@ -260,21 +264,65 @@ def main():
         base.red_fighter_num,
     )
 
-    local_obs_buf = []
-    agent_ids_buf = []
-    attack_masks_buf = []
-    alive_mask_buf = []
-    course_action_buf = []
-    attack_action_buf = []
-
+    accepted_steps = []
     episode_returns = []
+    accepted_episode_returns = []
+    accepted_episode_lengths = []
+    accepted_episode_wins = []
+    accepted_episode_destroy_balance = []
+    accepted_episode_round_reward = []
     obs = env.reset(seed=args.seed)
     ep_return = 0.0
-    episode_idx = 0
+    accepted_episode_idx = 0
+    attempt_episode_idx = 0
     step_cnt = 0
+    max_attempts = int(args.max_attempt_episodes) if int(args.max_attempt_episodes) > 0 else int(args.episodes)
+
+    episode_local_obs = []
+    episode_agent_ids = []
+    episode_attack_masks = []
+    episode_alive_mask = []
+    episode_course_action = []
+    episode_attack_action = []
+
+    def flush_episode_if_accepted(episode_stats, episode_return: float):
+        nonlocal accepted_episode_idx
+        win_flag = float(episode_stats.get("win_flag", 0.0))
+        destroy_balance = float(episode_stats.get("fighter_destroy_balance_end", 0.0))
+        round_reward = float(episode_stats.get("round_reward", 0.0))
+
+        accepted = True
+        if args.wins_only and win_flag < 0.5:
+            accepted = False
+        if args.min_destroy_balance is not None and destroy_balance < float(args.min_destroy_balance):
+            accepted = False
+        if args.min_round_reward is not None and round_reward < float(args.min_round_reward):
+            accepted = False
+
+        episode_len = len(episode_local_obs)
+        if accepted and episode_len > 0:
+            accepted_steps.extend(
+                [
+                    {
+                        "local_obs": np.stack(episode_local_obs, axis=0),
+                        "agent_ids": np.stack(episode_agent_ids, axis=0),
+                        "attack_masks": np.stack(episode_attack_masks, axis=0),
+                        "alive_mask": np.stack(episode_alive_mask, axis=0),
+                        "course_action": np.stack(episode_course_action, axis=0),
+                        "attack_action": np.stack(episode_attack_action, axis=0),
+                    }
+                ]
+            )
+            accepted_episode_returns.append(float(episode_return))
+            accepted_episode_lengths.append(int(episode_len))
+            accepted_episode_wins.append(float(win_flag))
+            accepted_episode_destroy_balance.append(float(destroy_balance))
+            accepted_episode_round_reward.append(float(round_reward))
+            accepted_episode_idx += 1
+        return accepted, episode_len, win_flag, destroy_balance, round_reward
 
     try:
-        while episode_idx < args.episodes:
+        while accepted_episode_idx < args.episodes and attempt_episode_idx < max_attempts:
             teacher_obs = build_teacher_obs(base, teacher_obs_mode)
             try:
                 _detector_action, fighter_action = teacher.get_action(teacher_obs, step_cnt)
@@ -287,12 +335,12 @@ def main():
                     raise
             mappo_actions = teacher_actions_to_mappo(env, fighter_action)
 
-            local_obs_buf.append(np.asarray(obs["local_obs"], dtype=np.float32))
-            agent_ids_buf.append(np.asarray(obs["agent_ids"], dtype=np.int64))
-            attack_masks_buf.append(np.asarray(obs["attack_masks"], dtype=np.bool_))
-            alive_mask_buf.append(np.asarray(obs["alive_mask"], dtype=np.float32))
-            course_action_buf.append(np.asarray(mappo_actions[:, 0], dtype=np.int64))
-            attack_action_buf.append(np.asarray(mappo_actions[:, 1], dtype=np.int64))
+            episode_local_obs.append(np.asarray(obs["local_obs"], dtype=np.float32))
+            episode_agent_ids.append(np.asarray(obs["agent_ids"], dtype=np.int64))
+            episode_attack_masks.append(np.asarray(obs["attack_masks"], dtype=np.bool_))
+            episode_alive_mask.append(np.asarray(obs["alive_mask"], dtype=np.float32))
+            episode_course_action.append(np.asarray(mappo_actions[:, 0], dtype=np.int64))
+            episode_attack_action.append(np.asarray(mappo_actions[:, 1], dtype=np.int64))
 
             obs, reward, done, _info = env.step(mappo_actions)
             ep_return += float(reward)
@@ -300,36 +348,87 @@ def main():
 
             if done:
                 episode_returns.append(ep_return)
-                episode_idx += 1
+                attempt_episode_idx += 1
+                episode_stats = dict(_info.get("episode_extra_stats", {}))
+                accepted, episode_len, win_flag, destroy_balance, round_reward = flush_episode_if_accepted(
+                    episode_stats,
+                    ep_return,
+                )
                 print(
-                    "[collect] episode=%d/%d return=%.2f" % (episode_idx, args.episodes, ep_return),
+                    "[collect] accepted=%d/%d attempt=%d/%d return=%.2f win=%.0f destroy_balance=%.1f round_reward=%.1f steps=%d kept=%s"
+                    % (
+                        accepted_episode_idx,
+                        args.episodes,
+                        attempt_episode_idx,
+                        max_attempts,
+                        ep_return,
+                        win_flag,
+                        destroy_balance,
+                        round_reward,
+                        episode_len,
+                        "yes" if accepted else "no",
+                    ),
                     flush=True,
                 )
                 ep_return = 0.0
                 step_cnt = 0
-                obs = env.reset(seed=args.seed + episode_idx)
+                episode_local_obs = []
+                episode_agent_ids = []
+                episode_attack_masks = []
+                episode_alive_mask = []
+                episode_course_action = []
+                episode_attack_action = []
+                obs = env.reset(seed=args.seed + attempt_episode_idx)
     finally:
         env.close()
+
+    if accepted_episode_idx <= 0:
+        raise RuntimeError(
+            "No teacher episodes matched filters. attempts=%d wins_only=%s min_destroy_balance=%s min_round_reward=%s"
+            % (
+                attempt_episode_idx,
+                bool(args.wins_only),
+                str(args.min_destroy_balance),
+                str(args.min_round_reward),
+            )
+        )
 
     output_path = Path(args.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    payload_steps = {
+        "local_obs": np.concatenate([item["local_obs"] for item in accepted_steps], axis=0),
+        "agent_ids": np.concatenate([item["agent_ids"] for item in accepted_steps], axis=0),
+        "attack_masks": np.concatenate([item["attack_masks"] for item in accepted_steps], axis=0),
+        "alive_mask": np.concatenate([item["alive_mask"] for item in accepted_steps], axis=0),
+        "course_action": np.concatenate([item["course_action"] for item in accepted_steps], axis=0),
+        "attack_action": np.concatenate([item["attack_action"] for item in accepted_steps], axis=0),
+    }
     payload = {
-        "local_obs": np.stack(local_obs_buf, axis=0),
-        "agent_ids": np.stack(agent_ids_buf, axis=0),
-        "attack_masks": np.stack(attack_masks_buf, axis=0),
-        "alive_mask": np.stack(alive_mask_buf, axis=0),
-        "course_action": np.stack(course_action_buf, axis=0),
-        "attack_action": np.stack(attack_action_buf, axis=0),
+        **payload_steps,
+        "episode_lengths": np.asarray(accepted_episode_lengths, dtype=np.int32),
+        "episode_win_flag": np.asarray(accepted_episode_wins, dtype=np.float32),
+        "episode_destroy_balance": np.asarray(accepted_episode_destroy_balance, dtype=np.float32),
+        "episode_round_reward": np.asarray(accepted_episode_round_reward, dtype=np.float32),
     }
     np.savez_compressed(str(output_path), **payload)
 
     summary = {
-        "episodes": int(args.episodes),
-        "steps": int(payload["local_obs"].shape[0]),
+        "requested_episodes": int(args.episodes),
+        "accepted_episodes": int(accepted_episode_idx),
+        "attempted_episodes": int(attempt_episode_idx),
+        "steps": int(payload_steps["local_obs"].shape[0]),
         "mean_return": float(np.mean(episode_returns)) if episode_returns else 0.0,
+        "mean_accepted_return": float(np.mean(accepted_episode_returns)) if accepted_episode_returns else 0.0,
+        "mean_accepted_win": float(np.mean(accepted_episode_wins)) if accepted_episode_wins else 0.0,
+        "mean_accepted_destroy_balance": float(np.mean(accepted_episode_destroy_balance))
+        if accepted_episode_destroy_balance
+        else 0.0,
         "teacher_agent": args.teacher_agent,
         "teacher_obs_mode": teacher_obs_mode,
+        "wins_only": bool(args.wins_only),
+        "min_destroy_balance": args.min_destroy_balance,
+        "min_round_reward": args.min_round_reward,
         "output_path": str(output_path),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)

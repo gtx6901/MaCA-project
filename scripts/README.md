@@ -6,6 +6,9 @@ Primary entrypoints:
 
 - `train.py`: config-driven training entrypoint
 - `evaluate.py`: config-driven evaluation entrypoint
+- `run_mappo_fixrule_teacher_pipeline.sh`: one-click `fix_rule -> teacher -> BC -> PPO` launcher
+- `monitor_mappo.sh`: latest log / process / GPU monitor
+- `eval_mappo_latest.sh`: evaluate latest or named MAPPO experiment
 - `train_mappo_maca.py`: low-level recurrent MAPPO trainer
 - `eval_mappo_maca.py`: low-level checkpoint evaluator
 - `run_mappo_maca_train.sh`: shared shell launcher for MAPPO profiles
@@ -13,7 +16,7 @@ Primary entrypoints:
 - `run_mappo_maca_4060_overnight.sh`: 4060 overnight profile
 - `run_mappo_maca_4080_server_scale.sh`: 4080 larger-scale profile
 - `collect_teacher_maca.py`: teacher trajectory collection for BC warm start
-- `pretrain_bc_maca.py`: actor warm start by behavior cloning
+- `pretrain_bc_maca.py`: recurrent actor warm start by sequence behavior cloning
 
 Engineering rules:
 

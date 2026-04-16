@@ -25,6 +25,8 @@ from scripts.train_mappo_maca import main as train_mappo_main
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--experiment", type=str, default=None)
+    parser.add_argument("--train_dir", type=str, default=None)
     return parser.parse_args(argv)
 
 
@@ -113,10 +115,14 @@ def maybe_collect_teacher_dataset(config: Dict[str, object], train_cfg: Dict[str
         str(bc_cfg.get("teacher_agent", "fix_rule")),
         "--episodes",
         str(int(bc_cfg.get("teacher_episodes", 200))),
+        "--max_attempt_episodes",
+        str(int(bc_cfg.get("max_attempt_episodes", 0))),
         "--seed",
         str(int(train_cfg.get("seed", 1))),
         "--output_path",
         str(output_path),
+        "--wins_only",
+        "true" if bool(bc_cfg.get("wins_only", False)) else "false",
         "--maca_opponent",
         str(config.get("env", {}).get("opponent", "fix_rule")),
         "--maca_map_path",
@@ -132,6 +138,10 @@ def maybe_collect_teacher_dataset(config: Dict[str, object], train_cfg: Dict[str
         "--maca_enemy_attrition_reward",
         str(float(config.get("env", {}).get("enemy_attrition_reward", 100.0))),
     ]
+    if bc_cfg.get("min_destroy_balance") is not None:
+        cmd.extend(["--min_destroy_balance", str(float(bc_cfg.get("min_destroy_balance")))])
+    if bc_cfg.get("min_round_reward") is not None:
+        cmd.extend(["--min_round_reward", str(float(bc_cfg.get("min_round_reward")))])
     subprocess.check_call(cmd, cwd=str(ROOT_DIR))
     return output_path
 
@@ -162,6 +172,10 @@ def maybe_run_bc_warm_start(config: Dict[str, object]) -> None:
         str(int(bc_cfg.get("batch_size", 8192))),
         "--learning_rate",
         str(float(bc_cfg.get("learning_rate", train_cfg.get("learning_rate", 3e-4)))),
+        "--chunk_len",
+        str(int(bc_cfg.get("chunk_len", train_cfg.get("chunk_len", 16)))),
+        "--burn_in",
+        str(int(bc_cfg.get("burn_in", train_cfg.get("burn_in", 8)))),
         "--hidden_size",
         str(int(train_cfg.get("hidden_size", 256))),
         "--role_embed_dim",
@@ -176,8 +190,13 @@ def main(argv=None):
     args = parse_args(argv)
     config_path = Path(args.config).resolve()
     config = load_config(config_path)
-
     train_cfg = dict(config.get("train", {}))
+    if args.experiment:
+        train_cfg["experiment"] = args.experiment
+    if args.train_dir:
+        train_cfg["train_dir"] = args.train_dir
+    config["train"] = train_cfg
+
     if "experiment" not in train_cfg:
         raise KeyError("Config must define train.experiment")
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import multiprocessing as mp
 import random
@@ -28,6 +29,22 @@ if str(ENV_DIR) not in sys.path:
 
 from marl_env.mappo_env import MAPPOMaCAConfig, MAPPOMaCAEnv
 from marl_env.mappo_model import MAPPOModelConfig, TeamActorCritic
+
+
+ROLLOUT_BUFFER_DTYPES = {
+    "local_obs": np.float32,
+    "global_state": np.float32,
+    "agent_ids": np.int64,
+    "attack_masks": np.uint8,
+    "alive_mask": np.float32,
+    "actor_h": np.float32,
+    "course_action": np.int64,
+    "attack_action": np.int64,
+    "log_prob": np.float32,
+    "reward": np.float32,
+    "done": np.float32,
+    "agent_aux_reward": np.float32,
+}
 
 
 class ValueNormalizer:
@@ -330,12 +347,72 @@ def build_env(args, seed_offset: int) -> MAPPOMaCAEnv:
     )
 
 
-def _collector_process_main(args, worker_idx: int, env_count: int, conn):
+def make_shared_ndarray(shape, dtype):
+    dtype = np.dtype(dtype)
+    c_type = np.ctypeslib.as_ctypes_type(dtype)
+    size = int(np.prod(shape))
+    raw = mp.RawArray(c_type, size)
+    array = np.frombuffer(raw, dtype=dtype, count=size).reshape(shape)
+    return raw, array
+
+
+def shared_ndarray_view(raw, shape, dtype):
+    dtype = np.dtype(dtype)
+    size = int(np.prod(shape))
+    return np.frombuffer(raw, dtype=dtype, count=size).reshape(shape)
+
+
+def build_worker_buffer_shapes(rollout_steps: int, env_count: int, env_spec: dict):
+    num_agents = int(env_spec["num_agents"])
+    local_obs_dim = int(env_spec["local_obs_dim"])
+    global_state_dim = int(env_spec["global_state_dim"])
+    attack_dim = int(env_spec["attack_dim"])
+    actor_hidden_dim = int(env_spec["actor_hidden_dim"])
+    return {
+        "local_obs": (rollout_steps, env_count, num_agents, local_obs_dim),
+        "global_state": (rollout_steps, env_count, global_state_dim),
+        "agent_ids": (rollout_steps, env_count, num_agents),
+        "attack_masks": (rollout_steps, env_count, num_agents, attack_dim),
+        "alive_mask": (rollout_steps, env_count, num_agents),
+        "actor_h": (rollout_steps, env_count, num_agents, actor_hidden_dim),
+        "course_action": (rollout_steps, env_count, num_agents),
+        "attack_action": (rollout_steps, env_count, num_agents),
+        "log_prob": (rollout_steps, env_count, num_agents),
+        "reward": (rollout_steps, env_count),
+        "done": (rollout_steps, env_count),
+        "agent_aux_reward": (rollout_steps, env_count, num_agents),
+        "final_global_state": (env_count, global_state_dim),
+    }
+
+
+def allocate_worker_shared_buffers(rollout_steps: int, env_count: int, env_spec: dict):
+    shapes = build_worker_buffer_shapes(rollout_steps, env_count, env_spec)
+    shared = {}
+    for key, shape in shapes.items():
+        dtype = np.float32 if key == "final_global_state" else ROLLOUT_BUFFER_DTYPES[key]
+        raw, _view = make_shared_ndarray(shape, dtype)
+        shared[key] = {
+            "raw": raw,
+            "shape": shape,
+            "dtype": np.dtype(dtype).str,
+        }
+    return shared
+
+
+def attach_worker_shared_buffers(shared_buffers):
+    attached = {}
+    for key, meta in shared_buffers.items():
+        attached[key] = shared_ndarray_view(meta["raw"], meta["shape"], np.dtype(meta["dtype"]))
+    return attached
+
+
+def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spec: dict, shared_buffers):
     torch.set_num_threads(1)
     set_seed(args.seed + worker_idx * 1009)
     envs = [build_env(args, seed_offset=worker_idx * 100000 + env_idx * 9973) for env_idx in range(env_count)]
     worker_model = None
     obs_batch = None
+    shared_views = attach_worker_shared_buffers(shared_buffers)
 
     try:
         while True:
@@ -373,27 +450,10 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn):
                 actor_state_tensors = {key: torch.from_numpy(value) for key, value in actor_state.items()}
                 worker_model.load_state_dict(actor_state_tensors, strict=False)
 
-                num_agents = obs_batch[0]["local_obs"].shape[0]
-                local_obs_dim = obs_batch[0]["local_obs"].shape[1]
-                global_dim = obs_batch[0]["global_state"].shape[0]
-                attack_dim = obs_batch[0]["attack_masks"].shape[1]
                 actor_hidden_dim = worker_model.actor_hidden_dim
+                num_agents = int(env_spec["num_agents"])
 
                 actor_h_batch = np.zeros((env_count, num_agents, actor_hidden_dim), dtype=np.float32)
-                buffer = {
-                    "local_obs": np.zeros((rollout_steps, env_count, num_agents, local_obs_dim), dtype=np.float32),
-                    "global_state": np.zeros((rollout_steps, env_count, global_dim), dtype=np.float32),
-                    "agent_ids": np.zeros((rollout_steps, env_count, num_agents), dtype=np.int64),
-                    "attack_masks": np.zeros((rollout_steps, env_count, num_agents, attack_dim), dtype=np.bool_),
-                    "alive_mask": np.zeros((rollout_steps, env_count, num_agents), dtype=np.float32),
-                    "actor_h": np.zeros((rollout_steps, env_count, num_agents, actor_hidden_dim), dtype=np.float32),
-                    "course_action": np.zeros((rollout_steps, env_count, num_agents), dtype=np.int64),
-                    "attack_action": np.zeros((rollout_steps, env_count, num_agents), dtype=np.int64),
-                    "log_prob": np.zeros((rollout_steps, env_count, num_agents), dtype=np.float32),
-                    "reward": np.zeros((rollout_steps, env_count), dtype=np.float32),
-                    "done": np.zeros((rollout_steps, env_count), dtype=np.float32),
-                    "agent_aux_reward": np.zeros((rollout_steps, env_count, num_agents), dtype=np.float32),
-                }
                 episodes = []
 
                 for step_idx in range(rollout_steps):
@@ -409,15 +469,15 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn):
                     with torch.no_grad():
                         actions = sample_actions(worker_model, stacked, torch.device("cpu"), deterministic=False)
 
-                    buffer["local_obs"][step_idx] = stacked["local_obs"]
-                    buffer["global_state"][step_idx] = stacked["global_state"]
-                    buffer["attack_masks"][step_idx] = stacked["attack_masks"]
-                    buffer["alive_mask"][step_idx] = stacked["alive_mask"]
-                    buffer["agent_ids"][step_idx] = stacked["agent_ids"]
-                    buffer["actor_h"][step_idx] = stacked["actor_h"]
-                    buffer["course_action"][step_idx] = actions["course_action"].cpu().numpy()
-                    buffer["attack_action"][step_idx] = actions["attack_action"].cpu().numpy()
-                    buffer["log_prob"][step_idx] = actions["log_prob"].cpu().numpy()
+                    shared_views["local_obs"][step_idx] = stacked["local_obs"]
+                    shared_views["global_state"][step_idx] = stacked["global_state"]
+                    shared_views["attack_masks"][step_idx] = stacked["attack_masks"].astype(np.uint8, copy=False)
+                    shared_views["alive_mask"][step_idx] = stacked["alive_mask"]
+                    shared_views["agent_ids"][step_idx] = stacked["agent_ids"]
+                    shared_views["actor_h"][step_idx] = stacked["actor_h"]
+                    shared_views["course_action"][step_idx] = actions["course_action"].cpu().numpy()
+                    shared_views["attack_action"][step_idx] = actions["attack_action"].cpu().numpy()
+                    shared_views["log_prob"][step_idx] = actions["log_prob"].cpu().numpy()
 
                     next_obs_batch = []
                     rewards = np.zeros((env_count,), dtype=np.float32)
@@ -447,9 +507,9 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn):
                             next_obs = env.reset()
                         next_obs_batch.append(next_obs)
 
-                    buffer["reward"][step_idx] = rewards
-                    buffer["done"][step_idx] = dones
-                    buffer["agent_aux_reward"][step_idx] = aux_rewards
+                    shared_views["reward"][step_idx] = rewards
+                    shared_views["done"][step_idx] = dones
+                    shared_views["agent_aux_reward"][step_idx] = aux_rewards
 
                     actor_h_batch = actions["next_actor_h"].cpu().numpy()
                     if np.any(dones > 0.5):
@@ -458,11 +518,10 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn):
                     obs_batch = next_obs_batch
 
                 final_global_state = np.stack([obs["global_state"] for obs in obs_batch], axis=0)
+                shared_views["final_global_state"][:] = final_global_state
 
                 conn.send(
                     {
-                        "buffer": buffer,
-                        "final_global_state": final_global_state,
                         "episodes": episodes,
                     }
                 )
@@ -479,7 +538,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn):
 
 
 class CollectorPool:
-    def __init__(self, args):
+    def __init__(self, args, env_spec: dict):
         total_envs = max(1, int(args.num_envs))
         requested_workers = max(1, int(args.num_workers))
         actual_workers = min(requested_workers, total_envs)
@@ -495,18 +554,25 @@ class CollectorPool:
         self.processes = []
         self.num_workers = actual_workers
         self.num_envs = total_envs
+        self.rollout_steps = int(args.rollout)
+        self.env_spec = env_spec
+        self.worker_shared_meta = []
+        self.worker_shared_views = []
 
         for worker_idx, env_count in enumerate(self.worker_env_counts):
+            shared_buffers = allocate_worker_shared_buffers(self.rollout_steps, env_count, env_spec)
             parent_conn, child_conn = ctx.Pipe()
             process = ctx.Process(
                 target=_collector_process_main,
-                args=(args, worker_idx, env_count, child_conn),
+                args=(args, worker_idx, env_count, child_conn, env_spec, shared_buffers),
                 daemon=True,
             )
             process.start()
             child_conn.close()
             self.parent_conns.append(parent_conn)
             self.processes.append(process)
+            self.worker_shared_meta.append(shared_buffers)
+            self.worker_shared_views.append(attach_worker_shared_buffers(shared_buffers))
 
     def reset(self, seed=None):
         for worker_idx, conn in enumerate(self.parent_conns):
@@ -523,8 +589,11 @@ class CollectorPool:
             conn.send(("collect", (actor_state, rollout_steps)))
 
         results = []
-        for conn in self.parent_conns:
-            results.append(conn.recv())
+        for worker_idx, conn in enumerate(self.parent_conns):
+            worker_result = conn.recv()
+            worker_result["buffer"] = self.worker_shared_views[worker_idx]
+            worker_result["final_global_state"] = self.worker_shared_views[worker_idx]["final_global_state"]
+            results.append(worker_result)
         return results
 
     def close(self):
@@ -748,6 +817,89 @@ def build_recurrent_chunks(rollout_steps: int, num_envs: int, num_agents: int, c
     return chunks
 
 
+def pack_recurrent_minibatch(
+    chunk_indices,
+    chunks,
+    local_obs,
+    global_state,
+    agent_ids,
+    attack_masks,
+    alive_mask,
+    actor_h,
+    old_log_prob,
+    course_action,
+    attack_action,
+    returns_t,
+    combined_adv,
+    burn_in: int,
+):
+    batch_size = len(chunk_indices)
+    hidden_dim = actor_h.shape[-1]
+    obs_dim = local_obs.shape[-1]
+    global_dim = global_state.shape[-1]
+    attack_dim = attack_masks.shape[-1]
+
+    chunk_meta = []
+    max_total_len = 0
+    for chunk_idx in chunk_indices:
+        env_idx, agent_idx, start, end = chunks[int(chunk_idx)]
+        burn_start = max(0, start - burn_in)
+        total_len = end - burn_start
+        train_len = end - start
+        train_offset = start - burn_start
+        chunk_meta.append((env_idx, agent_idx, start, end, burn_start, total_len, train_len, train_offset))
+        max_total_len = max(max_total_len, total_len)
+
+    local_batch = local_obs.new_zeros((max_total_len, batch_size, obs_dim))
+    global_batch = global_state.new_zeros((max_total_len, batch_size, global_dim))
+    agent_id_batch = agent_ids.new_zeros((max_total_len, batch_size))
+    attack_mask_batch = attack_masks.new_zeros((max_total_len, batch_size, attack_dim))
+    course_batch = course_action.new_zeros((max_total_len, batch_size))
+    attack_batch = attack_action.new_zeros((max_total_len, batch_size))
+    old_log_prob_batch = old_log_prob.new_zeros((max_total_len, batch_size))
+    adv_batch = combined_adv.new_zeros((max_total_len, batch_size))
+    return_batch = returns_t.new_zeros((max_total_len, batch_size))
+    train_mask = torch.zeros((max_total_len, batch_size), dtype=torch.bool, device=local_obs.device)
+    active_policy_mask = torch.zeros((max_total_len, batch_size), dtype=torch.bool, device=local_obs.device)
+    seq_valid_mask = torch.zeros((max_total_len, batch_size), dtype=torch.bool, device=local_obs.device)
+    init_h = actor_h.new_zeros((batch_size, hidden_dim))
+
+    for batch_col, meta in enumerate(chunk_meta):
+        env_idx, agent_idx, start, end, burn_start, total_len, train_len, train_offset = meta
+        init_h[batch_col] = actor_h[burn_start, env_idx, agent_idx]
+        seq_valid_mask[:total_len, batch_col] = True
+
+        local_batch[:total_len, batch_col] = local_obs[burn_start:end, env_idx, agent_idx]
+        global_batch[:total_len, batch_col] = global_state[burn_start:end, env_idx]
+        agent_id_batch[:total_len, batch_col] = agent_ids[burn_start:end, env_idx, agent_idx]
+        attack_mask_batch[:total_len, batch_col] = attack_masks[burn_start:end, env_idx, agent_idx]
+        course_batch[:total_len, batch_col] = course_action[burn_start:end, env_idx, agent_idx]
+        attack_batch[:total_len, batch_col] = attack_action[burn_start:end, env_idx, agent_idx]
+
+        train_slice = slice(train_offset, train_offset + train_len)
+        train_mask[train_slice, batch_col] = True
+        old_log_prob_batch[train_slice, batch_col] = old_log_prob[start:end, env_idx, agent_idx]
+        adv_batch[train_slice, batch_col] = combined_adv[start:end, env_idx, agent_idx]
+        return_batch[train_slice, batch_col] = returns_t[start:end, env_idx]
+        active_policy_mask[train_slice, batch_col] = alive_mask[start:end, env_idx, agent_idx] > 0.5
+
+    return {
+        "init_h": init_h.detach(),
+        "local_obs": local_batch,
+        "global_state": global_batch,
+        "agent_ids": agent_id_batch,
+        "attack_masks": attack_mask_batch,
+        "course_action": course_batch,
+        "attack_action": attack_batch,
+        "old_log_prob": old_log_prob_batch,
+        "advantages": adv_batch,
+        "returns": return_batch,
+        "train_mask": train_mask,
+        "active_policy_mask": active_policy_mask,
+        "seq_valid_mask": seq_valid_mask,
+    }
+
+
 def ppo_update(model, optimizer, buffer, advantages_team, advantages_aux, returns, device, args, value_normalizer=None):
     local_obs = torch.as_tensor(buffer["local_obs"], dtype=torch.float32, device=device)
     global_state = torch.as_tensor(buffer["global_state"], dtype=torch.float32, device=device)
@@ -780,77 +932,106 @@ def ppo_update(model, optimizer, buffer, advantages_team, advantages_aux, return
     rollout_steps, num_envs, num_agents = local_obs.shape[0], local_obs.shape[1], local_obs.shape[2]
     chunks = build_recurrent_chunks(rollout_steps, num_envs, num_agents, args.chunk_len)
     num_chunks = len(chunks)
-    accum_size = max(1, num_chunks // max(1, args.num_mini_batches))
 
     total_policy = 0.0
     total_value = 0.0
     total_entropy = 0.0
-    total_chunk_count = 0
+    total_minibatches = 0
     total_active = 0
     total_grad_steps = 0
 
     for _ in range(args.ppo_epochs):
         order = np.random.permutation(num_chunks)
-        optimizer.zero_grad()
-        chunks_in_batch = 0
+        mini_batches = np.array_split(order, max(1, args.num_mini_batches))
 
-        for i in range(num_chunks):
-            chunk_idx = int(order[i])
-            env_idx, agent_idx, start, end = chunks[chunk_idx]
-            burn_start = max(0, start - args.burn_in)
+        for mini_batch_indices in mini_batches:
+            if len(mini_batch_indices) <= 0:
+                continue
 
-            h = actor_h[burn_start, env_idx, agent_idx].unsqueeze(0).detach()
+            packed = pack_recurrent_minibatch(
+                mini_batch_indices,
+                chunks,
+                local_obs,
+                global_state,
+                agent_ids,
+                attack_masks,
+                alive_mask,
+                actor_h,
+                old_log_prob,
+                course_action,
+                attack_action,
+                returns_t,
+                combined_adv,
+                args.burn_in,
+            )
 
+            train_mask = packed["train_mask"]
+            train_global_state = packed["global_state"][train_mask]
+            train_returns = packed["returns"][train_mask]
+            if train_global_state.numel() <= 0:
+                continue
+
+            value_pred_t = model.value(train_global_state)
+            value_loss = 0.5 * (value_pred_t - train_returns).pow(2).mean() * args.value_loss_coeff
+
+            h = packed["init_h"]
             new_log_probs = []
             old_log_probs = []
             entropies = []
             advantages = []
-            value_preds = []
-            value_targets = []
 
-            for t in range(burn_start, end):
-                obs_t = local_obs[t, env_idx, agent_idx].unsqueeze(0)
-                id_t = agent_ids[t, env_idx, agent_idx].unsqueeze(0)
-                course_t = course_action[t, env_idx, agent_idx].unsqueeze(0)
-                attack_t = attack_action[t, env_idx, agent_idx].unsqueeze(0)
-
-                course_logits, attack_logits, h = model.actor_step(obs_t, id_t, h, course_actions=course_t)
-
-                if t < start:
+            max_total_len = packed["local_obs"].shape[0]
+            for seq_idx in range(max_total_len):
+                seq_valid = packed["seq_valid_mask"][seq_idx]
+                if not torch.any(seq_valid):
                     continue
 
-                mask_t = attack_masks[t, env_idx, agent_idx].unsqueeze(0)
-                alive_t = bool(alive_mask[t, env_idx, agent_idx].item() > 0.5)
+                seq_local = packed["local_obs"][seq_idx, seq_valid]
+                seq_ids = packed["agent_ids"][seq_idx, seq_valid]
+                seq_h = h[seq_valid]
+                seq_course = packed["course_action"][seq_idx, seq_valid]
+
+                course_logits, attack_logits, next_h_valid = model.actor_step(
+                    seq_local,
+                    seq_ids,
+                    seq_h,
+                    course_actions=seq_course,
+                )
+                h = h.clone()
+                h[seq_valid] = next_h_valid
+
+                seq_train = packed["train_mask"][seq_idx, seq_valid]
+                if not torch.any(seq_train):
+                    continue
+
+                course_logits = course_logits[seq_train]
+                attack_logits = attack_logits[seq_train]
+                seq_course = seq_course[seq_train]
+                seq_attack = packed["attack_action"][seq_idx, seq_valid][seq_train]
+                seq_attack_mask = packed["attack_masks"][seq_idx, seq_valid][seq_train]
+                seq_old_log_prob = packed["old_log_prob"][seq_idx, seq_valid][seq_train]
+                seq_adv = packed["advantages"][seq_idx, seq_valid][seq_train]
+                seq_active = packed["active_policy_mask"][seq_idx, seq_valid][seq_train]
+
+                if course_logits.shape[0] <= 0:
+                    continue
 
                 course_dist = Categorical(logits=course_logits)
-                attack_dist = masked_categorical(attack_logits, mask_t)
-                lp = course_dist.log_prob(course_t) + attack_dist.log_prob(attack_t)
-                ent = course_dist.entropy() + attack_dist.entropy()
+                attack_dist = masked_categorical(attack_logits, seq_attack_mask)
+                seq_log_prob = course_dist.log_prob(seq_course) + attack_dist.log_prob(seq_attack)
+                seq_entropy = course_dist.entropy() + attack_dist.entropy()
 
-                value_pred = model.value(global_state[t, env_idx].unsqueeze(0)).squeeze(0)
-                value_target = returns_t[t, env_idx]
-                value_preds.append(value_pred)
-                value_targets.append(value_target)
-
-                if alive_t:
-                    new_log_probs.append(lp.squeeze(0))
-                    old_log_probs.append(old_log_prob[t, env_idx, agent_idx])
-                    entropies.append(ent.squeeze(0))
-                    advantages.append(combined_adv[t, env_idx, agent_idx])
-
-            if not value_preds:
-                continue
-
-            value_pred_t = torch.stack(value_preds)
-            value_target_t = torch.stack(value_targets)
-            # FIX: removed erroneous /num_agents scaling
-            value_loss = 0.5 * (value_pred_t - value_target_t).pow(2).mean() * args.value_loss_coeff
+                if torch.any(seq_active):
+                    new_log_probs.append(seq_log_prob[seq_active])
+                    old_log_probs.append(seq_old_log_prob[seq_active])
+                    entropies.append(seq_entropy[seq_active])
+                    advantages.append(seq_adv[seq_active])
 
             if new_log_probs:
-                new_log_prob_t = torch.stack(new_log_probs)
-                old_log_prob_t = torch.stack(old_log_probs)
-                adv_t = torch.stack(advantages)
-                entropy_t = torch.stack(entropies)
+                new_log_prob_t = torch.cat(new_log_probs, dim=0)
+                old_log_prob_t = torch.cat(old_log_probs, dim=0)
+                adv_t = torch.cat(advantages, dim=0)
+                entropy_t = torch.cat(entropies, dim=0)
 
                 ratio = torch.exp(new_log_prob_t - old_log_prob_t)
                 clipped_ratio = torch.clamp(ratio, 1.0 - args.clip_ratio, 1.0 + args.clip_ratio)
@@ -863,25 +1044,19 @@ def ppo_update(model, optimizer, buffer, advantages_team, advantages_aux, return
                 entropy_loss = value_loss * 0.0
                 entropy_mean = 0.0
 
-            # Gradient accumulation: scale loss by mini-batch size
-            chunk_loss = (policy_loss + value_loss + entropy_loss) / float(accum_size)
-            chunk_loss.backward()
-            chunks_in_batch += 1
+            loss = policy_loss + value_loss + entropy_loss
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            optimizer.step()
 
             total_policy += float(policy_loss.item())
             total_value += float(value_loss.item())
             total_entropy += entropy_mean
-            total_chunk_count += 1
+            total_minibatches += 1
+            total_grad_steps += 1
 
-            # Step optimizer once per accumulated mini-batch
-            if chunks_in_batch >= accum_size or i == num_chunks - 1:
-                nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
-                chunks_in_batch = 0
-                total_grad_steps += 1
-
-    if total_chunk_count <= 0:
+    if total_minibatches <= 0:
         return {
             "policy_loss": 0.0,
             "value_loss": 0.0,
@@ -891,9 +1066,9 @@ def ppo_update(model, optimizer, buffer, advantages_team, advantages_aux, return
         }
 
     return {
-        "policy_loss": total_policy / float(total_chunk_count),
-        "value_loss": total_value / float(total_chunk_count),
-        "entropy": total_entropy / float(total_chunk_count),
+        "policy_loss": total_policy / float(total_minibatches),
+        "value_loss": total_value / float(total_minibatches),
+        "entropy": total_entropy / float(total_minibatches),
         "active_samples": total_active,
         "grad_steps": total_grad_steps,
     }
@@ -904,12 +1079,27 @@ def main(argv=None):
     device = device_from_arg(args.device)
     set_seed(args.seed)
 
-    collectors = CollectorPool(args)
     writer = build_summary_writer(args)
-    initial_obs = collectors.reset(seed=args.seed)
-    local_obs_dim = initial_obs[0]["local_obs"].shape[1]
-    global_state_dim = initial_obs[0]["global_state"].shape[0]
-    num_agents = initial_obs[0]["local_obs"].shape[0]
+    probe_env = build_env(args, seed_offset=0)
+    try:
+        initial_obs = probe_env.reset(seed=args.seed)
+        local_obs_dim = initial_obs["local_obs"].shape[1]
+        global_state_dim = initial_obs["global_state"].shape[0]
+        num_agents = initial_obs["local_obs"].shape[0]
+        attack_dim = initial_obs["attack_masks"].shape[1]
+    finally:
+        probe_env.close()
+
+    env_spec = {
+        "local_obs_dim": int(local_obs_dim),
+        "global_state_dim": int(global_state_dim),
+        "num_agents": int(num_agents),
+        "attack_dim": int(attack_dim),
+        "actor_hidden_dim": int(args.hidden_size),
+    }
+
+    collectors = CollectorPool(args, env_spec)
+    collectors.reset(seed=args.seed)
 
     save_config(args, local_obs_dim, global_state_dim, num_agents, collectors.worker_env_counts)
     print(
@@ -947,16 +1137,32 @@ def main(argv=None):
     try:
         while env_steps < args.train_for_env_steps:
             update_start = time.time()
+            print(
+                "[stage] update=%d env_steps=%d starting_rollout rollout=%d num_envs=%d workers=%d"
+                % (update_idx + 1, env_steps, args.rollout, collectors.num_envs, collectors.num_workers),
+                flush=True,
+            )
 
             actor_state = export_actor_state_cpu(model)
             buffer, next_value = rollout(
                 collectors, actor_state, model, device, args, episode_stats, value_normalizer
+            )
+            rollout_wall_time = time.time() - update_start
+            print(
+                "[stage] update=%d env_steps=%d rollout_finished wall_time_sec=%.2f"
+                % (update_idx + 1, env_steps, rollout_wall_time),
+                flush=True,
             )
             advantages_team, returns = compute_gae(buffer, next_value, args.gamma, args.gae_lambda)
             advantages_aux = compute_aux_advantages(buffer, args.gamma)
 
             # Update value normalizer BEFORE ppo_update (so critic trains on fresh stats)
             value_normalizer.update(returns)
+            print(
+                "[stage] update=%d env_steps=%d starting_ppo_update"
+                % (update_idx + 1, env_steps),
+                flush=True,
+            )
 
             stats = ppo_update(
                 model,
@@ -968,6 +1174,11 @@ def main(argv=None):
                 device,
                 args,
                 value_normalizer,
+            )
+            print(
+                "[stage] update=%d env_steps=%d ppo_update_finished"
+                % (update_idx + 1, env_steps),
+                flush=True,
             )
 
             env_steps += args.rollout * collectors.num_envs
