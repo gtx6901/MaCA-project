@@ -78,6 +78,8 @@ class MaCAParallelEnv:
         self._last_red_raw_obs = None
         self._last_blue_raw_obs = None
         self._last_alive_mask = None
+        self._last_red_round_reward = 0.0
+        self._last_blue_round_reward = 0.0
         self._step_count = 0
         self._rng = np.random.RandomState(0)
         self._support_radar_points = None
@@ -156,6 +158,8 @@ class MaCAParallelEnv:
             self._build_env(seed=self._pending_seed)
         self._env.reset()
         self._step_count = 0
+        self._last_red_round_reward = 0.0
+        self._last_blue_round_reward = 0.0
         if self._semantic_enemy_memory is not None:
             self._semantic_enemy_memory.fill(0.0)
         observations, infos = self._collect_step_output()
@@ -199,16 +203,24 @@ class MaCAParallelEnv:
         ) = self._env.get_reward()
         env_done = bool(self._env.get_done())
         timeout = env_done and self._step_count >= self.config.max_step
+        red_round_reward_delta = float(red_round_reward) - float(self._last_red_round_reward)
+        blue_round_reward_delta = float(blue_round_reward) - float(self._last_blue_round_reward)
+        self._last_red_round_reward = float(red_round_reward)
+        self._last_blue_round_reward = float(blue_round_reward)
 
         rewards = {}
         terminations = {}
         truncations = {}
         for idx, agent_id in enumerate(self.agents):
-            rewards[agent_id] = float(red_fighter_reward[idx] + red_round_reward)
+            # Use round-reward delta (instead of absolute round reward) so that
+            # victory signal is preserved without being repeatedly accumulated.
+            rewards[agent_id] = float(red_fighter_reward[idx]) + red_round_reward_delta
             terminations[agent_id] = bool(env_done and not timeout)
             truncations[agent_id] = bool(timeout)
             infos[agent_id]["round_reward"] = float(red_round_reward)
+            infos[agent_id]["round_reward_delta"] = red_round_reward_delta
             infos[agent_id]["opponent_round_reward"] = float(blue_round_reward)
+            infos[agent_id]["opponent_round_reward_delta"] = blue_round_reward_delta
         return observations, rewards, terminations, truncations, infos
 
     def close(self) -> None:
@@ -217,6 +229,8 @@ class MaCAParallelEnv:
         self._last_blue_raw_obs = None
         self._last_red_obs = None
         self._last_red_raw_obs = None
+        self._last_red_round_reward = 0.0
+        self._last_blue_round_reward = 0.0
 
     def get_raw_snapshot(self):
         """Expose the latest raw red/blue observations for custom trainers."""

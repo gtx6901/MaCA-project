@@ -7,6 +7,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -41,7 +42,7 @@ def device_from_arg(device_arg: str):
     return torch.device("cpu")
 
 
-def latest_checkpoint(exp_dir: Path) -> Path | None:
+def latest_checkpoint(exp_dir: Path) -> Optional[Path]:
     ckpt_dir = exp_dir / "checkpoint"
     if not ckpt_dir.exists():
         return None
@@ -88,6 +89,12 @@ def build_env(train_cfg: dict, args) -> MAPPOMaCAEnv:
             max_visible_enemies=int(train_cfg.get("maca_max_visible_enemies", 4)),
             friendly_attrition_penalty=float(train_cfg.get("maca_friendly_attrition_penalty", 200.0)),
             enemy_attrition_reward=float(train_cfg.get("maca_enemy_attrition_reward", 100.0)),
+            track_memory_steps=int(train_cfg.get("maca_track_memory_steps", 12)),
+            contact_reward=float(train_cfg.get("maca_contact_reward", 0.1)),
+            progress_reward_scale=float(train_cfg.get("maca_progress_reward_scale", 0.002)),
+            progress_reward_cap=float(train_cfg.get("maca_progress_reward_cap", 20.0)),
+            attack_window_reward=float(train_cfg.get("maca_attack_window_reward", 0.1)),
+            agent_aux_reward_scale=float(train_cfg.get("maca_agent_aux_reward_scale", 0.0)),
         )
     )
 
@@ -99,14 +106,18 @@ def select_actions(model, obs, actor_h, device, deterministic: bool):
     actor_h_t = torch.as_tensor(actor_h, dtype=torch.float32, device=device)
 
     with torch.no_grad():
-        course_logits, attack_logits, next_actor_h = model.actor_step(local_obs, agent_ids, actor_h_t)
+        course_logits, _attack_logits_unused, next_actor_h = model.actor_step(local_obs, agent_ids, actor_h_t)
+        if deterministic:
+            course_action = torch.argmax(course_logits, dim=-1)
+        else:
+            course_action = torch.distributions.Categorical(logits=course_logits).sample()
+
+        attack_logits = model.attack_logits(next_actor_h, course_action)
         invalid_logit = torch.finfo(attack_logits.dtype).min
         attack_logits = attack_logits.masked_fill(~attack_masks, invalid_logit)
         if deterministic:
-            course_action = torch.argmax(course_logits, dim=-1)
             attack_action = torch.argmax(attack_logits, dim=-1)
         else:
-            course_action = torch.distributions.Categorical(logits=course_logits).sample()
             attack_action = torch.distributions.Categorical(logits=attack_logits).sample()
 
     return np.stack([course_action.cpu().numpy(), attack_action.cpu().numpy()], axis=-1), next_actor_h.cpu().numpy()
@@ -132,10 +143,17 @@ def main():
         num_agents=env.num_agents,
         hidden_size=int(train_cfg.get("hidden_size", 256)),
         role_embed_dim=int(train_cfg.get("role_embed_dim", 8)),
+        course_embed_dim=int(train_cfg.get("course_embed_dim", 16)),
     )
     model = TeamActorCritic(model_cfg).to(device)
     checkpoint_state = torch.load(checkpoint, map_location="cpu")
-    model.load_state_dict(checkpoint_state["model"])
+    model_load = model.load_state_dict(checkpoint_state["model"], strict=False)
+    if model_load.missing_keys or model_load.unexpected_keys:
+        print(
+            "[eval] non-strict load missing=%s unexpected=%s"
+            % (model_load.missing_keys, model_load.unexpected_keys),
+            flush=True,
+        )
     model.eval()
     actor_h = np.zeros((env.num_agents, model.actor_hidden_dim), dtype=np.float32)
 

@@ -45,6 +45,12 @@ class MAPPOMaCAConfig:
     max_visible_enemies: int = 4
     friendly_attrition_penalty: float = 200.0
     enemy_attrition_reward: float = 100.0
+    track_memory_steps: int = 12
+    contact_reward: float = 0.1
+    progress_reward_scale: float = 0.002
+    progress_reward_cap: float = 20.0
+    attack_window_reward: float = 0.1
+    agent_aux_reward_scale: float = 0.0
 
 
 class MAPPOMaCAEnv:
@@ -71,7 +77,8 @@ class MAPPOMaCAEnv:
         self.num_agents = len(self.base_env.agents)
         self.max_visible_enemies = max(1, int(self.config.max_visible_enemies))
         self._size_x, self._size_y = self.base_env.get_map_size()
-        self._local_obs_dim = 12 + self.max_visible_enemies * 8
+        self._track_memory_steps = max(1, int(self.config.track_memory_steps))
+        self._local_obs_dim = 16 + self.max_visible_enemies * 8
         self._global_state_dim = None
         self._reset_stats()
 
@@ -113,6 +120,8 @@ class MAPPOMaCAEnv:
         fire_count = 0
         executed_fire_count = 0
 
+        pre_states = [self._extract_agent_state(red_raw_obs["fighter_obs_list"][idx]) for idx in range(self.num_agents)]
+
         for idx, agent_id in enumerate(self.base_env.agents):
             fighter_raw_obs = red_raw_obs["fighter_obs_list"][idx]
             alive = bool(fighter_raw_obs["alive"])
@@ -140,6 +149,7 @@ class MAPPOMaCAEnv:
             action_dict[agent_id] = [course_action, attack_action]
 
         obs_dict, reward_dict, terminations, truncations, infos = self.base_env.step(action_dict)
+        red_raw_obs_next, _ = self.base_env.get_raw_snapshot()
         done = bool(any(terminations.values()) or any(truncations.values()))
         raw_info = infos[self.base_env.agents[0]]
         red_destroyed_count = int(raw_info.get("red_fighter_destroyed_count", 0))
@@ -153,9 +163,19 @@ class MAPPOMaCAEnv:
             float(blue_destroyed_delta) * float(self.config.enemy_attrition_reward)
             - float(red_destroyed_delta) * float(self.config.friendly_attrition_penalty)
         )
+        agent_aux_reward = np.zeros((self.num_agents,), dtype=np.float32)
+        if red_raw_obs_next is not None:
+            for idx in range(self.num_agents):
+                next_state = self._extract_agent_state(red_raw_obs_next["fighter_obs_list"][idx])
+                agent_aux_reward[idx] = self._compute_agent_aux_reward(pre_states[idx], next_state)
+
         team_reward = float(np.mean(list(reward_dict.values()))) + attrition_reward
+        if self.config.agent_aux_reward_scale != 0.0:
+            team_reward += float(np.mean(agent_aux_reward)) * float(self.config.agent_aux_reward_scale)
+
         self._episode_return += team_reward
         self._episode_len += 1
+        self._episode_agent_aux_return += agent_aux_reward
         self._attack_opportunity_count += attack_opportunity_count
         self._missed_attack_count += missed_attack_count
         self._fire_action_count += fire_count
@@ -169,6 +189,7 @@ class MAPPOMaCAEnv:
             "is_active": True,
             "round_reward": float(raw_info.get("round_reward", 0.0)),
             "opponent_round_reward": float(raw_info.get("opponent_round_reward", 0.0)),
+            "agent_aux_reward": agent_aux_reward.tolist(),
         }
         if done:
             info["true_reward"] = float(self._episode_return)
@@ -178,6 +199,7 @@ class MAPPOMaCAEnv:
     def _reset_stats(self):
         self._episode_return = 0.0
         self._episode_len = 0
+        self._episode_agent_aux_return = np.zeros((self.num_agents,), dtype=np.float32)
         self._fire_action_count = 0
         self._executed_fire_action_count = 0
         self._attack_opportunity_count = 0
@@ -192,6 +214,10 @@ class MAPPOMaCAEnv:
         self._last_course_actions = np.full((self.num_agents,), -1, dtype=np.int32)
         self._attack_window_entry_counts = np.zeros((self.num_agents,), dtype=np.int32)
         self._last_attack_available = np.zeros((self.num_agents,), dtype=np.bool_)
+        self._track_distance = np.zeros((self.num_agents,), dtype=np.float32)
+        self._track_bearing_deg = np.zeros((self.num_agents,), dtype=np.float32)
+        self._track_heading_diff = np.zeros((self.num_agents,), dtype=np.float32)
+        self._track_age = np.full((self.num_agents,), self._track_memory_steps, dtype=np.int32)
 
     def _build_step_output(self, obs_dict, infos):
         red_raw_obs, blue_raw_obs = self.base_env.get_raw_snapshot()
@@ -212,6 +238,7 @@ class MAPPOMaCAEnv:
             alive = bool(fighter_raw_obs["alive"])
             alive_mask[idx] = 1.0 if alive else 0.0
             local_obs[idx] = self._build_local_obs(
+                agent_idx=idx,
                 fighter_raw_obs=fighter_raw_obs,
                 step_frac=step_frac,
                 red_alive_count=red_alive_count,
@@ -246,6 +273,7 @@ class MAPPOMaCAEnv:
 
     def _build_local_obs(
         self,
+        agent_idx: int,
         fighter_raw_obs: Dict[str, object],
         step_frac: float,
         red_alive_count: int,
@@ -253,12 +281,18 @@ class MAPPOMaCAEnv:
     ) -> np.ndarray:
         obs = np.zeros((self.local_obs_dim,), dtype=np.float32)
         if not fighter_raw_obs["alive"]:
+            self._track_age[agent_idx] = self._track_memory_steps
             return obs
 
         own_x = float(fighter_raw_obs["pos_x"])
         own_y = float(fighter_raw_obs["pos_y"])
         course_rad = float(fighter_raw_obs["course"]) * (np.pi / 180.0)
         recv_count, recv_dir_sin, recv_dir_cos = self._recv_summary(fighter_raw_obs)
+        range_rate, bearing_rate, heading_diff, last_seen_age = self._dynamic_track_features(
+            agent_idx=agent_idx,
+            fighter_raw_obs=fighter_raw_obs,
+            course_rad=course_rad,
+        )
 
         cursor = 0
         base_features = [
@@ -274,6 +308,10 @@ class MAPPOMaCAEnv:
             recv_dir_sin,
             recv_dir_cos,
             (blue_alive_count - red_alive_count) / float(max(self.num_agents, 1)),
+            range_rate,
+            bearing_rate,
+            heading_diff,
+            last_seen_age,
         ]
         obs[cursor : cursor + len(base_features)] = np.asarray(base_features, dtype=np.float32)
         cursor += len(base_features)
@@ -301,6 +339,102 @@ class MAPPOMaCAEnv:
             ]
             obs[start : start + 8] = np.asarray(features, dtype=np.float32)
         return obs
+
+    def _dynamic_track_features(self, agent_idx: int, fighter_raw_obs: Dict[str, object], course_rad: float):
+        prev_age = int(self._track_age[agent_idx])
+        prev_distance = float(self._track_distance[agent_idx])
+        prev_bearing = float(self._track_bearing_deg[agent_idx])
+        prev_heading_diff = float(self._track_heading_diff[agent_idx])
+
+        visible_targets = self._sorted_visible_targets(fighter_raw_obs)
+        if visible_targets:
+            target = visible_targets[0]
+            own_x = float(fighter_raw_obs["pos_x"])
+            own_y = float(fighter_raw_obs["pos_y"])
+            dx = float(target["pos_x"]) - own_x
+            dy = float(target["pos_y"]) - own_y
+            distance = float(np.sqrt(dx * dx + dy * dy))
+            rel_bearing_deg = float(np.degrees(np.arctan2(dy, dx) - course_rad))
+            rel_bearing_deg = ((rel_bearing_deg + 180.0) % 360.0) - 180.0
+            heading_diff = float(np.clip(rel_bearing_deg / 180.0, -1.0, 1.0))
+
+            range_rate = 0.0
+            bearing_rate = 0.0
+            if prev_age < self._track_memory_steps and prev_distance > 0.0:
+                range_rate = float(np.clip((prev_distance - distance) / 100.0, -1.0, 1.0))
+                bearing_delta = ((rel_bearing_deg - prev_bearing + 180.0) % 360.0) - 180.0
+                bearing_rate = float(np.clip(bearing_delta / 45.0, -1.0, 1.0))
+
+            self._track_distance[agent_idx] = distance
+            self._track_bearing_deg[agent_idx] = rel_bearing_deg
+            self._track_heading_diff[agent_idx] = heading_diff
+            self._track_age[agent_idx] = 0
+            return range_rate, bearing_rate, heading_diff, 0.0
+
+        self._track_age[agent_idx] = min(self._track_age[agent_idx] + 1, self._track_memory_steps)
+        last_seen_age = float(self._track_age[agent_idx]) / float(max(self._track_memory_steps, 1))
+        if prev_age >= self._track_memory_steps:
+            prev_heading_diff = 0.0
+        return 0.0, 0.0, prev_heading_diff, last_seen_age
+
+    @staticmethod
+    def _extract_agent_state(fighter_raw_obs: Dict[str, object]) -> Dict[str, float]:
+        alive = bool(fighter_raw_obs.get("alive", False))
+        if not alive:
+            return {
+                "alive": False,
+                "has_contact": False,
+                "nearest_enemy_distance": 0.0,
+                "has_attack_opportunity": False,
+            }
+
+        visible_targets = list(fighter_raw_obs.get("r_visible_list", []))
+        has_contact = len(visible_targets) > 0
+        if has_contact:
+            own_x = float(fighter_raw_obs["pos_x"])
+            own_y = float(fighter_raw_obs["pos_y"])
+            nearest = min(
+                visible_targets,
+                key=lambda t: (own_x - float(t.get("pos_x", own_x))) ** 2 + (own_y - float(t.get("pos_y", own_y))) ** 2,
+            )
+            dx = own_x - float(nearest.get("pos_x", own_x))
+            dy = own_y - float(nearest.get("pos_y", own_y))
+            nearest_distance = float(np.sqrt(dx * dx + dy * dy))
+        else:
+            nearest_distance = 0.0
+
+        attack_mask = build_attack_mask_from_raw(fighter_raw_obs)
+        return {
+            "alive": True,
+            "has_contact": has_contact,
+            "nearest_enemy_distance": nearest_distance,
+            "has_attack_opportunity": bool(attack_mask[1:].any()),
+        }
+
+    def _compute_agent_aux_reward(self, prev_state: Dict[str, float], next_state: Dict[str, float]) -> float:
+        if not prev_state["alive"]:
+            return 0.0
+
+        reward = 0.0
+        if next_state["has_contact"] and not prev_state["has_contact"]:
+            reward += float(self.config.contact_reward)
+
+        if (
+            prev_state["has_contact"]
+            and next_state["has_contact"]
+            and prev_state["nearest_enemy_distance"] > 0.0
+            and next_state["nearest_enemy_distance"] > 0.0
+        ):
+            distance_delta = prev_state["nearest_enemy_distance"] - next_state["nearest_enemy_distance"]
+            if distance_delta > 0.0:
+                reward += min(distance_delta, float(self.config.progress_reward_cap)) * float(
+                    self.config.progress_reward_scale
+                )
+
+        if next_state["has_attack_opportunity"] and not prev_state["has_attack_opportunity"]:
+            reward += float(self.config.attack_window_reward)
+
+        return float(reward)
 
     @staticmethod
     def _recv_summary(fighter_raw_obs: Dict[str, object]) -> Tuple[float, float, float]:
@@ -363,6 +497,7 @@ class MAPPOMaCAEnv:
             "nearest_enemy_distance_mean": nearest_mean,
             "nearest_enemy_distance_min": nearest_min,
             "engagement_progress_reward_mean": 0.0,
+            "agent_aux_reward_mean": float(np.mean(self._episode_agent_aux_return)) / episode_len,
             "episode_len": float(self._episode_len),
             "win_flag": float(raw_info.get("round_reward", 0.0) > raw_info.get("opponent_round_reward", 0.0)),
             "red_fighter_alive_end": float(raw_info.get("red_fighter_alive_count", 0.0)),
