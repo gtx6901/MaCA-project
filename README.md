@@ -49,7 +49,7 @@ bash run_train.sh
 The default config is [configs/mappo.yaml](/home/lehan/MaCA-master/configs/mappo.yaml). Important defaults:
 
 - `fix_rule` is the main training opponent
-- `8` environments and `4` rollout workers target laptop-scale throughput
+- `10` environments and `5` rollout workers target the measured throughput sweet spot on `13900H + RTX 4060 8GB`
 - recurrent PPO uses `rollout=128`, `chunk_len=16`, `burn_in=8`
 - deterministic evaluation runs every `1,000,000` environment steps
 

@@ -3,8 +3,8 @@ train:
   train_dir: train_dir/mappo
   device: gpu
   seed: 1
-  num_envs: 8
-  num_workers: 4
+  num_envs: 10
+  num_workers: 5
   rollout: 128
   chunk_len: 16
   burn_in: 8

@@ -63,8 +63,8 @@ conda run --no-capture-output -n maca-py37-min \
 
 默认配置已经面向 `13900H + RTX 4060 Laptop 8GB` 调整：
 
-- `num_envs=8`
-- `num_workers=4`
+- `num_envs=10`
+- `num_workers=5`
 - `rollout=128`
 - `chunk_len=16`
 - `burn_in=8`
