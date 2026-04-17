@@ -69,7 +69,7 @@ class TeamActorCritic(nn.Module):
         self.critic = nn.ModuleDict(
             {
                 "input_proj": nn.Linear(cfg.global_state_dim + cfg.mode_embed_dim, cfg.hidden_size),
-                "rnn": nn.GRUCell(cfg.hidden_size, cfg.hidden_size),
+                "rnn": nn.GRU(cfg.hidden_size, cfg.hidden_size, num_layers=1),
                 "trunk": nn.Sequential(
                     nn.Linear(cfg.hidden_size, cfg.hidden_size),
                     nn.ReLU(),
@@ -196,8 +196,10 @@ class TeamActorCritic(nn.Module):
             mode_ctx = self._critic_mode_context(mode_actions, (n,), global_state.device)
             x = torch.cat([global_state, mode_ctx], dim=-1)
             x = torch.relu(self.critic["input_proj"](x))
-            h = torch.zeros((n, self.cfg.hidden_size), dtype=x.dtype, device=x.device)
-            h = self.critic["rnn"](x, h)
+            x_seq = x.unsqueeze(0)
+            h0 = torch.zeros((1, n, self.cfg.hidden_size), dtype=x.dtype, device=x.device)
+            out_seq, _h_n = self.critic["rnn"](x_seq, h0)
+            h = out_seq[0]
             trunk = self.critic["trunk"](h)
             return {
                 "team": self.critic["value_team"](trunk).squeeze(-1),
@@ -211,24 +213,20 @@ class TeamActorCritic(nn.Module):
         x = torch.cat([global_state, mode_ctx], dim=-1)
         x = torch.relu(self.critic["input_proj"](x))
 
-        h = torch.zeros((b, self.cfg.hidden_size), dtype=x.dtype, device=x.device)
-        team_values = []
-        contact_values = []
-        opportunity_values = []
-        survival_values = []
-        for step in range(t):
-            h = self.critic["rnn"](x[step], h)
-            trunk = self.critic["trunk"](h)
-            team_values.append(self.critic["value_team"](trunk).squeeze(-1))
-            contact_values.append(self.critic["value_contact"](trunk).squeeze(-1))
-            opportunity_values.append(self.critic["value_opportunity"](trunk).squeeze(-1))
-            survival_values.append(self.critic["value_survival"](trunk).squeeze(-1))
+        h0 = torch.zeros((1, b, self.cfg.hidden_size), dtype=x.dtype, device=x.device)
+        out_seq, _h_n = self.critic["rnn"](x, h0)
+        trunk = self.critic["trunk"](out_seq.reshape(t * b, self.cfg.hidden_size))
+
+        team_values = self.critic["value_team"](trunk).reshape(t, b)
+        contact_values = self.critic["value_contact"](trunk).reshape(t, b)
+        opportunity_values = self.critic["value_opportunity"](trunk).reshape(t, b)
+        survival_values = self.critic["value_survival"](trunk).reshape(t, b)
 
         return {
-            "team": torch.stack(team_values, dim=0),
-            "contact": torch.stack(contact_values, dim=0),
-            "opportunity": torch.stack(opportunity_values, dim=0),
-            "survival": torch.stack(survival_values, dim=0),
+            "team": team_values,
+            "contact": contact_values,
+            "opportunity": opportunity_values,
+            "survival": survival_values,
         }
 
     def value(self, global_state: torch.Tensor, mode_actions: Optional[torch.Tensor] = None):

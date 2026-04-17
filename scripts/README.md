@@ -21,6 +21,11 @@ Primary entrypoints:
 - `collect_teacher_maca.py`: teacher trajectory collection for BC warm start
 - `pretrain_bc_maca.py`: recurrent actor warm start by sequence behavior cloning
 
+Refactor note:
+
+- `scripts/train_mappo_maca.py` keeps the same CLI and remains the training entrypoint.
+- Core training logic is split into `marl_train/` (`collector`, `rollout`, `ppo_update`, `checkpoint`, `eval`, `logging_utils`) to reduce single-file complexity.
+
 Engineering rules:
 
 - keep one shared launcher plus one profile per hardware lane

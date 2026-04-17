@@ -2,6 +2,10 @@
 
 This document is the single operational guide for the HMARL scripts currently in use.
 
+Compatibility note:
+
+- The trainer internals were refactored into `marl_train/` modules for maintainability and performance, but script entrypoints and CLI usage in this document remain unchanged.
+
 ## 1. Prerequisites
 
 - Workspace root: `/home/lehan/MaCA-master`
