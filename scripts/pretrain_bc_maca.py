@@ -48,6 +48,9 @@ def parse_args():
     parser.add_argument("--role_embed_dim", type=int, default=8)
     parser.add_argument("--course_embed_dim", type=int, default=16)
 
+    parser.add_argument("--bc_stage", type=str, default="both", choices=["both", "mode", "action"])
+    parser.add_argument("--mode_loss_weight", type=float, default=1.0)
+
     parser.add_argument("--save_actor_only", type=str2bool, default=True)
     return parser.parse_args()
 
@@ -128,6 +131,7 @@ def pack_chunk_batch(
     alive_mask = dataset["alive_mask"]
     course_action = dataset["course_action"]
     attack_action = dataset["attack_action"]
+    mode_label = dataset.get("mode_label", None)
 
     batch_size = len(chunk_indices)
     hidden_dim = 0
@@ -150,6 +154,7 @@ def pack_chunk_batch(
     attack_mask_batch = torch.zeros((max_total_len, batch_size, attack_dim), dtype=torch.bool, device=device)
     course_batch = torch.zeros((max_total_len, batch_size), dtype=torch.long, device=device)
     attack_batch = torch.zeros((max_total_len, batch_size), dtype=torch.long, device=device)
+    mode_batch = torch.zeros((max_total_len, batch_size), dtype=torch.long, device=device)
     train_mask = torch.zeros((max_total_len, batch_size), dtype=torch.bool, device=device)
     active_mask = torch.zeros((max_total_len, batch_size), dtype=torch.bool, device=device)
     seq_valid_mask = torch.zeros((max_total_len, batch_size), dtype=torch.bool, device=device)
@@ -182,6 +187,12 @@ def pack_chunk_batch(
             dtype=torch.long,
             device=device,
         )
+        if mode_label is not None:
+            mode_batch[:total_len, batch_col] = torch.as_tensor(
+                mode_label[burn_start:end, agent_idx],
+                dtype=torch.long,
+                device=device,
+            )
         train_slice = slice(train_offset, train_offset + train_len)
         train_mask[train_slice, batch_col] = True
         active_mask[train_slice, batch_col] = torch.as_tensor(
@@ -196,6 +207,7 @@ def pack_chunk_batch(
         "attack_masks": attack_mask_batch,
         "course_action": course_batch,
         "attack_action": attack_batch,
+        "mode_label": mode_batch,
         "train_mask": train_mask,
         "active_mask": active_mask,
         "seq_valid_mask": seq_valid_mask,
@@ -212,6 +224,7 @@ def train_epoch(model, optimizer, dataset, chunks, args, device):
     total_loss = 0.0
     total_course_loss = 0.0
     total_attack_loss = 0.0
+    total_mode_loss = 0.0
     total_active = 0
     total_batches = 0
 
@@ -223,6 +236,7 @@ def train_epoch(model, optimizer, dataset, chunks, args, device):
 
         course_losses = []
         attack_losses = []
+        mode_losses = []
         max_total_len = packed["local_obs"].shape[0]
 
         for seq_idx in range(max_total_len):
@@ -235,6 +249,7 @@ def train_epoch(model, optimizer, dataset, chunks, args, device):
             seq_hidden = hidden[seq_valid]
             seq_course = packed["course_action"][seq_idx, seq_valid]
             seq_attack = packed["attack_action"][seq_idx, seq_valid]
+            seq_mode = packed["mode_label"][seq_idx, seq_valid]
             seq_attack_mask = packed["attack_masks"][seq_idx, seq_valid]
 
             course_logits, attack_logits, next_hidden = model.actor_step(
@@ -256,21 +271,44 @@ def train_epoch(model, optimizer, dataset, chunks, args, device):
             attack_logits = attack_logits[use_mask]
             seq_course = seq_course[use_mask]
             seq_attack = seq_attack[use_mask]
+            seq_mode = seq_mode[use_mask]
             seq_attack_mask = seq_attack_mask[use_mask]
 
             invalid_logit = torch.finfo(attack_logits.dtype).min
             attack_logits = attack_logits.masked_fill(~seq_attack_mask, invalid_logit)
 
-            course_losses.append(F.cross_entropy(course_logits, seq_course))
-            attack_losses.append(F.cross_entropy(attack_logits, seq_attack))
+            if args.bc_stage in {"both", "action"}:
+                course_losses.append(F.cross_entropy(course_logits, seq_course))
+                attack_losses.append(F.cross_entropy(attack_logits, seq_attack))
+            if args.bc_stage in {"both", "mode"}:
+                mode_logits = model.mode_head(next_hidden[use_mask])
+                mode_losses.append(F.cross_entropy(mode_logits, seq_mode))
             total_active += int(seq_course.shape[0])
 
-        if not course_losses:
+        if not course_losses and not mode_losses:
             continue
 
-        course_loss = torch.stack(course_losses).mean()
-        attack_loss = torch.stack(attack_losses).mean()
-        loss = course_loss + attack_loss
+        if course_losses:
+            course_loss = torch.stack(course_losses).mean()
+        else:
+            course_loss = torch.tensor(0.0, device=device)
+
+        if attack_losses:
+            attack_loss = torch.stack(attack_losses).mean()
+        else:
+            attack_loss = torch.tensor(0.0, device=device)
+
+        if mode_losses:
+            mode_loss = torch.stack(mode_losses).mean()
+        else:
+            mode_loss = torch.tensor(0.0, device=device)
+
+        if args.bc_stage == "mode":
+            loss = args.mode_loss_weight * mode_loss
+        elif args.bc_stage == "action":
+            loss = course_loss + attack_loss
+        else:
+            loss = course_loss + attack_loss + args.mode_loss_weight * mode_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -280,6 +318,7 @@ def train_epoch(model, optimizer, dataset, chunks, args, device):
         total_loss += float(loss.item())
         total_course_loss += float(course_loss.item())
         total_attack_loss += float(attack_loss.item())
+        total_mode_loss += float(mode_loss.item())
         total_batches += 1
 
     denom = float(max(total_batches, 1))
@@ -287,6 +326,7 @@ def train_epoch(model, optimizer, dataset, chunks, args, device):
         "loss": total_loss / denom,
         "course_loss": total_course_loss / denom,
         "attack_loss": total_attack_loss / denom,
+        "mode_loss": total_mode_loss / denom,
         "active_samples": total_active,
         "batches": total_batches,
     }
@@ -305,6 +345,7 @@ def main():
     alive_mask = np.asarray(raw_data["alive_mask"], dtype=np.float32)
     course_action = np.asarray(raw_data["course_action"], dtype=np.int64)
     attack_action = np.asarray(raw_data["attack_action"], dtype=np.int64)
+    mode_label = np.asarray(raw_data.get("mode_label", np.zeros_like(attack_action)), dtype=np.int64)
     episode_lengths = np.asarray(raw_data.get("episode_lengths", np.asarray([local_obs.shape[0]], dtype=np.int32)))
 
     total_steps, num_agents, local_obs_dim = local_obs.shape
@@ -319,6 +360,7 @@ def main():
         "alive_mask": alive_mask,
         "course_action": course_action,
         "attack_action": attack_action,
+        "mode_label": mode_label,
     }
 
     episode_offsets = build_episode_offsets(episode_lengths, total_steps)
@@ -341,11 +383,13 @@ def main():
     for epoch in range(args.epochs):
         stats = train_epoch(model, optimizer, dataset, chunks, args, device)
         print(
-            "[bc] epoch=%d/%d loss=%.4f course=%.4f attack=%.4f active=%d batches=%d"
+            "[bc] epoch=%d/%d stage=%s loss=%.4f mode=%.4f course=%.4f attack=%.4f active=%d batches=%d"
             % (
                 epoch + 1,
                 args.epochs,
+                args.bc_stage,
                 stats["loss"],
+                stats["mode_loss"],
                 stats["course_loss"],
                 stats["attack_loss"],
                 stats["active_samples"],
@@ -360,7 +404,7 @@ def main():
 
     model_state = model.state_dict()
     if args.save_actor_only:
-        model_state = {k: v for k, v in model_state.items() if not k.startswith("critic.")}
+        model_state = {k: v for k, v in model_state.items() if not k.startswith("critic")}
 
     checkpoint_path = ckpt_dir / "checkpoint_000000000_0.pt"
     torch.save(
@@ -385,6 +429,7 @@ def main():
         "bc_warmstart": True,
         "bc_dataset_path": str(dataset_path),
         "bc_wall_time_sec": float(time.time() - start_time),
+        "bc_stage": args.bc_stage,
         "bc_chunk_len": int(args.chunk_len),
         "bc_burn_in": int(args.burn_in),
         "bc_total_steps": int(total_steps),

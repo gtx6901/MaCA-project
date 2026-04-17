@@ -248,6 +248,43 @@ def teacher_actions_to_mappo(env: MAPPOMaCAEnv, fighter_actions) -> np.ndarray:
         actions[idx, 1] = int(attack_action)
     return actions
 
+def infer_mode_labels(obs: dict, mappo_actions: np.ndarray, max_visible_enemies: int = 4) -> np.ndarray:
+    """Auto-generate hierarchical mode labels from observation/action snapshots.
+
+    Labels:
+      0: search (no contact)
+      1: approach (contact but no attack window)
+      2: attack_ready (attack window available, no fire)
+      3: fire_commit (attack action > 0)
+    """
+
+    local_obs = np.asarray(obs["local_obs"], dtype=np.float32)
+    attack_masks = np.asarray(obs["attack_masks"], dtype=np.bool_)
+    actions = np.asarray(mappo_actions, dtype=np.int64)
+
+    mode_labels = np.zeros((local_obs.shape[0],), dtype=np.int64)
+    for idx in range(local_obs.shape[0]):
+        attack_action = int(actions[idx, 1])
+        if attack_action > 0:
+            mode_labels[idx] = 3
+            continue
+
+        has_opportunity = bool(attack_masks[idx, 1:].any())
+        if has_opportunity:
+            mode_labels[idx] = 2
+            continue
+
+        # Local obs packs visible targets in slots, each slot starts with valid flag.
+        has_contact = False
+        base = 16
+        for slot in range(max(1, int(max_visible_enemies))):
+            pos = base + slot * 8
+            if pos < local_obs.shape[1] and local_obs[idx, pos] > 0.5:
+                has_contact = True
+                break
+        mode_labels[idx] = 1 if has_contact else 0
+    return mode_labels
+
 
 def main():
     args = parse_args()
@@ -284,6 +321,7 @@ def main():
     episode_alive_mask = []
     episode_course_action = []
     episode_attack_action = []
+    episode_mode_label = []
 
     def flush_episode_if_accepted(episode_stats, episode_return: float):
         nonlocal accepted_episode_idx
@@ -310,6 +348,7 @@ def main():
                         "alive_mask": np.stack(episode_alive_mask, axis=0),
                         "course_action": np.stack(episode_course_action, axis=0),
                         "attack_action": np.stack(episode_attack_action, axis=0),
+                        "mode_label": np.stack(episode_mode_label, axis=0),
                     }
                 ]
             )
@@ -341,6 +380,13 @@ def main():
             episode_alive_mask.append(np.asarray(obs["alive_mask"], dtype=np.float32))
             episode_course_action.append(np.asarray(mappo_actions[:, 0], dtype=np.int64))
             episode_attack_action.append(np.asarray(mappo_actions[:, 1], dtype=np.int64))
+            episode_mode_label.append(
+                infer_mode_labels(
+                    obs,
+                    mappo_actions,
+                    max_visible_enemies=int(args.maca_max_visible_enemies),
+                )
+            )
 
             obs, reward, done, _info = env.step(mappo_actions)
             ep_return += float(reward)
@@ -378,6 +424,7 @@ def main():
                 episode_alive_mask = []
                 episode_course_action = []
                 episode_attack_action = []
+                episode_mode_label = []
                 obs = env.reset(seed=args.seed + attempt_episode_idx)
     finally:
         env.close()
@@ -403,6 +450,7 @@ def main():
         "alive_mask": np.concatenate([item["alive_mask"] for item in accepted_steps], axis=0),
         "course_action": np.concatenate([item["course_action"] for item in accepted_steps], axis=0),
         "attack_action": np.concatenate([item["attack_action"] for item in accepted_steps], axis=0),
+        "mode_label": np.concatenate([item["mode_label"] for item in accepted_steps], axis=0),
     }
     payload = {
         **payload_steps,

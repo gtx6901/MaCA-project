@@ -44,6 +44,25 @@ def str2bool(value: str) -> bool:
     return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
 
+def append_agent_id_onehot(local_obs: np.ndarray, agent_ids: np.ndarray, num_agents: int) -> np.ndarray:
+    one_hot = np.eye(num_agents, dtype=np.float32)[agent_ids]
+    return np.concatenate([local_obs.astype(np.float32, copy=False), one_hot], axis=-1)
+
+
+def ensure_valid_action_mask(mask: torch.Tensor) -> torch.Tensor:
+    if mask.numel() <= 0:
+        return mask
+    has_any = torch.any(mask, dim=-1, keepdim=True)
+    safe = mask.clone()
+    safe[..., 0] = safe[..., 0] | (~has_any.squeeze(-1))
+    return safe
+
+
+def sanitize_logits(logits: torch.Tensor, clamp_abs: float = 30.0) -> torch.Tensor:
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=clamp_abs, neginf=-clamp_abs)
+    return torch.clamp(logits, -clamp_abs, clamp_abs)
+
+
 def device_from_arg(device_arg: str):
     if device_arg == "gpu" and torch.cuda.is_available():
         return torch.device("cuda")
@@ -103,24 +122,34 @@ def build_env(train_cfg: dict, args) -> MAPPOMaCAEnv:
             progress_reward_cap=float(train_cfg.get("maca_progress_reward_cap", 20.0)),
             attack_window_reward=float(train_cfg.get("maca_attack_window_reward", 0.1)),
             agent_aux_reward_scale=float(train_cfg.get("maca_agent_aux_reward_scale", 0.0)),
+            mode_reward_scale=float(train_cfg.get("maca_mode_reward_scale", 0.5)),
+            exec_reward_scale=float(train_cfg.get("maca_exec_reward_scale", 0.2)),
+            disengage_penalty=float(train_cfg.get("maca_disengage_penalty", 0.05)),
+            bearing_reward_scale=float(train_cfg.get("maca_bearing_reward_scale", 0.05)),
         )
     )
 
 
-def select_actions(model, obs, actor_h, device, deterministic: bool):
-    local_obs = torch.as_tensor(obs["local_obs"], dtype=torch.float32, device=device)
+def select_actions(model, obs, actor_h, device, deterministic: bool, concat_agent_id_onehot: bool, num_agents: int):
+    local_obs_np = obs["local_obs"]
+    if concat_agent_id_onehot:
+        local_obs_np = append_agent_id_onehot(local_obs_np[None, ...], obs["agent_ids"][None, ...], num_agents)[0]
+    local_obs = torch.as_tensor(local_obs_np, dtype=torch.float32, device=device)
     agent_ids = torch.as_tensor(obs["agent_ids"], dtype=torch.long, device=device)
     attack_masks = torch.as_tensor(obs["attack_masks"], dtype=torch.bool, device=device)
+    attack_masks = ensure_valid_action_mask(attack_masks)
     actor_h_t = torch.as_tensor(actor_h, dtype=torch.float32, device=device)
 
     with torch.no_grad():
         course_logits, _attack_logits_unused, next_actor_h = model.actor_step(local_obs, agent_ids, actor_h_t)
+        course_logits = sanitize_logits(course_logits)
         if deterministic:
             course_action = torch.argmax(course_logits, dim=-1)
         else:
             course_action = torch.distributions.Categorical(logits=course_logits).sample()
 
         attack_logits = model.attack_logits(next_actor_h, course_action)
+        attack_logits = sanitize_logits(attack_logits)
         invalid_logit = torch.finfo(attack_logits.dtype).min
         attack_logits = attack_logits.masked_fill(~attack_masks, invalid_logit)
         if deterministic:
@@ -145,8 +174,11 @@ def main(argv=None):
 
     env = build_env(train_cfg, args)
     obs = env.reset(seed=args.seed)
+    concat_agent_id_onehot = bool(train_cfg.get("concat_agent_id_onehot", False))
+    base_local_obs_dim = int(env.local_obs_dim)
+    local_obs_dim = int(base_local_obs_dim + (env.num_agents if concat_agent_id_onehot else 0))
     model_cfg = MAPPOModelConfig(
-        local_obs_dim=env.local_obs_dim,
+        local_obs_dim=local_obs_dim,
         global_state_dim=env.global_state_dim,
         num_agents=env.num_agents,
         hidden_size=int(train_cfg.get("hidden_size", 256)),
@@ -167,9 +199,22 @@ def main(argv=None):
 
     episode_results = []
     start_time = time.time()
+    print(
+        "[eval] obs_agent_id_concat=%s base_obs_dim=%d final_obs_dim=%d"
+        % (str(concat_agent_id_onehot), base_local_obs_dim, local_obs_dim),
+        flush=True,
+    )
     try:
         while len(episode_results) < args.episodes:
-            actions, next_actor_h = select_actions(model, obs, actor_h, device, deterministic)
+            actions, next_actor_h = select_actions(
+                model,
+                obs,
+                actor_h,
+                device,
+                deterministic,
+                concat_agent_id_onehot=concat_agent_id_onehot,
+                num_agents=env.num_agents,
+            )
             obs, _reward, done, info = env.step(actions)
             actor_h = next_actor_h
             if not done:
