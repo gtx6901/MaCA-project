@@ -33,6 +33,8 @@ ROLLOUT_BUFFER_DTYPES = {
     "reward_env": np.float32,
     "reward_mode": np.float32,
     "reward_exec": np.float32,
+    "contact_signal": np.float32,
+    "opportunity_signal": np.float32,
     "damage_reward": np.float32,
     "kill_reward": np.float32,
     "survival_reward": np.float32,
@@ -435,6 +437,8 @@ def build_worker_buffer_shapes(rollout_steps: int, env_count: int, env_spec: dic
         "reward_env": (rollout_steps, env_count),
         "reward_mode": (rollout_steps, env_count),
         "reward_exec": (rollout_steps, env_count),
+        "contact_signal": (rollout_steps, env_count),
+        "opportunity_signal": (rollout_steps, env_count),
         "damage_reward": (rollout_steps, env_count),
         "kill_reward": (rollout_steps, env_count),
         "survival_reward": (rollout_steps, env_count),
@@ -538,6 +542,8 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                 rewards_env = np.zeros((env_count,), dtype=np.float32)
                 rewards_mode = np.zeros((env_count,), dtype=np.float32)
                 rewards_exec = np.zeros((env_count,), dtype=np.float32)
+                contact_signals = np.zeros((env_count,), dtype=np.float32)
+                opportunity_signals = np.zeros((env_count,), dtype=np.float32)
                 damage_rewards = np.zeros((env_count,), dtype=np.float32)
                 kill_rewards = np.zeros((env_count,), dtype=np.float32)
                 survival_rewards = np.zeros((env_count,), dtype=np.float32)
@@ -579,6 +585,13 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                         local_obs_batch[:, :, base_local_obs_dim:] = agent_id_eye[agent_ids_batch]
                     else:
                         local_obs_batch[:] = raw_local_obs_batch
+
+                    alive_bool = alive_mask_batch > 0.5
+                    alive_count = np.maximum(np.sum(alive_bool, axis=1), 1)
+                    contact_agent = np.any(rule_visible_target_ids_batch > 0, axis=-1) & alive_bool
+                    opportunity_agent = np.any(attack_masks_batch[:, :, 1:], axis=-1) & alive_bool
+                    contact_signals[:] = np.sum(contact_agent, axis=1) / alive_count
+                    opportunity_signals[:] = np.sum(opportunity_agent, axis=1) / alive_count
 
                     if prev_expected_actor_h is not None:
                         diff = np.abs(actor_h_batch - prev_expected_actor_h)
@@ -708,6 +721,8 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                     shared_views["reward_env"][step_idx] = rewards_env
                     shared_views["reward_mode"][step_idx] = rewards_mode
                     shared_views["reward_exec"][step_idx] = rewards_exec
+                    shared_views["contact_signal"][step_idx] = contact_signals
+                    shared_views["opportunity_signal"][step_idx] = opportunity_signals
                     shared_views["damage_reward"][step_idx] = damage_rewards
                     shared_views["kill_reward"][step_idx] = kill_rewards
                     shared_views["survival_reward"][step_idx] = survival_rewards

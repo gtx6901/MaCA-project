@@ -70,6 +70,8 @@ def parse_args(argv=None):
     parser.add_argument("--gae_lambda", type=float, default=0.95)
     parser.add_argument("--clip_ratio", type=float, default=0.1)
     parser.add_argument("--value_loss_coeff", type=float, default=0.5)
+    parser.add_argument("--aux_value_loss_coeff", type=float, default=0.25)
+    parser.add_argument("--disable_aux_value_heads", type=str2bool, default=False)
     parser.add_argument("--entropy_coeff", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=5.0)
     parser.add_argument("--max_actor_grad_norm", type=float, default=2.5)
@@ -104,6 +106,7 @@ def parse_args(argv=None):
     parser.add_argument("--save_best_checkpoint", type=str2bool, default=True)
     parser.add_argument("--best_checkpoint_source", type=str, default="eval_then_train")
     parser.add_argument("--debug_freeze_update_after_env_steps", type=int, default=-1)
+    parser.add_argument("--freeze_value_normalizer_after_env_steps", type=int, default=-1)
 
     parser.add_argument("--team_adv_weight", type=float, default=1.0)
     parser.add_argument("--aux_adv_weight", type=float, default=1.0)
@@ -177,6 +180,8 @@ def parse_args(argv=None):
         raise ValueError("attack_rule_mode must be one of: none, nearest_target")
     if str(args.attack_policy_mode).lower() not in {"full_discrete", "fire_or_not"}:
         raise ValueError("attack_policy_mode must be one of: full_discrete, fire_or_not")
+    if float(args.aux_value_loss_coeff) < 0.0:
+        raise ValueError("aux_value_loss_coeff must be >= 0")
     return args
 
 
@@ -478,7 +483,6 @@ def main(argv=None):
             advantages_aux = compute_aux_advantages(buffer, args.gamma)
             gae_time = time.time() - gae_start
 
-            value_normalizer.update(returns)
             print(
                 "[stage] update=%d env_steps=%d starting_ppo_update"
                 % (update_idx + 1, env_steps),
@@ -513,6 +517,16 @@ def main(argv=None):
                     teacher_model=teacher_model,
                     update_idx=update_idx,
                 )
+
+            freeze_vn_after = int(getattr(args, "freeze_value_normalizer_after_env_steps", -1))
+            value_norm_updated = False
+            if freeze_vn_after < 0 or env_steps < freeze_vn_after:
+                value_normalizer.update(returns)
+                value_norm_updated = True
+
+            stats["value_norm_mean"] = float(value_normalizer.mean)
+            stats["value_norm_std"] = float(np.sqrt(max(float(value_normalizer.var), 0.0) + float(value_normalizer.epsilon)))
+            stats["value_norm_updated"] = 1.0 if value_norm_updated else 0.0
             ppo_update_time = time.time() - ppo_start
             total_update_time = time.time() - update_start
 
@@ -587,7 +601,7 @@ def main(argv=None):
                     disable_high_level_mode=bool(args.disable_high_level_mode),
                 )
                 print(
-                    "[train] env_steps=%d update=%d stage=%s reward_mean=%.2f win_rate=%.3f fps=%.1f lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d policy=%.4f low=%.4f high=%.4f value_loss=%.4f entropy=%.4f imitation=%.4f coef=%.4f ev=%.4f actor_gn=%.4f critic_gn=%.4f active=%.3f skipped_nf=%d repaired_nf=%d hidden_err=%.6f rnn_mismatch=%d grad_steps=%d"
+                    "[train] env_steps=%d update=%d stage=%s reward_mean=%.2f win_rate=%.3f fps=%.1f lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d policy=%.4f low=%.4f high=%.4f value_loss=%.4f v_team=%.4f v_aux=%.4f entropy=%.4f imitation=%.4f coef=%.4f ev=%.4f actor_gn=%.4f critic_gn=%.4f active=%.3f skipped_nf=%d repaired_nf=%d hidden_err=%.6f rnn_mismatch=%d grad_steps=%d"
                     % (
                         env_steps,
                         update_idx,
@@ -603,6 +617,8 @@ def main(argv=None):
                         stats.get("policy_loss_low", 0.0),
                         stats.get("policy_loss_high", 0.0),
                         stats.get("value_loss", 0.0),
+                        stats.get("value_team_loss", 0.0),
+                        stats.get("value_aux_loss", 0.0),
                         stats.get("entropy", 0.0),
                         stats.get("imitation_loss", 0.0),
                         stats.get("imitation_coef", 0.0),
@@ -619,7 +635,7 @@ def main(argv=None):
                     flush=True,
                 )
                 print(
-                    "[stability] env_steps=%d update=%d lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d actor_gn=%.4f critic_gn=%.4f value_loss=%.4f policy_loss=%.4f entropy=%.4f value_target_std=%.4f value_target_norm_std=%.4f active_mask_ratio=%.4f reward_mean=%.2f win_rate=%.3f damage_reward_mean=%.4f attack_opportunity_frac=%.4f executed_fire_action_frac=%.4f no_fire_when_legal_frac=%.4f opportunity_to_fire_ratio=%.4f fire_decision_freq_00=%.4f fire_decision_freq_01=%.4f rule_selected_attack_nonzero_freq=%.4f freeze_update=%d"
+                    "[stability] env_steps=%d update=%d lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d actor_gn=%.4f critic_gn=%.4f value_loss=%.4f v_team=%.4f v_contact=%.4f v_opp=%.4f v_surv=%.4f aux_v_coef=%.3f aux_v_off=%d policy_loss=%.4f entropy=%.4f value_target_std=%.4f value_target_norm_std=%.4f value_norm_std=%.4f value_norm_updated=%d active_mask_ratio=%.4f reward_mean=%.2f win_rate=%.3f damage_reward_mean=%.4f attack_opportunity_frac=%.4f executed_fire_action_frac=%.4f no_fire_when_legal_frac=%.4f opportunity_to_fire_ratio=%.4f fire_decision_freq_00=%.4f fire_decision_freq_01=%.4f rule_selected_attack_nonzero_freq=%.4f freeze_update=%d"
                     % (
                         env_steps,
                         update_idx,
@@ -630,10 +646,18 @@ def main(argv=None):
                         stats.get("actor_grad_norm", 0.0),
                         stats.get("critic_grad_norm", 0.0),
                         stats.get("value_loss", 0.0),
+                        stats.get("value_team_loss", 0.0),
+                        stats.get("value_contact_loss", 0.0),
+                        stats.get("value_opportunity_loss", 0.0),
+                        stats.get("value_survival_loss", 0.0),
+                        stats.get("aux_value_loss_coeff", 0.0),
+                        int(stats.get("disable_aux_value_heads", 0.0) > 0.5),
                         stats.get("policy_loss", 0.0),
                         stats.get("entropy", 0.0),
                         stats.get("value_target_std", 0.0),
                         stats.get("value_target_norm_std", 0.0),
+                        stats.get("value_norm_std", 0.0),
+                        int(stats.get("value_norm_updated", 0.0) > 0.5),
                         stats.get("active_mask_ratio", 0.0),
                         reward_mean,
                         win_rate,

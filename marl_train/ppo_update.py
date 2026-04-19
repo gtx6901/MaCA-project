@@ -123,7 +123,8 @@ def pack_recurrent_minibatch(
     course_action,
     attack_action,
     policy_attack_action,
-    damage_reward,
+    contact_signal,
+    opportunity_signal,
     survival_reward,
     aux_reward_mean,
     returns_t,
@@ -161,7 +162,8 @@ def pack_recurrent_minibatch(
     old_mode_log_prob_batch = mode_log_prob.new_zeros((max_total_len, batch_size))
     mode_decision_batch = mode_decision.new_zeros((max_total_len, batch_size))
     mode_duration_batch = mode_duration.new_zeros((max_total_len, batch_size))
-    damage_reward_batch = damage_reward.new_zeros((max_total_len, batch_size))
+    contact_signal_batch = contact_signal.new_zeros((max_total_len, batch_size))
+    opportunity_signal_batch = opportunity_signal.new_zeros((max_total_len, batch_size))
     survival_reward_batch = survival_reward.new_zeros((max_total_len, batch_size))
     aux_reward_mean_batch = aux_reward_mean.new_zeros((max_total_len, batch_size))
     adv_batch = combined_adv.new_zeros((max_total_len, batch_size))
@@ -192,7 +194,8 @@ def pack_recurrent_minibatch(
         mode_batch[:total_len, batch_col] = mode_action[burn_start:end, env_idx, agent_idx]
         mode_decision_batch[:total_len, batch_col] = mode_decision[burn_start:end, env_idx, agent_idx]
         mode_duration_batch[:total_len, batch_col] = mode_duration[burn_start:end, env_idx, agent_idx]
-        damage_reward_batch[:total_len, batch_col] = damage_reward[burn_start:end, env_idx]
+        contact_signal_batch[:total_len, batch_col] = contact_signal[burn_start:end, env_idx]
+        opportunity_signal_batch[:total_len, batch_col] = opportunity_signal[burn_start:end, env_idx]
         survival_reward_batch[:total_len, batch_col] = survival_reward[burn_start:end, env_idx]
         aux_reward_mean_batch[:total_len, batch_col] = aux_reward_mean[burn_start:end, env_idx]
 
@@ -218,7 +221,8 @@ def pack_recurrent_minibatch(
         "mode_action": mode_batch,
         "mode_decision": mode_decision_batch,
         "mode_duration": mode_duration_batch,
-        "damage_reward": damage_reward_batch,
+        "contact_signal": contact_signal_batch,
+        "opportunity_signal": opportunity_signal_batch,
         "survival_reward": survival_reward_batch,
         "aux_reward_mean": aux_reward_mean_batch,
         "old_log_prob": old_log_prob_batch,
@@ -260,7 +264,8 @@ def ppo_update(
     mode_action = torch.as_tensor(buffer["mode_action"], dtype=torch.long, device=device)
     mode_decision = torch.as_tensor(buffer["mode_decision"], dtype=torch.float32, device=device)
     mode_duration = torch.as_tensor(buffer["mode_duration"], dtype=torch.float32, device=device)
-    damage_reward_t = torch.as_tensor(buffer["damage_reward"], dtype=torch.float32, device=device)
+    contact_signal_t = torch.as_tensor(buffer["contact_signal"], dtype=torch.float32, device=device)
+    opportunity_signal_t = torch.as_tensor(buffer["opportunity_signal"], dtype=torch.float32, device=device)
     survival_reward_t = torch.as_tensor(buffer["survival_reward"], dtype=torch.float32, device=device)
     aux_reward_mean_t = torch.as_tensor(
         np.mean(buffer["agent_aux_reward"], axis=-1),
@@ -333,10 +338,18 @@ def ppo_update(
     total_hidden_init_count = 0
     total_skipped_non_finite = 0
     total_repaired_params = 0
+    total_value_team_loss = 0.0
+    total_value_contact_loss = 0.0
+    total_value_opportunity_loss = 0.0
+    total_value_survival_loss = 0.0
 
     actor_params = [p for name, p in model.named_parameters() if not name.startswith("critic")]
     critic_params = [p for name, p in model.named_parameters() if name.startswith("critic")]
     attack_policy_mode = str(getattr(args, "attack_policy_mode", "full_discrete")).lower()
+    disable_aux_value_heads = bool(getattr(args, "disable_aux_value_heads", False))
+    aux_value_loss_coeff = float(max(getattr(args, "aux_value_loss_coeff", 0.25), 0.0))
+    if disable_aux_value_heads:
+        aux_value_loss_coeff = 0.0
 
     for _ in range(args.ppo_epochs):
         order = np.random.permutation(num_chunks)
@@ -366,7 +379,8 @@ def ppo_update(
                 course_action,
                 attack_action,
                 policy_attack_action,
-                damage_reward_t,
+                contact_signal_t,
+                opportunity_signal_t,
                 survival_reward_t,
                 aux_reward_mean_t,
                 returns_t,
@@ -377,13 +391,10 @@ def ppo_update(
 
             train_mask = packed["train_mask"]
             active_train_mask = train_mask & packed["active_policy_mask"]
-            train_global_state = packed["global_state"][active_train_mask]
             train_returns = packed["returns"][active_train_mask]
-            train_mode_action = packed["mode_action"][active_train_mask]
-            if train_global_state.numel() <= 0:
+            if train_returns.numel() <= 0:
                 continue
 
-            train_global_state = sanitize_tensor(train_global_state)
             train_returns = sanitize_tensor(train_returns)
 
             total_train_mask_count += int(train_mask.sum().item())
@@ -392,14 +403,17 @@ def ppo_update(
             total_hidden_init_err += float(init_err.sum().item())
             total_hidden_init_count += int(init_err.numel())
 
-            value_heads_t = model.value_heads(train_global_state, mode_actions=train_mode_action)
-            value_team_pred = sanitize_tensor(value_heads_t["team"])
-            value_contact_pred = sanitize_tensor(value_heads_t["contact"])
-            value_opportunity_pred = sanitize_tensor(value_heads_t["opportunity"])
-            value_survival_pred = sanitize_tensor(value_heads_t["survival"])
+            value_heads_t = model.value_heads(
+                sanitize_tensor(packed["global_state"]),
+                mode_actions=packed["mode_action"],
+            )
+            value_team_pred = sanitize_tensor(value_heads_t["team"][active_train_mask])
+            value_contact_pred = sanitize_tensor(value_heads_t["contact"][active_train_mask])
+            value_opportunity_pred = sanitize_tensor(value_heads_t["opportunity"][active_train_mask])
+            value_survival_pred = sanitize_tensor(value_heads_t["survival"][active_train_mask])
 
-            contact_target = sanitize_tensor(packed["aux_reward_mean"][active_train_mask])
-            opportunity_target = sanitize_tensor(packed["damage_reward"][active_train_mask])
+            contact_target = sanitize_tensor(packed["contact_signal"][active_train_mask])
+            opportunity_target = sanitize_tensor(packed["opportunity_signal"][active_train_mask])
             survival_target = sanitize_tensor(packed["survival_reward"][active_train_mask])
 
             def _norm_target(x: torch.Tensor) -> torch.Tensor:
@@ -413,9 +427,10 @@ def ppo_update(
             value_contact_loss = 0.5 * (value_contact_pred - _norm_target(contact_target)).pow(2).mean()
             value_opportunity_loss = 0.5 * (value_opportunity_pred - _norm_target(opportunity_target)).pow(2).mean()
             value_survival_loss = 0.5 * (value_survival_pred - _norm_target(survival_target)).pow(2).mean()
+            value_aux_loss = value_contact_loss + value_opportunity_loss + value_survival_loss
             value_loss = (
                 value_team_loss
-                + 0.25 * (value_contact_loss + value_opportunity_loss + value_survival_loss)
+                + aux_value_loss_coeff * value_aux_loss
             ) * args.value_loss_coeff
 
             h = packed["init_h"]
@@ -622,6 +637,10 @@ def ppo_update(
             total_policy_low += float(policy_loss_low.item())
             total_policy_high += float(policy_loss_high.item())
             total_value += float(value_loss.item())
+            total_value_team_loss += float(value_team_loss.item())
+            total_value_contact_loss += float(value_contact_loss.item())
+            total_value_opportunity_loss += float(value_opportunity_loss.item())
+            total_value_survival_loss += float(value_survival_loss.item())
             total_entropy_low += entropy_mean_low
             total_entropy_high += entropy_mean_high
             total_imitation += float(imitation_loss.item())
@@ -654,6 +673,13 @@ def ppo_update(
             "value_target_std": float(np.std(returns)),
             "value_target_norm_mean": float(np.mean(norm_returns)) if value_normalizer is not None else float(np.mean(returns)),
             "value_target_norm_std": float(np.std(norm_returns)) if value_normalizer is not None else float(np.std(returns)),
+            "value_team_loss": 0.0,
+            "value_contact_loss": 0.0,
+            "value_opportunity_loss": 0.0,
+            "value_survival_loss": 0.0,
+            "value_aux_loss": 0.0,
+            "aux_value_loss_coeff": float(aux_value_loss_coeff),
+            "disable_aux_value_heads": 1.0 if disable_aux_value_heads else 0.0,
         }
 
     active_mask_ratio = 0.0
@@ -687,6 +713,14 @@ def ppo_update(
         "value_target_std": float(np.std(returns)),
         "value_target_norm_mean": float(np.mean(norm_returns)) if value_normalizer is not None else float(np.mean(returns)),
         "value_target_norm_std": float(np.std(norm_returns)) if value_normalizer is not None else float(np.std(returns)),
+        "value_team_loss": total_value_team_loss / float(total_minibatches),
+        "value_contact_loss": total_value_contact_loss / float(total_minibatches),
+        "value_opportunity_loss": total_value_opportunity_loss / float(total_minibatches),
+        "value_survival_loss": total_value_survival_loss / float(total_minibatches),
+        "value_aux_loss": (total_value_contact_loss + total_value_opportunity_loss + total_value_survival_loss)
+        / float(total_minibatches),
+        "aux_value_loss_coeff": float(aux_value_loss_coeff),
+        "disable_aux_value_heads": 1.0 if disable_aux_value_heads else 0.0,
     }
 
 
