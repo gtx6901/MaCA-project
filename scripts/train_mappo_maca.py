@@ -71,6 +71,7 @@ def parse_args(argv=None):
     parser.add_argument("--clip_ratio", type=float, default=0.1)
     parser.add_argument("--value_loss_coeff", type=float, default=0.5)
     parser.add_argument("--aux_value_loss_coeff", type=float, default=0.25)
+    parser.add_argument("--priority_aux_loss_coeff", type=float, default=0.05)
     parser.add_argument("--disable_aux_value_heads", type=str2bool, default=False)
     parser.add_argument("--entropy_coeff", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=5.0)
@@ -142,6 +143,23 @@ def parse_args(argv=None):
     parser.add_argument("--maca_boundary_stuck_penalty_enabled", type=str2bool, default=True)
     parser.add_argument("--maca_boundary_stuck_trigger_steps", type=int, default=24)
     parser.add_argument("--maca_boundary_stuck_ramp_steps", type=int, default=20)
+    parser.add_argument("--maca_search_reward_scale", type=float, default=0.015)
+    parser.add_argument("--maca_reacquire_reward_scale", type=float, default=0.02)
+    parser.add_argument("--maca_priority_grid_h", type=int, default=4)
+    parser.add_argument("--maca_priority_grid_w", type=int, default=4)
+    parser.add_argument("--maca_priority_top_k", type=int, default=2)
+    parser.add_argument("--maca_priority_evidence_weight", type=float, default=1.0)
+    parser.add_argument("--maca_priority_uncertainty_weight", type=float, default=0.9)
+    parser.add_argument("--maca_priority_diffusion_weight", type=float, default=0.7)
+    parser.add_argument("--maca_priority_crowding_penalty", type=float, default=0.45)
+    parser.add_argument("--maca_priority_assignment_penalty", type=float, default=0.35)
+    parser.add_argument("--maca_priority_distance_penalty", type=float, default=0.25)
+    parser.add_argument("--maca_priority_unseen_cap_steps", type=int, default=40)
+    parser.add_argument("--maca_priority_memory_decay", type=float, default=0.92)
+    parser.add_argument("--maca_priority_diffusion_rate", type=float, default=0.25)
+    parser.add_argument("--maca_priority_passive_recv_weight", type=float, default=0.25)
+    parser.add_argument("--maca_priority_known_enemy_boost", type=float, default=0.8)
+    parser.add_argument("--maca_priority_unseen_threshold", type=float, default=0.7)
     parser.add_argument("--maca_semantic_screen_downsample", type=int, default=4)
     parser.add_argument("--maca_terminal_ammo_fail_penalty", type=float, default=80.0)
     parser.add_argument("--maca_terminal_participation_penalty", type=float, default=40.0)
@@ -190,6 +208,8 @@ def parse_args(argv=None):
         raise ValueError("attack_policy_mode must be one of: full_discrete, fire_or_not")
     if float(args.aux_value_loss_coeff) < 0.0:
         raise ValueError("aux_value_loss_coeff must be >= 0")
+    if float(args.priority_aux_loss_coeff) < 0.0:
+        raise ValueError("priority_aux_loss_coeff must be >= 0")
     if str(args.best_metric_name).lower() not in {"total_win_rate", "win_rate", "blue_alive_zero_rate"}:
         raise ValueError("best_metric_name must be one of: total_win_rate, win_rate, blue_alive_zero_rate")
     if float(args.maca_boundary_penalty_margin) <= 0.0:
@@ -202,6 +222,26 @@ def parse_args(argv=None):
         raise ValueError("maca_boundary_stuck_ramp_steps must be > 0")
     if int(args.maca_semantic_screen_downsample) <= 0:
         raise ValueError("maca_semantic_screen_downsample must be > 0")
+    if float(args.maca_search_reward_scale) < 0.0:
+        raise ValueError("maca_search_reward_scale must be >= 0")
+    if float(args.maca_reacquire_reward_scale) < 0.0:
+        raise ValueError("maca_reacquire_reward_scale must be >= 0")
+    if int(args.maca_priority_grid_h) < 2 or int(args.maca_priority_grid_w) < 2:
+        raise ValueError("maca_priority_grid_h and maca_priority_grid_w must be >= 2")
+    if int(args.maca_priority_top_k) <= 0:
+        raise ValueError("maca_priority_top_k must be > 0")
+    if int(args.maca_priority_unseen_cap_steps) <= 0:
+        raise ValueError("maca_priority_unseen_cap_steps must be > 0")
+    if not (0.0 <= float(args.maca_priority_memory_decay) <= 1.0):
+        raise ValueError("maca_priority_memory_decay must be in [0,1]")
+    if not (0.0 <= float(args.maca_priority_diffusion_rate) <= 1.0):
+        raise ValueError("maca_priority_diffusion_rate must be in [0,1]")
+    if float(args.maca_priority_passive_recv_weight) < 0.0:
+        raise ValueError("maca_priority_passive_recv_weight must be >= 0")
+    if float(args.maca_priority_known_enemy_boost) < 0.0:
+        raise ValueError("maca_priority_known_enemy_boost must be >= 0")
+    if not (0.0 <= float(args.maca_priority_unseen_threshold) <= 1.0):
+        raise ValueError("maca_priority_unseen_threshold must be in [0,1]")
     return args
 
 
@@ -396,6 +436,9 @@ def main(argv=None):
         global_state_dim = initial_obs["global_state"].shape[0]
         num_agents = initial_obs["local_obs"].shape[0]
         attack_dim = initial_obs["attack_masks"].shape[1]
+        priority_map_dim = initial_obs["priority_map_teacher"].shape[1]
+        priority_grid_shape = tuple(probe_env.priority_grid_shape)
+        priority_top_k = int(probe_env.priority_top_k)
     finally:
         probe_env.close()
 
@@ -407,6 +450,10 @@ def main(argv=None):
         "global_state_dim": int(global_state_dim),
         "num_agents": int(num_agents),
         "attack_dim": int(attack_dim),
+        "priority_map_dim": int(priority_map_dim),
+        "priority_grid_h": int(priority_grid_shape[0]),
+        "priority_grid_w": int(priority_grid_shape[1]),
+        "priority_top_k": int(priority_top_k),
         "actor_hidden_dim": int(args.hidden_size),
         "mode_interval": int(args.mode_interval),
     }
@@ -419,6 +466,9 @@ def main(argv=None):
         hidden_size=args.hidden_size,
         screen_embed_dim=args.screen_embed_dim,
         course_embed_dim=args.course_embed_dim,
+        priority_grid_h=int(priority_grid_shape[0]),
+        priority_grid_w=int(priority_grid_shape[1]),
+        priority_top_k=int(priority_top_k),
     )
     model = TeamActorCritic(model_cfg).to(device)
     teacher_model = None
@@ -442,13 +492,15 @@ def main(argv=None):
 
     save_config(args, local_obs_dim, global_state_dim, num_agents, collectors.worker_env_counts)
     print(
-        "[collector] num_workers=%d num_envs=%d worker_env_counts=%s base_obs_dim=%d local_screen_shape=%s curriculum_stage=%s attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%s"
+        "[collector] num_workers=%d num_envs=%d worker_env_counts=%s base_obs_dim=%d local_screen_shape=%s priority_grid=%s priority_top_k=%d curriculum_stage=%s attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%s"
         % (
             collectors.num_workers,
             collectors.num_envs,
             collectors.worker_env_counts,
             int(base_local_obs_dim),
             str(tuple(local_screen_shape)),
+            str(tuple(priority_grid_shape)),
+            int(priority_top_k),
             str(getattr(args, "runtime_curriculum_name", "full")),
             str(args.attack_rule_mode),
             str(args.attack_policy_mode),
@@ -641,7 +693,7 @@ def main(argv=None):
                     disable_high_level_mode=bool(args.disable_high_level_mode),
                 )
                 print(
-                    "[train] env_steps=%d update=%d stage=%s reward_mean=%.2f win_rate=%.3f total_win_rate=%.3f blue_alive_zero_rate=%.3f timeout_rate=%.3f boundary_penalty_mean=%.4f near_boundary_frac=%.3f fps=%.1f lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d policy=%.4f low=%.4f high=%.4f value_loss=%.4f v_team=%.4f v_aux=%.4f entropy=%.4f imitation=%.4f coef=%.4f ev=%.4f actor_gn=%.4f critic_gn=%.4f active=%.3f skipped_nf=%d repaired_nf=%d hidden_err=%.6f rnn_mismatch=%d grad_steps=%d"
+                    "[train] env_steps=%d update=%d stage=%s reward_mean=%.2f win_rate=%.3f total_win_rate=%.3f blue_alive_zero_rate=%.3f timeout_rate=%.3f boundary_penalty_mean=%.4f near_boundary_frac=%.3f fps=%.1f lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d policy=%.4f low=%.4f high=%.4f value_loss=%.4f v_team=%.4f v_aux=%.4f p_aux=%.4f entropy=%.4f imitation=%.4f coef=%.4f ev=%.4f actor_gn=%.4f critic_gn=%.4f active=%.3f skipped_nf=%d repaired_nf=%d hidden_err=%.6f rnn_mismatch=%d grad_steps=%d"
                     % (
                         env_steps,
                         update_idx,
@@ -664,6 +716,7 @@ def main(argv=None):
                         stats.get("value_loss", 0.0),
                         stats.get("value_team_loss", 0.0),
                         stats.get("value_aux_loss", 0.0),
+                        stats.get("priority_aux_loss", 0.0),
                         stats.get("entropy", 0.0),
                         stats.get("imitation_loss", 0.0),
                         stats.get("imitation_coef", 0.0),

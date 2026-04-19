@@ -19,6 +19,7 @@ def rollout(collectors, model, device, args, episode_stats, value_normalizer=Non
         "global_state",
         "attack_masks",
         "alive_mask",
+        "priority_map_teacher",
         "actor_h",
         "course_action",
         "attack_action",

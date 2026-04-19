@@ -114,6 +114,7 @@ def pack_recurrent_minibatch(
     global_state,
     attack_masks,
     alive_mask,
+    priority_map_teacher,
     actor_h,
     old_log_prob,
     mode_action,
@@ -140,6 +141,7 @@ def pack_recurrent_minibatch(
     screen_c = local_screen.shape[-1]
     global_dim = global_state.shape[-1]
     attack_dim = attack_masks.shape[-1]
+    priority_dim = priority_map_teacher.shape[-1]
 
     chunk_meta = []
     max_total_len = 0
@@ -156,6 +158,7 @@ def pack_recurrent_minibatch(
     local_screen_batch = local_screen.new_zeros((max_total_len, batch_size, screen_h, screen_w, screen_c))
     global_batch = global_state.new_zeros((max_total_len, batch_size, global_dim))
     attack_mask_batch = attack_masks.new_zeros((max_total_len, batch_size, attack_dim))
+    priority_teacher_batch = priority_map_teacher.new_zeros((max_total_len, batch_size, priority_dim))
     actor_h_batch = actor_h.new_zeros((max_total_len, batch_size, hidden_dim))
     course_batch = course_action.new_zeros((max_total_len, batch_size))
     attack_batch = attack_action.new_zeros((max_total_len, batch_size))
@@ -190,6 +193,7 @@ def pack_recurrent_minibatch(
         local_screen_batch[:total_len, batch_col] = local_screen[burn_start:end, env_idx, agent_idx]
         global_batch[:total_len, batch_col] = global_state[burn_start:end, env_idx]
         attack_mask_batch[:total_len, batch_col] = attack_masks[burn_start:end, env_idx, agent_idx]
+        priority_teacher_batch[:total_len, batch_col] = priority_map_teacher[burn_start:end, env_idx, agent_idx]
         actor_h_batch[:total_len, batch_col] = actor_h[burn_start:end, env_idx, agent_idx]
         course_batch[:total_len, batch_col] = course_action[burn_start:end, env_idx, agent_idx]
         attack_batch[:total_len, batch_col] = attack_action[burn_start:end, env_idx, agent_idx]
@@ -217,6 +221,7 @@ def pack_recurrent_minibatch(
         "local_screen": local_screen_batch,
         "global_state": global_batch,
         "attack_masks": attack_mask_batch,
+        "priority_map_teacher": priority_teacher_batch,
         "actor_h": actor_h_batch,
         "course_action": course_batch,
         "attack_action": attack_batch,
@@ -258,6 +263,7 @@ def ppo_update(
     global_state = torch.as_tensor(buffer["global_state"], dtype=torch.float32, device=device)
     attack_masks = torch.as_tensor(buffer["attack_masks"], dtype=torch.bool, device=device)
     alive_mask = torch.as_tensor(buffer["alive_mask"], dtype=torch.float32, device=device)
+    priority_map_teacher = torch.as_tensor(buffer["priority_map_teacher"], dtype=torch.float32, device=device)
     actor_h = torch.as_tensor(buffer["actor_h"], dtype=torch.float32, device=device)
     old_log_prob = torch.as_tensor(buffer["log_prob"], dtype=torch.float32, device=device)
     old_mode_log_prob = torch.as_tensor(buffer["mode_log_prob"], dtype=torch.float32, device=device)
@@ -345,12 +351,14 @@ def ppo_update(
     total_value_contact_loss = 0.0
     total_value_opportunity_loss = 0.0
     total_value_survival_loss = 0.0
+    total_priority_aux_loss = 0.0
 
     actor_params = [p for name, p in model.named_parameters() if not name.startswith("critic")]
     critic_params = [p for name, p in model.named_parameters() if name.startswith("critic")]
     attack_policy_mode = str(getattr(args, "attack_policy_mode", "full_discrete")).lower()
     disable_aux_value_heads = bool(getattr(args, "disable_aux_value_heads", False))
     aux_value_loss_coeff = float(max(getattr(args, "aux_value_loss_coeff", 0.25), 0.0))
+    priority_aux_loss_coeff = float(max(getattr(args, "priority_aux_loss_coeff", 0.05), 0.0))
     if disable_aux_value_heads:
         aux_value_loss_coeff = 0.0
 
@@ -373,6 +381,7 @@ def ppo_update(
                 global_state,
                 attack_masks,
                 alive_mask,
+                priority_map_teacher,
                 actor_h,
                 old_log_prob,
                 mode_action,
@@ -446,6 +455,7 @@ def ppo_update(
             high_entropies = []
             high_advantages = []
             imitation_losses = []
+            priority_aux_losses = []
 
             max_total_len = packed["local_obs"].shape[0]
             for seq_idx in range(max_total_len):
@@ -497,6 +507,18 @@ def ppo_update(
 
                 if course_logits.shape[0] <= 0:
                     continue
+
+                if priority_aux_loss_coeff > 0.0:
+                    seq_priority_teacher = packed["priority_map_teacher"][seq_idx, seq_valid][seq_train]
+                    seq_priority_logits = sanitize_logits(model.priority_logits(seq_screen[seq_train]))
+                    if torch.any(seq_active):
+                        active_priority_logits = seq_priority_logits[seq_active]
+                        active_priority_teacher = sanitize_tensor(seq_priority_teacher[seq_active])
+                        active_priority_teacher = torch.clamp(active_priority_teacher, min=0.0)
+                        teacher_sum = torch.clamp(active_priority_teacher.sum(dim=-1, keepdim=True), min=1e-6)
+                        active_priority_teacher = active_priority_teacher / teacher_sum
+                        log_prob = torch.log_softmax(active_priority_logits, dim=-1)
+                        priority_aux_losses.append(-(active_priority_teacher * log_prob).sum(dim=-1))
 
                 course_dist = Categorical(logits=course_logits)
                 if attack_policy_mode == "fire_or_not":
@@ -607,7 +629,18 @@ def ppo_update(
             else:
                 imitation_loss = value_loss * 0.0
 
-            loss = policy_loss + value_loss + entropy_loss + imitation_coef * imitation_loss
+            if priority_aux_losses:
+                priority_aux_loss = sanitize_tensor(torch.cat(priority_aux_losses, dim=0)).mean()
+            else:
+                priority_aux_loss = value_loss * 0.0
+
+            loss = (
+                policy_loss
+                + value_loss
+                + entropy_loss
+                + imitation_coef * imitation_loss
+                + priority_aux_loss_coeff * priority_aux_loss
+            )
             if not torch.isfinite(loss):
                 total_skipped_non_finite += 1
                 optimizer.zero_grad()
@@ -647,6 +680,7 @@ def ppo_update(
             total_entropy_low += entropy_mean_low
             total_entropy_high += entropy_mean_high
             total_imitation += float(imitation_loss.item())
+            total_priority_aux_loss += float(priority_aux_loss.item())
             total_minibatches += 1
             total_grad_steps += 1
             total_actor_grad_norm += actor_grad_norm
@@ -681,6 +715,8 @@ def ppo_update(
             "value_opportunity_loss": 0.0,
             "value_survival_loss": 0.0,
             "value_aux_loss": 0.0,
+            "priority_aux_loss": 0.0,
+            "priority_aux_loss_coeff": float(priority_aux_loss_coeff),
             "aux_value_loss_coeff": float(aux_value_loss_coeff),
             "disable_aux_value_heads": 1.0 if disable_aux_value_heads else 0.0,
         }
@@ -722,6 +758,8 @@ def ppo_update(
         "value_survival_loss": total_value_survival_loss / float(total_minibatches),
         "value_aux_loss": (total_value_contact_loss + total_value_opportunity_loss + total_value_survival_loss)
         / float(total_minibatches),
+        "priority_aux_loss": total_priority_aux_loss / float(total_minibatches),
+        "priority_aux_loss_coeff": float(priority_aux_loss_coeff),
         "aux_value_loss_coeff": float(aux_value_loss_coeff),
         "disable_aux_value_heads": 1.0 if disable_aux_value_heads else 0.0,
     }

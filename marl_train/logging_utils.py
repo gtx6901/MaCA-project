@@ -110,6 +110,8 @@ def log_train_scalars(
     writer.add_scalar("train/value_opportunity_loss", float(stats.get("value_opportunity_loss", 0.0)), env_steps)
     writer.add_scalar("train/value_survival_loss", float(stats.get("value_survival_loss", 0.0)), env_steps)
     writer.add_scalar("train/value_aux_loss", float(stats.get("value_aux_loss", 0.0)), env_steps)
+    writer.add_scalar("train/priority_aux_loss", float(stats.get("priority_aux_loss", 0.0)), env_steps)
+    writer.add_scalar("train/priority_aux_loss_coeff", float(stats.get("priority_aux_loss_coeff", 0.0)), env_steps)
     writer.add_scalar("train/aux_value_loss_coeff", float(stats.get("aux_value_loss_coeff", 0.0)), env_steps)
     writer.add_scalar("train/disable_aux_value_heads", float(stats.get("disable_aux_value_heads", 0.0)), env_steps)
     writer.add_scalar("train/value_norm_mean", float(stats.get("value_norm_mean", 0.0)), env_steps)

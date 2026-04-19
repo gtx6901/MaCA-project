@@ -20,6 +20,7 @@ ROLLOUT_BUFFER_DTYPES = {
     "global_state": np.float32,
     "attack_masks": np.uint8,
     "alive_mask": np.float32,
+    "priority_map_teacher": np.float32,
     "actor_h": np.float32,
     "course_action": np.int64,
     "attack_action": np.int64,
@@ -219,6 +220,23 @@ def build_env(args, seed_offset: int) -> MAPPOMaCAEnv:
             boundary_stuck_penalty_enabled=args.maca_boundary_stuck_penalty_enabled,
             boundary_stuck_trigger_steps=args.maca_boundary_stuck_trigger_steps,
             boundary_stuck_ramp_steps=args.maca_boundary_stuck_ramp_steps,
+            search_reward_scale=args.maca_search_reward_scale,
+            reacquire_reward_scale=args.maca_reacquire_reward_scale,
+            priority_grid_h=args.maca_priority_grid_h,
+            priority_grid_w=args.maca_priority_grid_w,
+            priority_top_k=args.maca_priority_top_k,
+            priority_evidence_weight=args.maca_priority_evidence_weight,
+            priority_uncertainty_weight=args.maca_priority_uncertainty_weight,
+            priority_diffusion_weight=args.maca_priority_diffusion_weight,
+            priority_crowding_penalty=args.maca_priority_crowding_penalty,
+            priority_assignment_penalty=args.maca_priority_assignment_penalty,
+            priority_distance_penalty=args.maca_priority_distance_penalty,
+            priority_unseen_cap_steps=args.maca_priority_unseen_cap_steps,
+            priority_memory_decay=args.maca_priority_memory_decay,
+            priority_diffusion_rate=args.maca_priority_diffusion_rate,
+            priority_passive_recv_weight=args.maca_priority_passive_recv_weight,
+            priority_known_enemy_boost=args.maca_priority_known_enemy_boost,
+            priority_unseen_threshold=args.maca_priority_unseen_threshold,
             semantic_screen_downsample=args.maca_semantic_screen_downsample,
             terminal_ammo_fail_penalty=args.maca_terminal_ammo_fail_penalty,
             terminal_participation_penalty=args.maca_terminal_participation_penalty,
@@ -434,6 +452,7 @@ def build_worker_buffer_shapes(rollout_steps: int, env_count: int, env_spec: dic
     local_screen_c = int(env_spec["local_screen_shape"][2])
     global_state_dim = int(env_spec["global_state_dim"])
     attack_dim = int(env_spec["attack_dim"])
+    priority_map_dim = int(env_spec["priority_map_dim"])
     actor_hidden_dim = int(env_spec["actor_hidden_dim"])
     return {
         "local_obs": (rollout_steps, env_count, num_agents, local_obs_dim),
@@ -441,6 +460,7 @@ def build_worker_buffer_shapes(rollout_steps: int, env_count: int, env_spec: dic
         "global_state": (rollout_steps, env_count, global_state_dim),
         "attack_masks": (rollout_steps, env_count, num_agents, attack_dim),
         "alive_mask": (rollout_steps, env_count, num_agents),
+        "priority_map_teacher": (rollout_steps, env_count, num_agents, priority_map_dim),
         "actor_h": (rollout_steps, env_count, num_agents, actor_hidden_dim),
         "course_action": (rollout_steps, env_count, num_agents),
         "attack_action": (rollout_steps, env_count, num_agents),
@@ -528,6 +548,9 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                             hidden_size=args.hidden_size,
                             screen_embed_dim=args.screen_embed_dim,
                             course_embed_dim=args.course_embed_dim,
+                            priority_grid_h=int(env_spec.get("priority_grid_h", 4)),
+                            priority_grid_w=int(env_spec.get("priority_grid_w", 4)),
+                            priority_top_k=int(env_spec.get("priority_top_k", 2)),
                         )
                     )
                     worker_model.eval()
@@ -542,6 +565,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                 disable_high_level_mode = bool(getattr(args, "disable_high_level_mode", False))
                 mode_interval = int(env_spec.get("mode_interval", 8))
                 attack_dim = int(env_spec["attack_dim"])
+                priority_map_dim = int(env_spec["priority_map_dim"])
                 final_local_obs_dim = int(env_spec["local_obs_dim"])
                 local_screen_shape = tuple(env_spec["local_screen_shape"])
                 global_state_dim = int(obs_batch[0]["global_state"].shape[0])
@@ -552,6 +576,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                 global_state_batch = np.empty((env_count, global_state_dim), dtype=np.float32)
                 attack_masks_batch = np.empty((env_count, num_agents, attack_dim), dtype=np.bool_)
                 alive_mask_batch = np.empty((env_count, num_agents), dtype=np.float32)
+                priority_map_teacher_batch = np.empty((env_count, num_agents, priority_map_dim), dtype=np.float32)
                 rule_visible_target_ids_batch = np.zeros((env_count, num_agents, visible_target_slots), dtype=np.int64)
                 env_actions_batch = np.empty((env_count, num_agents, 2), dtype=np.int64)
 
@@ -592,6 +617,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                         global_state_batch[env_idx] = obs["global_state"]
                         attack_masks_batch[env_idx] = obs["attack_masks"]
                         alive_mask_batch[env_idx] = obs["alive_mask"]
+                        priority_map_teacher_batch[env_idx] = obs["priority_map_teacher"]
                         if visible_target_slots > 0:
                             rule_visible_target_ids_batch[env_idx] = obs.get(
                                 "rule_visible_target_ids",
@@ -684,6 +710,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                     shared_views["global_state"][step_idx] = global_state_batch
                     shared_views["attack_masks"][step_idx] = attack_masks_batch.astype(np.uint8, copy=False)
                     shared_views["alive_mask"][step_idx] = alive_mask_batch
+                    shared_views["priority_map_teacher"][step_idx] = priority_map_teacher_batch
                     shared_views["actor_h"][step_idx] = actor_h_batch
                     shared_views["course_action"][step_idx] = course_action_np
                     shared_views["attack_action"][step_idx] = attack_action_np

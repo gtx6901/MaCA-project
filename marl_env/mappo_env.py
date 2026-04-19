@@ -61,8 +61,22 @@ class MAPPOMaCAConfig:
     boundary_stuck_trigger_steps: int = 24
     boundary_stuck_ramp_steps: int = 20
     search_reward_scale: float = 0.015
-    search_enemy_half_x_ratio: float = 0.62
     reacquire_reward_scale: float = 0.02
+    priority_grid_h: int = 4
+    priority_grid_w: int = 4
+    priority_top_k: int = 2
+    priority_evidence_weight: float = 1.0
+    priority_uncertainty_weight: float = 0.9
+    priority_diffusion_weight: float = 0.7
+    priority_crowding_penalty: float = 0.45
+    priority_assignment_penalty: float = 0.35
+    priority_distance_penalty: float = 0.25
+    priority_unseen_cap_steps: int = 40
+    priority_memory_decay: float = 0.92
+    priority_diffusion_rate: float = 0.25
+    priority_passive_recv_weight: float = 0.25
+    priority_known_enemy_boost: float = 0.8
+    priority_unseen_threshold: float = 0.7
     semantic_screen_downsample: int = 4
     terminal_ammo_fail_penalty: float = 80.0
     terminal_participation_penalty: float = 40.0
@@ -102,6 +116,11 @@ class MAPPOMaCAEnv:
             int((int(raw_screen_w) + self._screen_downsample - 1) // self._screen_downsample),
             int(raw_screen_c),
         )
+        self._priority_grid_h = max(2, int(self.config.priority_grid_h))
+        self._priority_grid_w = max(2, int(self.config.priority_grid_w))
+        self._priority_grid_size = int(self._priority_grid_h * self._priority_grid_w)
+        self._priority_top_k = max(1, min(int(self.config.priority_top_k), self._priority_grid_size))
+        self._priority_cell_centers = self._build_priority_cell_centers()
         self._local_obs_dim = 16 + self.max_visible_enemies * 8
         self._global_state_dim = None
         self._reset_stats()
@@ -113,6 +132,18 @@ class MAPPOMaCAEnv:
     @property
     def local_screen_shape(self) -> Tuple[int, int, int]:
         return tuple(self._local_screen_shape)
+
+    @property
+    def priority_map_dim(self) -> int:
+        return int(self._priority_grid_size)
+
+    @property
+    def priority_grid_shape(self) -> Tuple[int, int]:
+        return int(self._priority_grid_h), int(self._priority_grid_w)
+
+    @property
+    def priority_top_k(self) -> int:
+        return int(self._priority_top_k)
 
     @property
     def global_state_dim(self) -> int:
@@ -128,12 +159,19 @@ class MAPPOMaCAEnv:
         self.red_fighter_num = int(self.base_env.red_fighter_num)
         self.blue_fighter_num = int(self.base_env.blue_fighter_num)
         self._reset_stats()
+        red_raw_obs, blue_raw_obs = self.base_env.get_raw_snapshot()
+        if red_raw_obs is not None and blue_raw_obs is not None:
+            blue_alive_count = sum(1 for fighter in blue_raw_obs["fighter_obs_list"] if fighter["alive"])
+            self._build_team_priority_context(
+                fighter_obs_list=red_raw_obs["fighter_obs_list"],
+                blue_alive_count=int(blue_alive_count),
+                update_episode_metrics=False,
+            )
         structured = self._build_step_output(obs_dict, infos)
         self._global_state_dim = structured["global_state"].shape[0]
         self._last_course_actions = np.full(self.num_agents, -1, dtype=np.int32)
         self._last_red_destroyed_count = int(infos[self.base_env.agents[0]].get("red_fighter_destroyed_count", 0))
         self._last_blue_destroyed_count = int(infos[self.base_env.agents[0]].get("blue_fighter_destroyed_count", 0))
-        red_raw_obs, _blue_raw_obs = self.base_env.get_raw_snapshot()
         if red_raw_obs is not None:
             self._initial_team_missile_total = max(
                 1.0,
@@ -219,7 +257,7 @@ class MAPPOMaCAEnv:
         agent_post_contact_no_contact = np.zeros((self.num_agents,), dtype=np.float32)
         agent_post_contact_alive = np.zeros((self.num_agents,), dtype=np.float32)
         if red_raw_obs_next is not None:
-            team_context = self._build_team_contact_context(
+            team_context = self._build_team_priority_context(
                 fighter_obs_list=red_raw_obs_next["fighter_obs_list"],
                 blue_alive_count=blue_alive_count,
             )
@@ -392,6 +430,26 @@ class MAPPOMaCAEnv:
         self._agent_attack_opportunity_counts = np.zeros((self.num_agents,), dtype=np.float32)
         self._agent_destroy_contribution = np.zeros((self.num_agents,), dtype=np.float32)
         self._episode_boundary_penalty_return = np.zeros((self.num_agents,), dtype=np.float32)
+        self._priority_unseen_steps = np.zeros((self._priority_grid_size,), dtype=np.float32)
+        self._priority_enemy_memory = np.zeros((self._priority_grid_size,), dtype=np.float32)
+        self._priority_teacher_map = np.full(
+            (self._priority_grid_size,),
+            1.0 / float(max(self._priority_grid_size, 1)),
+            dtype=np.float32,
+        )
+        self._priority_uncertainty_map = np.zeros((self._priority_grid_size,), dtype=np.float32)
+        self._agent_search_region_assignment = np.full((self.num_agents,), -1, dtype=np.int32)
+        self._priority_entropy_sum = 0.0
+        self._top1_priority_sum = 0.0
+        self._priority_metric_steps = 0
+        self._topk_coverage_sum = 0.0
+        self._topk_coverage_steps = 0
+        self._search_region_switch_total = 0.0
+        self._search_region_step_total = 0.0
+        self._unseen_area_priority_sum = 0.0
+        self._unseen_area_priority_steps = 0
+        self._assignment_concentration_sum = 0.0
+        self._assignment_concentration_steps = 0
         self._episode_contact_seen = False
         self._team_known_enemy_pos = np.zeros((2,), dtype=np.float32)
         self._team_known_enemy_age = self._track_memory_steps + 1
@@ -427,6 +485,9 @@ class MAPPOMaCAEnv:
         attack_masks = np.zeros((self.num_agents, ATTACK_IND_NUM), dtype=np.bool_)
         alive_mask = np.zeros((self.num_agents,), dtype=np.float32)
         rule_visible_target_ids = np.zeros((self.num_agents, self.max_visible_enemies), dtype=np.int64)
+        priority_map_teacher = np.repeat(self._priority_teacher_map[None, :], self.num_agents, axis=0).astype(
+            np.float32, copy=False
+        )
 
         for idx, fighter_raw_obs in enumerate(fighter_obs_list):
             agent_id = self.base_env.agents[idx]
@@ -476,6 +537,7 @@ class MAPPOMaCAEnv:
             "global_state": global_state,
             "attack_masks": attack_masks,
             "alive_mask": alive_mask,
+            "priority_map_teacher": priority_map_teacher,
             "agent_ids": agent_ids,
             "rule_visible_target_ids": rule_visible_target_ids,
         }
@@ -484,6 +546,249 @@ class MAPPOMaCAEnv:
         if self._screen_downsample <= 1:
             return screen.astype(np.uint8, copy=False)
         return screen[:: self._screen_downsample, :: self._screen_downsample, :].astype(np.uint8, copy=False)
+
+    def _build_priority_cell_centers(self) -> np.ndarray:
+        centers = np.zeros((self._priority_grid_size, 2), dtype=np.float32)
+        cursor = 0
+        for gy in range(self._priority_grid_h):
+            for gx in range(self._priority_grid_w):
+                centers[cursor, 0] = float(gx + 0.5) / float(max(self._priority_grid_w, 1))
+                centers[cursor, 1] = float(gy + 0.5) / float(max(self._priority_grid_h, 1))
+                cursor += 1
+        return centers
+
+    def _grid_index_from_pos(self, pos_x: float, pos_y: float) -> int:
+        x_norm = float(np.clip(pos_x / float(max(self._size_x, 1.0)), 0.0, 0.999999))
+        y_norm = float(np.clip(pos_y / float(max(self._size_y, 1.0)), 0.0, 0.999999))
+        gx = int(min(max(int(x_norm * self._priority_grid_w), 0), self._priority_grid_w - 1))
+        gy = int(min(max(int(y_norm * self._priority_grid_h), 0), self._priority_grid_h - 1))
+        return int(gy * self._priority_grid_w + gx)
+
+    def _diffuse_priority_grid(self, values: np.ndarray) -> np.ndarray:
+        grid = values.reshape(self._priority_grid_h, self._priority_grid_w)
+        padded = np.pad(grid, ((1, 1), (1, 1)), mode="edge")
+        center = padded[1:-1, 1:-1]
+        up = padded[0:-2, 1:-1]
+        down = padded[2:, 1:-1]
+        left = padded[1:-1, 0:-2]
+        right = padded[1:-1, 2:]
+        smooth = (center + up + down + left + right) / 5.0
+        return smooth.reshape(-1)
+
+    @staticmethod
+    def _normalize_priority_map(values: np.ndarray) -> np.ndarray:
+        clipped = np.clip(values, 0.0, None)
+        total = float(np.sum(clipped))
+        if total <= 1e-8:
+            return np.full_like(clipped, 1.0 / float(max(clipped.size, 1)), dtype=np.float32)
+        return (clipped / total).astype(np.float32, copy=False)
+
+    def _topk_indices(self, scores: np.ndarray, k: int) -> np.ndarray:
+        k = max(1, min(int(k), int(scores.size)))
+        unsorted_idx = np.argpartition(scores, -k)[-k:]
+        order = np.argsort(scores[unsorted_idx])[::-1]
+        return unsorted_idx[order].astype(np.int32, copy=False)
+
+    def _build_team_priority_context(
+        self,
+        fighter_obs_list: List[Dict[str, object]],
+        blue_alive_count: int,
+        update_episode_metrics: bool = True,
+    ) -> Dict[str, object]:
+        self._priority_unseen_steps += 1.0
+
+        direct_evidence = np.zeros((self._priority_grid_size,), dtype=np.float32)
+        passive_evidence = np.zeros((self._priority_grid_size,), dtype=np.float32)
+        friendly_density = np.zeros((self._priority_grid_size,), dtype=np.float32)
+        observed_enemy_positions: List[Tuple[float, float]] = []
+        any_contact_now = False
+
+        agent_alive = np.zeros((self.num_agents,), dtype=np.bool_)
+        agent_no_contact = np.zeros((self.num_agents,), dtype=np.bool_)
+        agent_pos_norm = np.zeros((self.num_agents, 2), dtype=np.float32)
+
+        diag_len = float(np.hypot(self._size_x, self._size_y))
+        passive_probe_len = 0.28 * diag_len
+        passive_weight = float(max(float(self.config.priority_passive_recv_weight), 0.0))
+
+        for idx, fighter in enumerate(fighter_obs_list):
+            if not bool(fighter.get("alive", False)):
+                continue
+
+            own_x = float(np.clip(float(fighter.get("pos_x", 0.0)), 0.0, float(max(self._size_x, 1.0))))
+            own_y = float(np.clip(float(fighter.get("pos_y", 0.0)), 0.0, float(max(self._size_y, 1.0))))
+            own_cell = self._grid_index_from_pos(own_x, own_y)
+            self._priority_unseen_steps[own_cell] = 0.0
+            friendly_density[own_cell] += 1.0
+
+            agent_alive[idx] = True
+            agent_pos_norm[idx, 0] = own_x / float(max(self._size_x, 1.0))
+            agent_pos_norm[idx, 1] = own_y / float(max(self._size_y, 1.0))
+
+            visible_targets = list(fighter.get("r_visible_list", []))
+            if visible_targets:
+                any_contact_now = True
+            else:
+                agent_no_contact[idx] = True
+
+            for target in visible_targets:
+                tx = float(np.clip(float(target.get("pos_x", own_x)), 0.0, float(max(self._size_x, 1.0))))
+                ty = float(np.clip(float(target.get("pos_y", own_y)), 0.0, float(max(self._size_y, 1.0))))
+                observed_enemy_positions.append((tx, ty))
+                t_cell = self._grid_index_from_pos(tx, ty)
+                direct_evidence[t_cell] += 1.0
+
+            for recv in list(fighter.get("j_recv_list", [])):
+                recv_deg = float(recv.get("direction", 0.0))
+                recv_rad = recv_deg * (np.pi / 180.0)
+                tx = float(np.clip(own_x + passive_probe_len * np.cos(recv_rad), 0.0, float(max(self._size_x, 1.0))))
+                ty = float(np.clip(own_y + passive_probe_len * np.sin(recv_rad), 0.0, float(max(self._size_y, 1.0))))
+                t_cell = self._grid_index_from_pos(tx, ty)
+                passive_evidence[t_cell] += 1.0
+
+        if any_contact_now:
+            self._episode_contact_seen = True
+
+        if observed_enemy_positions:
+            observed_arr = np.asarray(observed_enemy_positions, dtype=np.float32)
+            mean_target = np.mean(observed_arr, axis=0)
+            self._team_known_enemy_pos[0] = float(np.clip(mean_target[0], 0.0, float(max(self._size_x, 1.0))))
+            self._team_known_enemy_pos[1] = float(np.clip(mean_target[1], 0.0, float(max(self._size_y, 1.0))))
+            self._team_known_enemy_age = 0
+        else:
+            self._team_known_enemy_age = min(self._team_known_enemy_age + 1, self._track_memory_steps + 1)
+
+        evidence_raw = direct_evidence + passive_weight * passive_evidence
+        evidence_norm = np.zeros_like(evidence_raw)
+        evidence_max = float(np.max(evidence_raw))
+        if evidence_max > 1e-6:
+            evidence_norm = evidence_raw / evidence_max
+
+        memory_decay = float(np.clip(float(self.config.priority_memory_decay), 0.0, 0.999))
+        self._priority_enemy_memory *= memory_decay
+        self._priority_enemy_memory = np.maximum(self._priority_enemy_memory, evidence_norm)
+        diffusion_rate = float(np.clip(float(self.config.priority_diffusion_rate), 0.0, 1.0))
+        if diffusion_rate > 0.0:
+            diffuse_map = self._diffuse_priority_grid(self._priority_enemy_memory)
+            self._priority_enemy_memory = (
+                (1.0 - diffusion_rate) * self._priority_enemy_memory + diffusion_rate * diffuse_map
+            )
+        self._priority_enemy_memory = np.clip(self._priority_enemy_memory, 0.0, 1.0)
+
+        has_team_known_enemy = bool(self._team_known_enemy_age <= self._track_memory_steps)
+        if has_team_known_enemy:
+            known_cell = self._grid_index_from_pos(self._team_known_enemy_pos[0], self._team_known_enemy_pos[1])
+            known_boost = np.zeros((self._priority_grid_size,), dtype=np.float32)
+            known_boost[known_cell] = 1.0
+            known_boost = self._diffuse_priority_grid(known_boost)
+            known_boost = self._diffuse_priority_grid(known_boost)
+        else:
+            known_boost = np.zeros((self._priority_grid_size,), dtype=np.float32)
+
+        unseen_cap = float(max(int(self.config.priority_unseen_cap_steps), 1))
+        uncertainty_map = np.clip(self._priority_unseen_steps / unseen_cap, 0.0, 1.0)
+
+        alive_count = float(max(int(np.sum(agent_alive)), 1))
+        friendly_density = friendly_density / alive_count
+
+        previous_assignment_density = np.zeros((self._priority_grid_size,), dtype=np.float32)
+        for region_idx in self._agent_search_region_assignment:
+            if region_idx >= 0:
+                previous_assignment_density[int(region_idx)] += 1.0
+        previous_assignment_density /= alive_count
+
+        crowding_map = friendly_density + previous_assignment_density
+
+        priority_raw = (
+            float(max(float(self.config.priority_evidence_weight), 0.0)) * evidence_norm
+            + float(max(float(self.config.priority_uncertainty_weight), 0.0)) * uncertainty_map
+            + float(max(float(self.config.priority_diffusion_weight), 0.0)) * self._priority_enemy_memory
+            + float(max(float(self.config.priority_known_enemy_boost), 0.0)) * known_boost
+            - float(max(float(self.config.priority_crowding_penalty), 0.0)) * crowding_map
+        )
+        priority_map = self._normalize_priority_map(priority_raw)
+
+        self._priority_teacher_map = priority_map.astype(np.float32, copy=False)
+        self._priority_uncertainty_map = uncertainty_map.astype(np.float32, copy=False)
+
+        assigned_region_idx = np.full((self.num_agents,), -1, dtype=np.int32)
+        assigned_priority = np.zeros((self.num_agents,), dtype=np.float32)
+        assigned_target_xy = np.zeros((self.num_agents, 2), dtype=np.float32)
+        assigned_counts = np.zeros((self._priority_grid_size,), dtype=np.float32)
+
+        assign_penalty = float(max(float(self.config.priority_assignment_penalty), 0.0))
+        dist_penalty = float(max(float(self.config.priority_distance_penalty), 0.0))
+        no_contact_indices = np.flatnonzero(agent_alive & agent_no_contact)
+
+        for agent_idx in no_contact_indices.tolist():
+            dist_to_cells = np.linalg.norm(self._priority_cell_centers - agent_pos_norm[agent_idx], axis=1)
+            score = priority_map - assign_penalty * assigned_counts - dist_penalty * dist_to_cells
+            best_idx = int(np.argmax(score))
+            assigned_region_idx[agent_idx] = best_idx
+            assigned_counts[best_idx] += 1.0
+            assigned_priority[agent_idx] = float(priority_map[best_idx])
+            assigned_target_xy[agent_idx, 0] = float(self._priority_cell_centers[best_idx, 0] * float(self._size_x))
+            assigned_target_xy[agent_idx, 1] = float(self._priority_cell_centers[best_idx, 1] * float(self._size_y))
+
+        switch_steps = 0
+        switch_count = 0
+        for agent_idx in no_contact_indices.tolist():
+            prev_idx = int(self._agent_search_region_assignment[agent_idx])
+            curr_idx = int(assigned_region_idx[agent_idx])
+            if prev_idx >= 0 and curr_idx >= 0:
+                switch_steps += 1
+                if prev_idx != curr_idx:
+                    switch_count += 1
+            self._agent_search_region_assignment[agent_idx] = curr_idx
+        for agent_idx in np.flatnonzero(~(agent_alive & agent_no_contact)).tolist():
+            self._agent_search_region_assignment[agent_idx] = -1
+
+        topk_idx = self._topk_indices(priority_map, self._priority_top_k)
+        top1_priority = float(priority_map[int(topk_idx[0])]) if topk_idx.size > 0 else 0.0
+        entropy = float(-np.sum(priority_map * np.log(np.clip(priority_map, 1e-8, 1.0))))
+        entropy_norm = entropy / float(np.log(float(max(self._priority_grid_size, 2))))
+
+        if update_episode_metrics:
+            self._priority_entropy_sum += float(entropy_norm)
+            self._top1_priority_sum += float(top1_priority)
+            self._priority_metric_steps += 1
+
+        if update_episode_metrics and no_contact_indices.size > 0:
+            assigned_valid = assigned_region_idx[no_contact_indices]
+            assigned_valid = assigned_valid[assigned_valid >= 0]
+            if assigned_valid.size > 0:
+                covered_topk = np.intersect1d(np.unique(assigned_valid), topk_idx, assume_unique=False)
+                topk_coverage = float(covered_topk.size) / float(max(self._priority_top_k, 1))
+                self._topk_coverage_sum += topk_coverage
+                self._topk_coverage_steps += 1
+
+                cell_counts = np.bincount(assigned_valid, minlength=self._priority_grid_size)
+                concentration = float(np.max(cell_counts)) / float(max(assigned_valid.size, 1))
+                self._assignment_concentration_sum += concentration
+                self._assignment_concentration_steps += 1
+
+        if update_episode_metrics and switch_steps > 0:
+            self._search_region_switch_total += float(switch_count)
+            self._search_region_step_total += float(switch_steps)
+
+        unseen_threshold = float(np.clip(float(self.config.priority_unseen_threshold), 0.0, 1.0))
+        unseen_mask = uncertainty_map >= unseen_threshold
+        if update_episode_metrics and np.any(unseen_mask):
+            self._unseen_area_priority_sum += float(np.mean(priority_map[unseen_mask]))
+            self._unseen_area_priority_steps += 1
+
+        team_context: Dict[str, object] = {
+            "post_contact_phase": bool(self._episode_contact_seen and blue_alive_count > 0),
+            "blue_alive_count": float(max(blue_alive_count, 0)),
+            "has_team_known_enemy": has_team_known_enemy,
+            "team_known_enemy_x": float(self._team_known_enemy_pos[0]),
+            "team_known_enemy_y": float(self._team_known_enemy_pos[1]),
+            "assigned_region_idx": assigned_region_idx,
+            "assigned_priority": assigned_priority,
+            "assigned_target_x": assigned_target_xy[:, 0],
+            "assigned_target_y": assigned_target_xy[:, 1],
+        }
+        return team_context
 
     def _build_local_obs(
         self,
@@ -592,52 +897,10 @@ class MAPPOMaCAEnv:
         return 0.0, 0.0, prev_heading_diff, last_seen_age
 
     def _build_team_contact_context(self, fighter_obs_list: List[Dict[str, object]], blue_alive_count: int) -> Dict[str, object]:
-        alive_positions: List[Tuple[float, float]] = []
-        observed_enemy_positions: List[Tuple[float, float]] = []
-        any_contact_now = False
-
-        for fighter in fighter_obs_list:
-            if not bool(fighter.get("alive", False)):
-                continue
-            own_x = float(np.clip(float(fighter.get("pos_x", 0.0)), 0.0, float(max(self._size_x, 1.0))))
-            own_y = float(np.clip(float(fighter.get("pos_y", 0.0)), 0.0, float(max(self._size_y, 1.0))))
-            alive_positions.append((own_x, own_y))
-
-            visible_targets = list(fighter.get("r_visible_list", []))
-            if visible_targets:
-                any_contact_now = True
-            for target in visible_targets:
-                tx = float(np.clip(float(target.get("pos_x", own_x)), 0.0, float(max(self._size_x, 1.0))))
-                ty = float(np.clip(float(target.get("pos_y", own_y)), 0.0, float(max(self._size_y, 1.0))))
-                observed_enemy_positions.append((tx, ty))
-
-        if any_contact_now:
-            self._episode_contact_seen = True
-
-        if observed_enemy_positions:
-            observed_arr = np.asarray(observed_enemy_positions, dtype=np.float32)
-            mean_target = np.mean(observed_arr, axis=0)
-            self._team_known_enemy_pos[0] = float(np.clip(mean_target[0], 0.0, float(max(self._size_x, 1.0))))
-            self._team_known_enemy_pos[1] = float(np.clip(mean_target[1], 0.0, float(max(self._size_y, 1.0))))
-            self._team_known_enemy_age = 0
-        else:
-            self._team_known_enemy_age = min(self._team_known_enemy_age + 1, self._track_memory_steps + 1)
-
-        if alive_positions:
-            alive_arr = np.asarray(alive_positions, dtype=np.float32)
-            team_center_y = float(np.mean(alive_arr[:, 1]))
-        else:
-            team_center_y = float(self._size_y) * 0.5
-
-        return {
-            "post_contact_phase": bool(self._episode_contact_seen and blue_alive_count > 0),
-            "blue_alive_count": float(max(blue_alive_count, 0)),
-            "has_team_known_enemy": bool(self._team_known_enemy_age <= self._track_memory_steps),
-            "team_known_enemy_x": float(self._team_known_enemy_pos[0]),
-            "team_known_enemy_y": float(self._team_known_enemy_pos[1]),
-            "team_center_y": float(team_center_y),
-            "search_target_x": float(np.clip(float(self.config.search_enemy_half_x_ratio), 0.4, 0.9)) * float(self._size_x),
-        }
+        return self._build_team_priority_context(
+            fighter_obs_list=fighter_obs_list,
+            blue_alive_count=blue_alive_count,
+        )
 
     def _extract_agent_state(self, fighter_raw_obs: Dict[str, object]) -> Dict[str, float]:
         alive = bool(fighter_raw_obs.get("alive", False))
@@ -788,12 +1051,29 @@ class MAPPOMaCAEnv:
             team_context = {
                 "post_contact_phase": False,
                 "blue_alive_count": 0.0,
-                "has_team_known_enemy": False,
-                "team_known_enemy_x": float(next_state.get("pos_x", 0.0)),
-                "team_known_enemy_y": float(next_state.get("pos_y", 0.0)),
-                "team_center_y": float(next_state.get("pos_y", 0.0)),
-                "search_target_x": float(np.clip(float(self.config.search_enemy_half_x_ratio), 0.4, 0.9)) * float(self._size_x),
+                "assigned_priority": np.zeros((self.num_agents,), dtype=np.float32),
+                "assigned_target_x": np.full((self.num_agents,), float(next_state.get("pos_x", 0.0)), dtype=np.float32),
+                "assigned_target_y": np.full((self.num_agents,), float(next_state.get("pos_y", 0.0)), dtype=np.float32),
             }
+
+        assigned_priority = np.asarray(
+            team_context.get("assigned_priority", np.zeros((self.num_agents,), dtype=np.float32)),
+            dtype=np.float32,
+        )
+        assigned_target_x = np.asarray(
+            team_context.get(
+                "assigned_target_x",
+                np.full((self.num_agents,), float(next_state.get("pos_x", 0.0)), dtype=np.float32),
+            ),
+            dtype=np.float32,
+        )
+        assigned_target_y = np.asarray(
+            team_context.get(
+                "assigned_target_y",
+                np.full((self.num_agents,), float(next_state.get("pos_y", 0.0)), dtype=np.float32),
+            ),
+            dtype=np.float32,
+        )
 
         if is_alive and no_contact:
             search_scale = float(max(float(self.config.search_reward_scale), 0.0))
@@ -804,33 +1084,23 @@ class MAPPOMaCAEnv:
             next_y = float(next_state.get("pos_y", 0.0))
 
             post_contact_phase = bool(team_context.get("post_contact_phase", False))
-            has_team_known_enemy = bool(team_context.get("has_team_known_enemy", False))
             if post_contact_phase:
                 post_contact_no_contact = 1.0
                 post_contact_alive = 1.0
 
-            if post_contact_phase and has_team_known_enemy and float(team_context.get("blue_alive_count", 0.0)) > 0.0:
-                target_x = float(team_context.get("team_known_enemy_x", next_x))
-                target_y = float(team_context.get("team_known_enemy_y", next_y))
-                prev_dist = float(np.hypot(prev_x - target_x, prev_y - target_y))
-                next_dist = float(np.hypot(next_x - target_x, next_y - target_y))
-                dist_norm = max(float(np.hypot(self._size_x, self._size_y)) * 0.5, 1.0)
-                reacquire_reward = reacquire_scale * float(np.clip((prev_dist - next_dist) / dist_norm, -1.0, 1.0))
-            else:
-                target_x = float(team_context.get("search_target_x", float(self._size_x) * 0.62))
-                size_x = float(max(self._size_x, 1.0))
-                prev_err_x = abs(prev_x - target_x) / size_x
-                next_err_x = abs(next_x - target_x) / size_x
-                forward_reward = search_scale * float(np.clip(prev_err_x - next_err_x, -1.0, 1.0))
+            target_x = float(assigned_target_x[agent_idx])
+            target_y = float(assigned_target_y[agent_idx])
+            target_priority = float(np.clip(assigned_priority[agent_idx], 0.0, 1.0))
+            prev_dist = float(np.hypot(prev_x - target_x, prev_y - target_y))
+            next_dist = float(np.hypot(next_x - target_x, next_y - target_y))
+            dist_norm = max(float(np.hypot(self._size_x, self._size_y)), 1.0)
+            region_progress = float(np.clip((prev_dist - next_dist) / dist_norm, -1.0, 1.0))
+            priority_gain = 0.5 + target_priority
 
-                team_center_y = float(team_context.get("team_center_y", next_y))
-                spread_radius = max(float(self._size_y) * 0.18, 1.0)
-                dist_center = abs(next_y - team_center_y)
-                if dist_center < spread_radius:
-                    spread_penalty = -search_scale * 0.4 * float(1.0 - dist_center / spread_radius)
-                else:
-                    spread_penalty = 0.0
-                search_reward = forward_reward + spread_penalty
+            if post_contact_phase and float(team_context.get("blue_alive_count", 0.0)) > 0.0:
+                reacquire_reward = reacquire_scale * priority_gain * region_progress
+            else:
+                search_reward = search_scale * priority_gain * region_progress
 
         mode_total = contact_reward + attack_window_reward + disengage_penalty + search_reward + reacquire_reward
         exec_total = range_improve_reward + bearing_improve_reward
@@ -934,6 +1204,17 @@ class MAPPOMaCAEnv:
         reacquire_reward_mean = float(np.sum(self._episode_reacquire_reward_return) / alive_steps_total)
         post_contact_alive_total = float(max(np.sum(self._post_contact_alive_counts), 1.0))
         post_contact_no_contact_frac = float(np.sum(self._post_contact_no_contact_counts) / post_contact_alive_total)
+        priority_steps = float(max(self._priority_metric_steps, 1))
+        topk_steps = float(max(self._topk_coverage_steps, 1))
+        switch_steps = float(max(self._search_region_step_total, 1.0))
+        unseen_steps = float(max(self._unseen_area_priority_steps, 1))
+        assignment_steps = float(max(self._assignment_concentration_steps, 1))
+        priority_map_entropy_mean = float(self._priority_entropy_sum / priority_steps)
+        top1_priority_mean = float(self._top1_priority_sum / priority_steps)
+        topk_coverage_frac = float(self._topk_coverage_sum / topk_steps)
+        search_region_switch_frac = float(self._search_region_switch_total / switch_steps)
+        unseen_area_priority_mean = float(self._unseen_area_priority_sum / unseen_steps)
+        assigned_region_concentration_mean = float(self._assignment_concentration_sum / assignment_steps)
 
         return {
             "round_reward": float(raw_info.get("round_reward", 0.0)),
@@ -960,6 +1241,12 @@ class MAPPOMaCAEnv:
             "search_reward_mean": search_reward_mean,
             "reacquire_reward_mean": reacquire_reward_mean,
             "post_contact_no_contact_frac": post_contact_no_contact_frac,
+            "priority_map_entropy_mean": priority_map_entropy_mean,
+            "top1_priority_mean": top1_priority_mean,
+            "topk_coverage_frac": topk_coverage_frac,
+            "search_region_switch_frac": search_region_switch_frac,
+            "unseen_area_priority_mean": unseen_area_priority_mean,
+            "assigned_region_concentration_mean": assigned_region_concentration_mean,
             "reward_env_mean": float(self._episode_env_return) / episode_len,
             "reward_mode_mean": float(self._episode_mode_return) / episode_len,
             "reward_exec_mean": float(self._episode_exec_return) / episode_len,

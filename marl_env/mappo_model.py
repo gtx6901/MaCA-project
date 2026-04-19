@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -22,6 +23,9 @@ class MAPPOModelConfig:
     screen_embed_dim: int = 64
     course_dim: int = 16
     attack_dim: int = 21
+    priority_grid_h: int = 4
+    priority_grid_w: int = 4
+    priority_top_k: int = 2
 
 
 def _mlp(input_dim: int, hidden_size: int, output_dim: int) -> nn.Sequential:
@@ -46,21 +50,47 @@ class TeamActorCritic(nn.Module):
         if min(int(screen_h), int(screen_w), int(screen_c)) <= 0:
             raise ValueError("local_screen_shape entries must be positive")
 
-        self.screen_encoder = nn.Sequential(
+        self.priority_grid_h = max(2, int(cfg.priority_grid_h))
+        self.priority_grid_w = max(2, int(cfg.priority_grid_w))
+        self.priority_grid_size = int(self.priority_grid_h * self.priority_grid_w)
+        self.priority_top_k = max(1, min(int(cfg.priority_top_k), self.priority_grid_size))
+        self.priority_feature_dim = int(self.priority_top_k * 4 + 1)
+
+        centers = []
+        for gy in range(self.priority_grid_h):
+            for gx in range(self.priority_grid_w):
+                centers.append(
+                    [
+                        float(gx + 0.5) / float(self.priority_grid_w),
+                        float(gy + 0.5) / float(self.priority_grid_h),
+                    ]
+                )
+        self.register_buffer("priority_cell_centers", torch.as_tensor(centers, dtype=torch.float32))
+
+        self.screen_backbone = nn.Sequential(
             nn.Conv2d(int(screen_c), 16, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
             nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
             nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
+        )
+        self.screen_encoder = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
             nn.Linear(32, cfg.screen_embed_dim),
             nn.ReLU(),
         )
+        self.priority_head = nn.Sequential(
+            nn.Conv2d(32, 16, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((self.priority_grid_h, self.priority_grid_w)),
+            nn.Flatten(),
+            nn.Linear(16 * self.priority_grid_size, self.priority_grid_size),
+        )
 
         self.actor_backbone = nn.Sequential(
-            nn.Linear(cfg.local_obs_dim + cfg.screen_embed_dim, cfg.hidden_size),
+            nn.Linear(cfg.local_obs_dim + cfg.screen_embed_dim + self.priority_feature_dim, cfg.hidden_size),
             nn.ReLU(),
             nn.Linear(cfg.hidden_size, cfg.hidden_size),
             nn.ReLU(),
@@ -104,7 +134,7 @@ class TeamActorCritic(nn.Module):
     def actor_hidden_dim(self) -> int:
         return int(self.cfg.hidden_size)
 
-    def _encode_screen(self, local_screen: torch.Tensor) -> torch.Tensor:
+    def _screen_features(self, local_screen: torch.Tensor) -> torch.Tensor:
         # local_screen: [N, H, W, C] uint8/float32
         if local_screen.dim() != 4:
             raise ValueError("Expected local_screen rank 4 [N,H,W,C], got %d" % local_screen.dim())
@@ -112,7 +142,42 @@ class TeamActorCritic(nn.Module):
         if torch.max(x) > 1.0:
             x = x / 255.0
         x = x.permute(0, 3, 1, 2).contiguous()
-        return self.screen_encoder(x)
+        return self.screen_backbone(x)
+
+    def _encode_screen(self, local_screen: torch.Tensor) -> torch.Tensor:
+        return self.screen_encoder(self._screen_features(local_screen))
+
+    def _priority_logits_from_features(self, screen_features: torch.Tensor) -> torch.Tensor:
+        return self.priority_head(screen_features)
+
+    def priority_logits(self, local_screen: torch.Tensor) -> torch.Tensor:
+        screen_features = self._screen_features(local_screen)
+        return self._priority_logits_from_features(screen_features)
+
+    def _priority_features(self, priority_logits: torch.Tensor, local_obs: torch.Tensor) -> torch.Tensor:
+        priority_probs = torch.softmax(priority_logits, dim=-1)
+        top_values, top_indices = torch.topk(priority_probs, k=self.priority_top_k, dim=-1)
+        top_centers = self.priority_cell_centers[top_indices]
+
+        if local_obs.shape[-1] >= 6:
+            own_xy = torch.clamp(local_obs[:, 4:6], 0.0, 1.0)
+        else:
+            own_xy = torch.zeros((local_obs.shape[0], 2), dtype=local_obs.dtype, device=local_obs.device)
+
+        rel_xy = top_centers - own_xy.unsqueeze(1)
+        uncertainty_proxy = 1.0 - top_values
+        topk_struct = torch.cat(
+            [
+                rel_xy,
+                top_values.unsqueeze(-1),
+                uncertainty_proxy.unsqueeze(-1),
+            ],
+            dim=-1,
+        ).reshape(priority_logits.shape[0], -1)
+
+        entropy = -(priority_probs * torch.log(torch.clamp(priority_probs, min=1e-8))).sum(dim=-1, keepdim=True)
+        entropy_norm = entropy / max(math.log(float(max(self.priority_grid_size, 2))), 1e-6)
+        return torch.cat([topk_struct, entropy_norm], dim=-1)
 
     def _course_context(self, course_logits: torch.Tensor, course_actions: Optional[torch.Tensor] = None):
         if course_actions is None:
@@ -166,8 +231,12 @@ class TeamActorCritic(nn.Module):
         course_actions: Optional[torch.Tensor] = None,
         mode_actions: Optional[torch.Tensor] = None,
     ):
-        screen_embed = self._encode_screen(local_screen)
-        x = torch.cat([local_obs, screen_embed], dim=-1)
+        screen_features = self._screen_features(local_screen)
+        screen_embed = self.screen_encoder(screen_features)
+        priority_logits = self._priority_logits_from_features(screen_features)
+        priority_features = self._priority_features(priority_logits, local_obs)
+
+        x = torch.cat([local_obs, screen_embed, priority_features], dim=-1)
         x = self.actor_backbone(x)
         next_h = self.actor_rnn(x, actor_h)
 
