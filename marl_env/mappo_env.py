@@ -56,9 +56,13 @@ class MAPPOMaCAConfig:
     disengage_penalty: float = 0.05
     bearing_reward_scale: float = 0.05
     boundary_penalty_margin: float = 120.0
-    boundary_penalty_scale: float = 0.03
+    boundary_penalty_scale: float = 0.01
     boundary_stuck_penalty_enabled: bool = True
+    boundary_stuck_trigger_steps: int = 24
     boundary_stuck_ramp_steps: int = 20
+    search_reward_scale: float = 0.015
+    search_enemy_half_x_ratio: float = 0.62
+    reacquire_reward_scale: float = 0.02
     semantic_screen_downsample: int = 4
     terminal_ammo_fail_penalty: float = 80.0
     terminal_participation_penalty: float = 40.0
@@ -210,10 +214,23 @@ class MAPPOMaCAEnv:
         agent_boundary_penalty = np.zeros((self.num_agents,), dtype=np.float32)
         agent_near_boundary = np.zeros((self.num_agents,), dtype=np.float32)
         agent_alive_next = np.zeros((self.num_agents,), dtype=np.float32)
+        agent_search_reward = np.zeros((self.num_agents,), dtype=np.float32)
+        agent_reacquire_reward = np.zeros((self.num_agents,), dtype=np.float32)
+        agent_post_contact_no_contact = np.zeros((self.num_agents,), dtype=np.float32)
+        agent_post_contact_alive = np.zeros((self.num_agents,), dtype=np.float32)
         if red_raw_obs_next is not None:
+            team_context = self._build_team_contact_context(
+                fighter_obs_list=red_raw_obs_next["fighter_obs_list"],
+                blue_alive_count=blue_alive_count,
+            )
             for idx in range(self.num_agents):
                 next_state = self._extract_agent_state(red_raw_obs_next["fighter_obs_list"][idx])
-                aux_components = self._agent_aux_reward_components(idx, pre_states[idx], next_state)
+                aux_components = self._agent_aux_reward_components(
+                    idx,
+                    pre_states[idx],
+                    next_state,
+                    team_context=team_context,
+                )
                 agent_aux_reward[idx] = aux_components["total"]
                 agent_mode_reward[idx] = aux_components["mode_total"]
                 agent_exec_reward[idx] = aux_components["exec_total"]
@@ -221,14 +238,24 @@ class MAPPOMaCAEnv:
                 agent_boundary_penalty[idx] = aux_components["boundary_penalty"]
                 agent_near_boundary[idx] = aux_components["near_boundary"]
                 agent_alive_next[idx] = 1.0 if next_state["alive"] else 0.0
+                agent_search_reward[idx] = aux_components["search_reward"]
+                agent_reacquire_reward[idx] = aux_components["reacquire_reward"]
+                agent_post_contact_no_contact[idx] = aux_components["post_contact_no_contact"]
+                agent_post_contact_alive[idx] = aux_components["post_contact_alive"]
 
         damage_reward = float(np.mean(list(reward_dict.values())))
         reward_env = damage_reward + attrition_reward
         reward_mode = float(np.mean(agent_mode_reward))
         reward_exec = float(np.mean(agent_exec_reward))
+        alive_count_next = float(np.sum(agent_alive_next))
+        if alive_count_next > 0.0:
+            reward_boundary = float(np.sum(agent_boundary_penalty) / alive_count_next)
+        else:
+            reward_boundary = 0.0
         team_reward = (
             reward_env
             + float(self.config.mode_reward_scale) * reward_mode
+            + float(self.config.mode_reward_scale) * reward_boundary
             + float(self.config.exec_reward_scale) * reward_exec
         )
         if self.config.agent_aux_reward_scale != 0.0:
@@ -286,8 +313,12 @@ class MAPPOMaCAEnv:
         self._episode_agent_aux_return += agent_aux_reward
         self._episode_engagement_progress_return += agent_progress_reward
         self._episode_boundary_penalty_return += agent_boundary_penalty
+        self._episode_search_reward_return += agent_search_reward
+        self._episode_reacquire_reward_return += agent_reacquire_reward
         self._near_boundary_counts += agent_near_boundary * agent_alive_next
         self._alive_step_counts += agent_alive_next
+        self._post_contact_no_contact_counts += agent_post_contact_no_contact
+        self._post_contact_alive_counts += agent_post_contact_alive
         self._attack_opportunity_count += attack_opportunity_count
         self._missed_attack_count += missed_attack_count
         self._fire_action_count += fire_count
@@ -304,7 +335,7 @@ class MAPPOMaCAEnv:
             "reward_env": reward_env,
             "reward_mode": reward_mode,
             "reward_exec": reward_exec,
-            "reward_boundary": float(np.mean(agent_boundary_penalty)),
+            "reward_boundary": float(reward_boundary),
             "reward_terminal": float(reward_terminal),
             "near_boundary_frac": float(
                 np.sum(agent_near_boundary * agent_alive_next) / max(float(np.sum(agent_alive_next)), 1.0)
@@ -353,10 +384,17 @@ class MAPPOMaCAEnv:
         self._near_boundary_streak = np.zeros((self.num_agents,), dtype=np.int32)
         self._near_boundary_counts = np.zeros((self.num_agents,), dtype=np.float32)
         self._alive_step_counts = np.zeros((self.num_agents,), dtype=np.float32)
+        self._episode_search_reward_return = np.zeros((self.num_agents,), dtype=np.float32)
+        self._episode_reacquire_reward_return = np.zeros((self.num_agents,), dtype=np.float32)
+        self._post_contact_no_contact_counts = np.zeros((self.num_agents,), dtype=np.float32)
+        self._post_contact_alive_counts = np.zeros((self.num_agents,), dtype=np.float32)
         self._agent_fire_counts = np.zeros((self.num_agents,), dtype=np.float32)
         self._agent_attack_opportunity_counts = np.zeros((self.num_agents,), dtype=np.float32)
         self._agent_destroy_contribution = np.zeros((self.num_agents,), dtype=np.float32)
         self._episode_boundary_penalty_return = np.zeros((self.num_agents,), dtype=np.float32)
+        self._episode_contact_seen = False
+        self._team_known_enemy_pos = np.zeros((2,), dtype=np.float32)
+        self._team_known_enemy_age = self._track_memory_steps + 1
         self._initial_team_missile_total = 1.0
         self._terminal_ammo_fail_penalty = 0.0
         self._terminal_participation_penalty = 0.0
@@ -553,11 +591,61 @@ class MAPPOMaCAEnv:
             prev_heading_diff = 0.0
         return 0.0, 0.0, prev_heading_diff, last_seen_age
 
+    def _build_team_contact_context(self, fighter_obs_list: List[Dict[str, object]], blue_alive_count: int) -> Dict[str, object]:
+        alive_positions: List[Tuple[float, float]] = []
+        observed_enemy_positions: List[Tuple[float, float]] = []
+        any_contact_now = False
+
+        for fighter in fighter_obs_list:
+            if not bool(fighter.get("alive", False)):
+                continue
+            own_x = float(np.clip(float(fighter.get("pos_x", 0.0)), 0.0, float(max(self._size_x, 1.0))))
+            own_y = float(np.clip(float(fighter.get("pos_y", 0.0)), 0.0, float(max(self._size_y, 1.0))))
+            alive_positions.append((own_x, own_y))
+
+            visible_targets = list(fighter.get("r_visible_list", []))
+            if visible_targets:
+                any_contact_now = True
+            for target in visible_targets:
+                tx = float(np.clip(float(target.get("pos_x", own_x)), 0.0, float(max(self._size_x, 1.0))))
+                ty = float(np.clip(float(target.get("pos_y", own_y)), 0.0, float(max(self._size_y, 1.0))))
+                observed_enemy_positions.append((tx, ty))
+
+        if any_contact_now:
+            self._episode_contact_seen = True
+
+        if observed_enemy_positions:
+            observed_arr = np.asarray(observed_enemy_positions, dtype=np.float32)
+            mean_target = np.mean(observed_arr, axis=0)
+            self._team_known_enemy_pos[0] = float(np.clip(mean_target[0], 0.0, float(max(self._size_x, 1.0))))
+            self._team_known_enemy_pos[1] = float(np.clip(mean_target[1], 0.0, float(max(self._size_y, 1.0))))
+            self._team_known_enemy_age = 0
+        else:
+            self._team_known_enemy_age = min(self._team_known_enemy_age + 1, self._track_memory_steps + 1)
+
+        if alive_positions:
+            alive_arr = np.asarray(alive_positions, dtype=np.float32)
+            team_center_y = float(np.mean(alive_arr[:, 1]))
+        else:
+            team_center_y = float(self._size_y) * 0.5
+
+        return {
+            "post_contact_phase": bool(self._episode_contact_seen and blue_alive_count > 0),
+            "blue_alive_count": float(max(blue_alive_count, 0)),
+            "has_team_known_enemy": bool(self._team_known_enemy_age <= self._track_memory_steps),
+            "team_known_enemy_x": float(self._team_known_enemy_pos[0]),
+            "team_known_enemy_y": float(self._team_known_enemy_pos[1]),
+            "team_center_y": float(team_center_y),
+            "search_target_x": float(np.clip(float(self.config.search_enemy_half_x_ratio), 0.4, 0.9)) * float(self._size_x),
+        }
+
     def _extract_agent_state(self, fighter_raw_obs: Dict[str, object]) -> Dict[str, float]:
         alive = bool(fighter_raw_obs.get("alive", False))
         if not alive:
             return {
                 "alive": False,
+                "pos_x": 0.0,
+                "pos_y": 0.0,
                 "has_contact": False,
                 "nearest_enemy_distance": 0.0,
                 "nearest_enemy_bearing_abs": 1.0,
@@ -597,6 +685,8 @@ class MAPPOMaCAEnv:
         attack_mask = build_attack_mask_from_raw(fighter_raw_obs)
         return {
             "alive": True,
+            "pos_x": own_x,
+            "pos_y": own_y,
             "has_contact": has_contact,
             "nearest_enemy_distance": nearest_distance,
             "nearest_enemy_bearing_abs": nearest_bearing_abs,
@@ -609,6 +699,7 @@ class MAPPOMaCAEnv:
         agent_idx: int,
         prev_state: Dict[str, float],
         next_state: Dict[str, float],
+        team_context: Optional[Dict[str, object]] = None,
     ) -> Dict[str, float]:
         if not prev_state["alive"]:
             self._near_boundary_streak[agent_idx] = 0
@@ -618,6 +709,10 @@ class MAPPOMaCAEnv:
                 "disengage": 0.0,
                 "range_improve": 0.0,
                 "bearing_improve": 0.0,
+                "search_reward": 0.0,
+                "reacquire_reward": 0.0,
+                "post_contact_no_contact": 0.0,
+                "post_contact_alive": 0.0,
                 "boundary_penalty": 0.0,
                 "near_boundary": 0.0,
                 "mode_total": 0.0,
@@ -630,6 +725,10 @@ class MAPPOMaCAEnv:
         disengage_penalty = 0.0
         range_improve_reward = 0.0
         bearing_improve_reward = 0.0
+        search_reward = 0.0
+        reacquire_reward = 0.0
+        post_contact_no_contact = 0.0
+        post_contact_alive = 0.0
         boundary_penalty = 0.0
         near_boundary = 0.0
         if next_state["has_contact"] and not prev_state["has_contact"]:
@@ -664,31 +763,88 @@ class MAPPOMaCAEnv:
 
         margin = float(max(float(self.config.boundary_penalty_margin), 1e-6))
         scale = float(max(float(self.config.boundary_penalty_scale), 0.0))
+        trigger_steps = int(max(int(self.config.boundary_stuck_trigger_steps), 1))
         dist_to_boundary = float(next_state.get("nearest_boundary_dist", margin))
-        if next_state["alive"] and scale > 0.0 and dist_to_boundary < margin:
-            near_boundary = 1.0
+        is_alive = bool(next_state["alive"])
+        is_near_boundary = bool(is_alive and dist_to_boundary < margin)
+        no_contact = bool(not next_state["has_contact"])
+        near_boundary = 1.0 if is_near_boundary else 0.0
+
+        if is_near_boundary and no_contact:
             self._near_boundary_streak[agent_idx] += 1
-            edge_ratio = float(np.clip(1.0 - dist_to_boundary / margin, 0.0, 1.0))
-            smooth_edge = edge_ratio * edge_ratio
-            idle_multiplier = 1.0 if (not next_state["has_contact"] and not next_state["has_attack_opportunity"]) else 0.35
-            stuck_multiplier = 1.0
-            if bool(self.config.boundary_stuck_penalty_enabled):
-                ramp_steps = int(max(int(self.config.boundary_stuck_ramp_steps), 1))
-                stuck_ratio = float(np.clip(float(self._near_boundary_streak[agent_idx]) / float(ramp_steps), 0.0, 1.0))
-                stuck_multiplier += 0.75 * stuck_ratio
-            boundary_penalty = -scale * smooth_edge * idle_multiplier * stuck_multiplier
         else:
             self._near_boundary_streak[agent_idx] = 0
 
-        mode_total = contact_reward + attack_window_reward + disengage_penalty + boundary_penalty
+        if is_near_boundary and no_contact and scale > 0.0 and self._near_boundary_streak[agent_idx] > trigger_steps:
+            stuck_factor = 1.0
+            if bool(self.config.boundary_stuck_penalty_enabled):
+                ramp_steps = int(max(int(self.config.boundary_stuck_ramp_steps), 1))
+                overflow = float(self._near_boundary_streak[agent_idx] - trigger_steps)
+                ramp_ratio = float(np.clip(overflow / float(ramp_steps), 0.0, 1.0))
+                stuck_factor += 0.5 * ramp_ratio
+            boundary_penalty = -scale * stuck_factor
+
+        if team_context is None:
+            team_context = {
+                "post_contact_phase": False,
+                "blue_alive_count": 0.0,
+                "has_team_known_enemy": False,
+                "team_known_enemy_x": float(next_state.get("pos_x", 0.0)),
+                "team_known_enemy_y": float(next_state.get("pos_y", 0.0)),
+                "team_center_y": float(next_state.get("pos_y", 0.0)),
+                "search_target_x": float(np.clip(float(self.config.search_enemy_half_x_ratio), 0.4, 0.9)) * float(self._size_x),
+            }
+
+        if is_alive and no_contact:
+            search_scale = float(max(float(self.config.search_reward_scale), 0.0))
+            reacquire_scale = float(max(float(self.config.reacquire_reward_scale), 0.0))
+            prev_x = float(prev_state.get("pos_x", next_state.get("pos_x", 0.0)))
+            prev_y = float(prev_state.get("pos_y", next_state.get("pos_y", 0.0)))
+            next_x = float(next_state.get("pos_x", 0.0))
+            next_y = float(next_state.get("pos_y", 0.0))
+
+            post_contact_phase = bool(team_context.get("post_contact_phase", False))
+            has_team_known_enemy = bool(team_context.get("has_team_known_enemy", False))
+            if post_contact_phase:
+                post_contact_no_contact = 1.0
+                post_contact_alive = 1.0
+
+            if post_contact_phase and has_team_known_enemy and float(team_context.get("blue_alive_count", 0.0)) > 0.0:
+                target_x = float(team_context.get("team_known_enemy_x", next_x))
+                target_y = float(team_context.get("team_known_enemy_y", next_y))
+                prev_dist = float(np.hypot(prev_x - target_x, prev_y - target_y))
+                next_dist = float(np.hypot(next_x - target_x, next_y - target_y))
+                dist_norm = max(float(np.hypot(self._size_x, self._size_y)) * 0.5, 1.0)
+                reacquire_reward = reacquire_scale * float(np.clip((prev_dist - next_dist) / dist_norm, -1.0, 1.0))
+            else:
+                target_x = float(team_context.get("search_target_x", float(self._size_x) * 0.62))
+                size_x = float(max(self._size_x, 1.0))
+                prev_err_x = abs(prev_x - target_x) / size_x
+                next_err_x = abs(next_x - target_x) / size_x
+                forward_reward = search_scale * float(np.clip(prev_err_x - next_err_x, -1.0, 1.0))
+
+                team_center_y = float(team_context.get("team_center_y", next_y))
+                spread_radius = max(float(self._size_y) * 0.18, 1.0)
+                dist_center = abs(next_y - team_center_y)
+                if dist_center < spread_radius:
+                    spread_penalty = -search_scale * 0.4 * float(1.0 - dist_center / spread_radius)
+                else:
+                    spread_penalty = 0.0
+                search_reward = forward_reward + spread_penalty
+
+        mode_total = contact_reward + attack_window_reward + disengage_penalty + search_reward + reacquire_reward
         exec_total = range_improve_reward + bearing_improve_reward
-        total_reward = mode_total + exec_total
+        total_reward = mode_total + exec_total + boundary_penalty
         return {
             "contact": float(contact_reward),
             "attack_window": float(attack_window_reward),
             "disengage": float(disengage_penalty),
             "range_improve": float(range_improve_reward),
             "bearing_improve": float(bearing_improve_reward),
+            "search_reward": float(search_reward),
+            "reacquire_reward": float(reacquire_reward),
+            "post_contact_no_contact": float(post_contact_no_contact),
+            "post_contact_alive": float(post_contact_alive),
             "boundary_penalty": float(boundary_penalty),
             "near_boundary": float(near_boundary),
             "mode_total": float(mode_total),
@@ -774,6 +930,10 @@ class MAPPOMaCAEnv:
         alive_steps_total = float(max(np.sum(self._alive_step_counts), 1.0))
         near_boundary_frac = float(np.sum(self._near_boundary_counts) / alive_steps_total)
         boundary_penalty_mean = float(np.sum(self._episode_boundary_penalty_return) / alive_steps_total)
+        search_reward_mean = float(np.sum(self._episode_search_reward_return) / alive_steps_total)
+        reacquire_reward_mean = float(np.sum(self._episode_reacquire_reward_return) / alive_steps_total)
+        post_contact_alive_total = float(max(np.sum(self._post_contact_alive_counts), 1.0))
+        post_contact_no_contact_frac = float(np.sum(self._post_contact_no_contact_counts) / post_contact_alive_total)
 
         return {
             "round_reward": float(raw_info.get("round_reward", 0.0)),
@@ -797,6 +957,9 @@ class MAPPOMaCAEnv:
             "agent_aux_reward_mean": float(np.mean(self._episode_agent_aux_return)) / episode_len,
             "boundary_penalty_mean": boundary_penalty_mean,
             "near_boundary_frac": near_boundary_frac,
+            "search_reward_mean": search_reward_mean,
+            "reacquire_reward_mean": reacquire_reward_mean,
+            "post_contact_no_contact_frac": post_contact_no_contact_frac,
             "reward_env_mean": float(self._episode_env_return) / episode_len,
             "reward_mode_mean": float(self._episode_mode_return) / episode_len,
             "reward_exec_mean": float(self._episode_exec_return) / episode_len,

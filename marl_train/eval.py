@@ -190,6 +190,7 @@ def run_evaluation(model, device, args, env_steps: int):
         boundary_penalty_margin=args.maca_boundary_penalty_margin,
         boundary_penalty_scale=args.maca_boundary_penalty_scale,
         boundary_stuck_penalty_enabled=args.maca_boundary_stuck_penalty_enabled,
+        boundary_stuck_trigger_steps=args.maca_boundary_stuck_trigger_steps,
         boundary_stuck_ramp_steps=args.maca_boundary_stuck_ramp_steps,
         semantic_screen_downsample=args.maca_semantic_screen_downsample,
         terminal_ammo_fail_penalty=args.maca_terminal_ammo_fail_penalty,

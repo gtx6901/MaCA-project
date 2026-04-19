@@ -138,8 +138,9 @@ def parse_args(argv=None):
     parser.add_argument("--maca_disengage_penalty", type=float, default=0.05)
     parser.add_argument("--maca_bearing_reward_scale", type=float, default=0.05)
     parser.add_argument("--maca_boundary_penalty_margin", type=float, default=120.0)
-    parser.add_argument("--maca_boundary_penalty_scale", type=float, default=0.03)
+    parser.add_argument("--maca_boundary_penalty_scale", type=float, default=0.01)
     parser.add_argument("--maca_boundary_stuck_penalty_enabled", type=str2bool, default=True)
+    parser.add_argument("--maca_boundary_stuck_trigger_steps", type=int, default=24)
     parser.add_argument("--maca_boundary_stuck_ramp_steps", type=int, default=20)
     parser.add_argument("--maca_semantic_screen_downsample", type=int, default=4)
     parser.add_argument("--maca_terminal_ammo_fail_penalty", type=float, default=80.0)
@@ -195,6 +196,8 @@ def parse_args(argv=None):
         raise ValueError("maca_boundary_penalty_margin must be > 0")
     if float(args.maca_boundary_penalty_scale) < 0.0:
         raise ValueError("maca_boundary_penalty_scale must be >= 0")
+    if int(args.maca_boundary_stuck_trigger_steps) <= 0:
+        raise ValueError("maca_boundary_stuck_trigger_steps must be > 0")
     if int(args.maca_boundary_stuck_ramp_steps) <= 0:
         raise ValueError("maca_boundary_stuck_ramp_steps must be > 0")
     if int(args.maca_semantic_screen_downsample) <= 0:
