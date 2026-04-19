@@ -114,6 +114,7 @@ def pack_recurrent_minibatch(
     global_state,
     attack_masks,
     alive_mask,
+    assigned_region_obs,
     priority_map_teacher,
     actor_h,
     old_log_prob,
@@ -141,6 +142,7 @@ def pack_recurrent_minibatch(
     screen_c = local_screen.shape[-1]
     global_dim = global_state.shape[-1]
     attack_dim = attack_masks.shape[-1]
+    assigned_region_dim = assigned_region_obs.shape[-1]
     priority_dim = priority_map_teacher.shape[-1]
 
     chunk_meta = []
@@ -158,6 +160,7 @@ def pack_recurrent_minibatch(
     local_screen_batch = local_screen.new_zeros((max_total_len, batch_size, screen_h, screen_w, screen_c))
     global_batch = global_state.new_zeros((max_total_len, batch_size, global_dim))
     attack_mask_batch = attack_masks.new_zeros((max_total_len, batch_size, attack_dim))
+    assigned_region_batch = assigned_region_obs.new_zeros((max_total_len, batch_size, assigned_region_dim))
     priority_teacher_batch = priority_map_teacher.new_zeros((max_total_len, batch_size, priority_dim))
     actor_h_batch = actor_h.new_zeros((max_total_len, batch_size, hidden_dim))
     course_batch = course_action.new_zeros((max_total_len, batch_size))
@@ -193,6 +196,7 @@ def pack_recurrent_minibatch(
         local_screen_batch[:total_len, batch_col] = local_screen[burn_start:end, env_idx, agent_idx]
         global_batch[:total_len, batch_col] = global_state[burn_start:end, env_idx]
         attack_mask_batch[:total_len, batch_col] = attack_masks[burn_start:end, env_idx, agent_idx]
+        assigned_region_batch[:total_len, batch_col] = assigned_region_obs[burn_start:end, env_idx, agent_idx]
         priority_teacher_batch[:total_len, batch_col] = priority_map_teacher[burn_start:end, env_idx, agent_idx]
         actor_h_batch[:total_len, batch_col] = actor_h[burn_start:end, env_idx, agent_idx]
         course_batch[:total_len, batch_col] = course_action[burn_start:end, env_idx, agent_idx]
@@ -221,6 +225,7 @@ def pack_recurrent_minibatch(
         "local_screen": local_screen_batch,
         "global_state": global_batch,
         "attack_masks": attack_mask_batch,
+        "assigned_region_obs": assigned_region_batch,
         "priority_map_teacher": priority_teacher_batch,
         "actor_h": actor_h_batch,
         "course_action": course_batch,
@@ -263,6 +268,7 @@ def ppo_update(
     global_state = torch.as_tensor(buffer["global_state"], dtype=torch.float32, device=device)
     attack_masks = torch.as_tensor(buffer["attack_masks"], dtype=torch.bool, device=device)
     alive_mask = torch.as_tensor(buffer["alive_mask"], dtype=torch.float32, device=device)
+    assigned_region_obs = torch.as_tensor(buffer["assigned_region_obs"], dtype=torch.float32, device=device)
     priority_map_teacher = torch.as_tensor(buffer["priority_map_teacher"], dtype=torch.float32, device=device)
     actor_h = torch.as_tensor(buffer["actor_h"], dtype=torch.float32, device=device)
     old_log_prob = torch.as_tensor(buffer["log_prob"], dtype=torch.float32, device=device)
@@ -381,6 +387,7 @@ def ppo_update(
                 global_state,
                 attack_masks,
                 alive_mask,
+                assigned_region_obs,
                 priority_map_teacher,
                 actor_h,
                 old_log_prob,
@@ -468,6 +475,7 @@ def ppo_update(
                 seq_h = h[seq_valid]
                 seq_course = packed["course_action"][seq_idx, seq_valid]
                 seq_mode = packed["mode_action"][seq_idx, seq_valid]
+                seq_assigned_region = packed["assigned_region_obs"][seq_idx, seq_valid]
 
                 course_logits, attack_logits, next_h_valid = model.actor_step(
                     seq_local,
@@ -475,6 +483,7 @@ def ppo_update(
                     seq_h,
                     course_actions=seq_course,
                     mode_actions=seq_mode,
+                    assigned_region_obs=seq_assigned_region,
                 )
                 course_logits = sanitize_logits(course_logits)
                 attack_logits = sanitize_logits(attack_logits)
@@ -547,6 +556,7 @@ def ppo_update(
                                 seq_h.detach(),
                                 course_actions=packed["course_action"][seq_idx, seq_valid],
                                 mode_actions=packed["mode_action"][seq_idx, seq_valid],
+                                assigned_region_obs=seq_assigned_region,
                             )
                             teacher_course_logits = teacher_course_logits[seq_train]
                             teacher_attack_logits = teacher_attack_logits[seq_train]

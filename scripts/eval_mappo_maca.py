@@ -22,6 +22,7 @@ if str(ENV_DIR) not in sys.path:
 
 from marl_env.mappo_env import MAPPOMaCAConfig, MAPPOMaCAEnv
 from marl_env.mappo_model import MAPPOModelConfig, TeamActorCritic
+from marl_train.eval import init_eval_policy_state, reset_eval_policy_state, select_eval_actions
 
 
 def parse_args(argv=None):
@@ -36,26 +37,17 @@ def parse_args(argv=None):
     parser.add_argument("--deterministic", type=str, default="True")
     parser.add_argument("--maca_opponent", type=str, default=None)
     parser.add_argument("--maca_render", type=str, default="True")
+    parser.add_argument("--attack_policy_mode", type=str, default=None)
+    parser.add_argument("--attack_rule_mode", type=str, default=None)
+    parser.add_argument("--attack_rule_prefer_long", type=str, default=None)
+    parser.add_argument("--disable_high_level_mode", type=str, default=None)
+    parser.add_argument("--mode_interval", type=int, default=None)
     parser.add_argument("--seed", type=int, default=1)
     return parser.parse_args(argv)
 
 
 def str2bool(value: str) -> bool:
     return str(value).strip().lower() not in {"0", "false", "no", "off"}
-
-
-def ensure_valid_action_mask(mask: torch.Tensor) -> torch.Tensor:
-    if mask.numel() <= 0:
-        return mask
-    has_any = torch.any(mask, dim=-1, keepdim=True)
-    safe = mask.clone()
-    safe[..., 0] = safe[..., 0] | (~has_any.squeeze(-1))
-    return safe
-
-
-def sanitize_logits(logits: torch.Tensor, clamp_abs: float = 30.0) -> torch.Tensor:
-    logits = torch.nan_to_num(logits, nan=0.0, posinf=clamp_abs, neginf=-clamp_abs)
-    return torch.clamp(logits, -clamp_abs, clamp_abs)
 
 
 def device_from_arg(device_arg: str):
@@ -101,14 +93,17 @@ def load_train_cfg(exp_dir: Path) -> dict:
 
 
 def build_env(train_cfg: dict, args) -> MAPPOMaCAEnv:
+    runtime_opponent = train_cfg.get("runtime_maca_opponent", train_cfg.get("maca_opponent", "fix_rule"))
+    runtime_max_step = int(train_cfg.get("runtime_maca_max_step", train_cfg.get("maca_max_step", 1000)))
+    runtime_random_pos = bool(train_cfg.get("runtime_maca_random_pos", train_cfg.get("maca_random_pos", False)))
     return MAPPOMaCAEnv(
         MAPPOMaCAConfig(
             map_path=train_cfg.get("maca_map_path", "maps/1000_1000_fighter10v10.map"),
             red_obs_ind=train_cfg.get("maca_red_obs_ind", "simple"),
-            opponent=args.maca_opponent or train_cfg.get("maca_opponent", "fix_rule"),
-            max_step=int(train_cfg.get("maca_max_step", 1000)),
+            opponent=args.maca_opponent or runtime_opponent,
+            max_step=runtime_max_step,
             render=str2bool(args.maca_render),
-            random_pos=bool(train_cfg.get("maca_random_pos", False)),
+            random_pos=runtime_random_pos,
             random_seed=int(args.seed),
             adaptive_support_policy=bool(train_cfg.get("maca_adaptive_support_policy", True)),
             support_search_hold=int(train_cfg.get("maca_support_search_hold", 6)),
@@ -156,35 +151,6 @@ def build_env(train_cfg: dict, args) -> MAPPOMaCAEnv:
     )
 
 
-def select_actions(model, obs, actor_h, device, deterministic: bool):
-    local_obs_np = obs["local_obs"]
-    local_screen_np = obs["local_screen"]
-    local_obs = torch.as_tensor(local_obs_np, dtype=torch.float32, device=device)
-    local_screen = torch.as_tensor(local_screen_np, dtype=torch.uint8, device=device)
-    attack_masks = torch.as_tensor(obs["attack_masks"], dtype=torch.bool, device=device)
-    attack_masks = ensure_valid_action_mask(attack_masks)
-    actor_h_t = torch.as_tensor(actor_h, dtype=torch.float32, device=device)
-
-    with torch.no_grad():
-        course_logits, _attack_logits_unused, next_actor_h = model.actor_step(local_obs, local_screen, actor_h_t)
-        course_logits = sanitize_logits(course_logits)
-        if deterministic:
-            course_action = torch.argmax(course_logits, dim=-1)
-        else:
-            course_action = torch.distributions.Categorical(logits=course_logits).sample()
-
-        attack_logits = model.attack_logits(next_actor_h, course_action)
-        attack_logits = sanitize_logits(attack_logits)
-        invalid_logit = torch.finfo(attack_logits.dtype).min
-        attack_logits = attack_logits.masked_fill(~attack_masks, invalid_logit)
-        if deterministic:
-            attack_action = torch.argmax(attack_logits, dim=-1)
-        else:
-            attack_action = torch.distributions.Categorical(logits=attack_logits).sample()
-
-    return np.stack([course_action.cpu().numpy(), attack_action.cpu().numpy()], axis=-1), next_actor_h.cpu().numpy()
-
-
 def main(argv=None):
     args = parse_args(argv)
     device = device_from_arg(args.device)
@@ -193,6 +159,25 @@ def main(argv=None):
 
     exp_dir = Path(args.train_dir) / args.experiment
     train_cfg = load_train_cfg(exp_dir)
+
+    def _resolve_bool_optional(value, fallback: bool) -> bool:
+        if value is None:
+            return bool(fallback)
+        return bool(str2bool(str(value)))
+
+    args.attack_policy_mode = str(args.attack_policy_mode or train_cfg.get("attack_policy_mode", "full_discrete"))
+    args.attack_rule_mode = str(args.attack_rule_mode or train_cfg.get("attack_rule_mode", "none"))
+    args.attack_rule_prefer_long = _resolve_bool_optional(
+        args.attack_rule_prefer_long,
+        bool(train_cfg.get("attack_rule_prefer_long", True)),
+    )
+    args.disable_high_level_mode = _resolve_bool_optional(
+        args.disable_high_level_mode,
+        bool(train_cfg.get("disable_high_level_mode", False)),
+    )
+    args.mode_interval = int(args.mode_interval if args.mode_interval is not None else int(train_cfg.get("mode_interval", 8)))
+    args.mode_interval = max(1, int(args.mode_interval))
+
     checkpoint = Path(args.checkpoint) if args.checkpoint else latest_checkpoint(exp_dir)
     if checkpoint is None or not checkpoint.exists():
         raise FileNotFoundError(f"No checkpoint found under {exp_dir / 'checkpoint'}")
@@ -223,26 +208,34 @@ def main(argv=None):
             flush=True,
         )
     model.eval()
-    actor_h = np.zeros((env.num_agents, model.actor_hidden_dim), dtype=np.float32)
+    policy_state = init_eval_policy_state(env.num_agents, model.actor_hidden_dim)
 
     episode_results = []
     start_time = time.time()
     print(
-        "[eval] base_obs_dim=%d final_obs_dim=%d local_screen_shape=%s"
-        % (base_local_obs_dim, local_obs_dim, str(tuple(env.local_screen_shape))),
+        "[eval] base_obs_dim=%d final_obs_dim=%d local_screen_shape=%s attack_policy_mode=%s attack_rule_mode=%s disable_high_level_mode=%s mode_interval=%d"
+        % (
+            base_local_obs_dim,
+            local_obs_dim,
+            str(tuple(env.local_screen_shape)),
+            str(args.attack_policy_mode),
+            str(args.attack_rule_mode),
+            str(bool(args.disable_high_level_mode)),
+            int(args.mode_interval),
+        ),
         flush=True,
     )
     try:
         while len(episode_results) < args.episodes:
-            actions, next_actor_h = select_actions(
+            actions = select_eval_actions(
                 model,
                 obs,
-                actor_h,
+                policy_state,
                 device,
                 deterministic,
+                args,
             )
             obs, _reward, done, info = env.step(actions)
-            actor_h = next_actor_h
             if not done:
                 continue
 
@@ -262,7 +255,7 @@ def main(argv=None):
                     ),
                     flush=True,
                 )
-            actor_h.fill(0.0)
+            reset_eval_policy_state(policy_state)
             obs = env.reset(seed=args.seed + len(episode_results))
     finally:
         env.close()
@@ -273,7 +266,7 @@ def main(argv=None):
         "checkpoint": str(checkpoint),
         "episodes": args.episodes,
         "deterministic": deterministic,
-        "maca_opponent": args.maca_opponent or train_cfg.get("maca_opponent", "fix_rule"),
+        "maca_opponent": args.maca_opponent or train_cfg.get("runtime_maca_opponent", train_cfg.get("maca_opponent", "fix_rule")),
         "eval_wall_time_sec": float(time.time() - start_time),
         "summary": summary,
         "episodes_detail": episode_results,

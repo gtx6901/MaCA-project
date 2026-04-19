@@ -145,13 +145,13 @@ def parse_args(argv=None):
     parser.add_argument("--maca_boundary_stuck_ramp_steps", type=int, default=20)
     parser.add_argument("--maca_search_reward_scale", type=float, default=0.015)
     parser.add_argument("--maca_reacquire_reward_scale", type=float, default=0.02)
-    parser.add_argument("--maca_priority_grid_h", type=int, default=4)
-    parser.add_argument("--maca_priority_grid_w", type=int, default=4)
-    parser.add_argument("--maca_priority_top_k", type=int, default=2)
+    parser.add_argument("--maca_priority_grid_h", type=int, default=5)
+    parser.add_argument("--maca_priority_grid_w", type=int, default=5)
+    parser.add_argument("--maca_priority_top_k", type=int, default=3)
     parser.add_argument("--maca_priority_evidence_weight", type=float, default=1.0)
     parser.add_argument("--maca_priority_uncertainty_weight", type=float, default=0.9)
     parser.add_argument("--maca_priority_diffusion_weight", type=float, default=0.7)
-    parser.add_argument("--maca_priority_crowding_penalty", type=float, default=0.45)
+    parser.add_argument("--maca_priority_crowding_penalty", type=float, default=0.6)
     parser.add_argument("--maca_priority_assignment_penalty", type=float, default=0.35)
     parser.add_argument("--maca_priority_distance_penalty", type=float, default=0.25)
     parser.add_argument("--maca_priority_unseen_cap_steps", type=int, default=40)
@@ -436,6 +436,7 @@ def main(argv=None):
         global_state_dim = initial_obs["global_state"].shape[0]
         num_agents = initial_obs["local_obs"].shape[0]
         attack_dim = initial_obs["attack_masks"].shape[1]
+        assigned_region_dim = int(initial_obs.get("assigned_region_obs", np.zeros((num_agents, 5), dtype=np.float32)).shape[1])
         priority_map_dim = initial_obs["priority_map_teacher"].shape[1]
         priority_grid_shape = tuple(probe_env.priority_grid_shape)
         priority_top_k = int(probe_env.priority_top_k)
@@ -450,6 +451,7 @@ def main(argv=None):
         "global_state_dim": int(global_state_dim),
         "num_agents": int(num_agents),
         "attack_dim": int(attack_dim),
+        "assigned_region_dim": int(assigned_region_dim),
         "priority_map_dim": int(priority_map_dim),
         "priority_grid_h": int(priority_grid_shape[0]),
         "priority_grid_w": int(priority_grid_shape[1]),

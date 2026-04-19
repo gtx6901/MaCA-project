@@ -121,6 +121,7 @@ class MAPPOMaCAEnv:
         self._priority_grid_size = int(self._priority_grid_h * self._priority_grid_w)
         self._priority_top_k = max(1, min(int(self.config.priority_top_k), self._priority_grid_size))
         self._priority_cell_centers = self._build_priority_cell_centers()
+        self._assigned_region_obs_dim = 5
         self._local_obs_dim = 16 + self.max_visible_enemies * 8
         self._global_state_dim = None
         self._reset_stats()
@@ -144,6 +145,10 @@ class MAPPOMaCAEnv:
     @property
     def priority_top_k(self) -> int:
         return int(self._priority_top_k)
+
+    @property
+    def assigned_region_obs_dim(self) -> int:
+        return int(self._assigned_region_obs_dim)
 
     @property
     def global_state_dim(self) -> int:
@@ -484,6 +489,7 @@ class MAPPOMaCAEnv:
         local_screen = np.zeros((self.num_agents,) + self.local_screen_shape, dtype=np.uint8)
         attack_masks = np.zeros((self.num_agents, ATTACK_IND_NUM), dtype=np.bool_)
         alive_mask = np.zeros((self.num_agents,), dtype=np.float32)
+        assigned_region_obs = np.zeros((self.num_agents, self.assigned_region_obs_dim), dtype=np.float32)
         rule_visible_target_ids = np.zeros((self.num_agents, self.max_visible_enemies), dtype=np.int64)
         priority_map_teacher = np.repeat(self._priority_teacher_map[None, :], self.num_agents, axis=0).astype(
             np.float32, copy=False
@@ -500,6 +506,7 @@ class MAPPOMaCAEnv:
             alive_mask[idx] = 1.0 if alive else 0.0
             if not alive:
                 local_screen[idx].fill(0)
+            assigned_region_obs[idx] = self._build_assigned_region_obs(idx, fighter_raw_obs)
             sorted_targets = self._sorted_visible_targets(fighter_raw_obs) if alive else []
             for slot_idx in range(min(self.max_visible_enemies, len(sorted_targets))):
                 rule_visible_target_ids[idx, slot_idx] = int(sorted_targets[slot_idx].get("id", 0))
@@ -537,10 +544,37 @@ class MAPPOMaCAEnv:
             "global_state": global_state,
             "attack_masks": attack_masks,
             "alive_mask": alive_mask,
+            "assigned_region_obs": assigned_region_obs,
             "priority_map_teacher": priority_map_teacher,
             "agent_ids": agent_ids,
             "rule_visible_target_ids": rule_visible_target_ids,
         }
+
+    def _build_assigned_region_obs(self, agent_idx: int, fighter_raw_obs: Dict[str, object]) -> np.ndarray:
+        feat = np.zeros((self.assigned_region_obs_dim,), dtype=np.float32)
+        if not bool(fighter_raw_obs.get("alive", False)):
+            return feat
+
+        region_idx = int(self._agent_search_region_assignment[agent_idx])
+        if region_idx < 0 or region_idx >= self._priority_grid_size:
+            return feat
+
+        own_x = float(np.clip(float(fighter_raw_obs.get("pos_x", 0.0)), 0.0, float(max(self._size_x, 1.0))))
+        own_y = float(np.clip(float(fighter_raw_obs.get("pos_y", 0.0)), 0.0, float(max(self._size_y, 1.0))))
+        own_x_norm = own_x / float(max(self._size_x, 1.0))
+        own_y_norm = own_y / float(max(self._size_y, 1.0))
+        center = self._priority_cell_centers[region_idx]
+        rel_x = float(np.clip(center[0] - own_x_norm, -1.0, 1.0))
+        rel_y = float(np.clip(center[1] - own_y_norm, -1.0, 1.0))
+        assigned_priority = float(np.clip(self._priority_teacher_map[region_idx], 0.0, 1.0))
+        assigned_uncertainty = float(np.clip(self._priority_uncertainty_map[region_idx], 0.0, 1.0))
+
+        feat[0] = 1.0
+        feat[1] = rel_x
+        feat[2] = rel_y
+        feat[3] = assigned_priority
+        feat[4] = assigned_uncertainty
+        return feat
 
     def _downsample_screen(self, screen: np.ndarray) -> np.ndarray:
         if self._screen_downsample <= 1:
@@ -722,7 +756,13 @@ class MAPPOMaCAEnv:
 
         for agent_idx in no_contact_indices.tolist():
             dist_to_cells = np.linalg.norm(self._priority_cell_centers - agent_pos_norm[agent_idx], axis=1)
-            score = priority_map - assign_penalty * assigned_counts - dist_penalty * dist_to_cells
+            base_score = priority_map - dist_penalty * dist_to_cells
+            unused_mask = assigned_counts <= 0.0
+            if np.any(unused_mask):
+                score = np.full_like(base_score, -1e9)
+                score[unused_mask] = base_score[unused_mask]
+            else:
+                score = base_score - assign_penalty * assigned_counts
             best_idx = int(np.argmax(score))
             assigned_region_idx[agent_idx] = best_idx
             assigned_counts[best_idx] += 1.0
@@ -744,9 +784,19 @@ class MAPPOMaCAEnv:
             self._agent_search_region_assignment[agent_idx] = -1
 
         topk_idx = self._topk_indices(priority_map, self._priority_top_k)
+        top1_idx = int(topk_idx[0]) if topk_idx.size > 0 else -1
         top1_priority = float(priority_map[int(topk_idx[0])]) if topk_idx.size > 0 else 0.0
         entropy = float(-np.sum(priority_map * np.log(np.clip(priority_map, 1e-8, 1.0))))
         entropy_norm = entropy / float(np.log(float(max(self._priority_grid_size, 2))))
+
+        if top1_idx >= 0:
+            top1_target_x = float(self._priority_cell_centers[top1_idx, 0] * float(self._size_x))
+            top1_target_y = float(self._priority_cell_centers[top1_idx, 1] * float(self._size_y))
+            top1_uncertainty = float(uncertainty_map[top1_idx])
+        else:
+            top1_target_x = 0.5 * float(self._size_x)
+            top1_target_y = 0.5 * float(self._size_y)
+            top1_uncertainty = 0.0
 
         if update_episode_metrics:
             self._priority_entropy_sum += float(entropy_norm)
@@ -787,6 +837,10 @@ class MAPPOMaCAEnv:
             "assigned_priority": assigned_priority,
             "assigned_target_x": assigned_target_xy[:, 0],
             "assigned_target_y": assigned_target_xy[:, 1],
+            "top1_target_x": top1_target_x,
+            "top1_target_y": top1_target_y,
+            "top1_priority": float(top1_priority),
+            "top1_uncertainty": float(top1_uncertainty),
         }
         return team_context
 
@@ -1051,10 +1105,19 @@ class MAPPOMaCAEnv:
             team_context = {
                 "post_contact_phase": False,
                 "blue_alive_count": 0.0,
+                "assigned_region_idx": np.full((self.num_agents,), -1, dtype=np.int32),
                 "assigned_priority": np.zeros((self.num_agents,), dtype=np.float32),
                 "assigned_target_x": np.full((self.num_agents,), float(next_state.get("pos_x", 0.0)), dtype=np.float32),
                 "assigned_target_y": np.full((self.num_agents,), float(next_state.get("pos_y", 0.0)), dtype=np.float32),
+                "top1_target_x": float(next_state.get("pos_x", 0.0)),
+                "top1_target_y": float(next_state.get("pos_y", 0.0)),
+                "top1_priority": 0.0,
             }
+
+        assigned_region_idx = np.asarray(
+            team_context.get("assigned_region_idx", np.full((self.num_agents,), -1, dtype=np.int32)),
+            dtype=np.int32,
+        )
 
         assigned_priority = np.asarray(
             team_context.get("assigned_priority", np.zeros((self.num_agents,), dtype=np.float32)),
@@ -1074,6 +1137,9 @@ class MAPPOMaCAEnv:
             ),
             dtype=np.float32,
         )
+        fallback_target_x = float(team_context.get("top1_target_x", next_state.get("pos_x", 0.0)))
+        fallback_target_y = float(team_context.get("top1_target_y", next_state.get("pos_y", 0.0)))
+        fallback_priority = float(np.clip(float(team_context.get("top1_priority", 0.0)), 0.0, 1.0))
 
         if is_alive and no_contact:
             search_scale = float(max(float(self.config.search_reward_scale), 0.0))
@@ -1088,9 +1154,16 @@ class MAPPOMaCAEnv:
                 post_contact_no_contact = 1.0
                 post_contact_alive = 1.0
 
-            target_x = float(assigned_target_x[agent_idx])
-            target_y = float(assigned_target_y[agent_idx])
-            target_priority = float(np.clip(assigned_priority[agent_idx], 0.0, 1.0))
+            region_idx = int(assigned_region_idx[agent_idx]) if assigned_region_idx.shape[0] > agent_idx else -1
+            has_assigned_region = bool(0 <= region_idx < self._priority_grid_size)
+            if has_assigned_region:
+                target_x = float(assigned_target_x[agent_idx])
+                target_y = float(assigned_target_y[agent_idx])
+                target_priority = float(np.clip(assigned_priority[agent_idx], 0.0, 1.0))
+            else:
+                target_x = fallback_target_x
+                target_y = fallback_target_y
+                target_priority = fallback_priority
             prev_dist = float(np.hypot(prev_x - target_x, prev_y - target_y))
             next_dist = float(np.hypot(next_x - target_x, next_y - target_y))
             dist_norm = max(float(np.hypot(self._size_x, self._size_y)), 1.0)

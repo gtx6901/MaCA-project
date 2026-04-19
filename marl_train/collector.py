@@ -20,6 +20,7 @@ ROLLOUT_BUFFER_DTYPES = {
     "global_state": np.float32,
     "attack_masks": np.uint8,
     "alive_mask": np.float32,
+    "assigned_region_obs": np.float32,
     "priority_map_teacher": np.float32,
     "actor_h": np.float32,
     "course_action": np.int64,
@@ -260,6 +261,18 @@ def sample_actions(model, batch, device, deterministic: bool = False, args=None)
     else:
         attack_masks = torch.as_tensor(batch["attack_masks"], dtype=torch.bool, device=device)
 
+    if "assigned_region_obs" in batch:
+        if torch.is_tensor(batch["assigned_region_obs"]):
+            assigned_region_obs = batch["assigned_region_obs"].to(device=device, dtype=torch.float32)
+        else:
+            assigned_region_obs = torch.as_tensor(batch["assigned_region_obs"], dtype=torch.float32, device=device)
+    else:
+        assigned_region_obs = torch.zeros(
+            local_obs.shape[:2] + (5,),
+            dtype=torch.float32,
+            device=device,
+        )
+
     if torch.is_tensor(batch["actor_h"]):
         actor_h = batch["actor_h"].to(device=device, dtype=torch.float32)
     else:
@@ -275,6 +288,7 @@ def sample_actions(model, batch, device, deterministic: bool = False, args=None)
     flat_attack_masks = attack_masks.reshape(-1, attack_masks.shape[-1])
     flat_attack_masks = ensure_valid_action_mask(flat_attack_masks)
     flat_attack_masks_np = flat_attack_masks.cpu().numpy().astype(np.bool_, copy=False)
+    flat_assigned_region_obs = assigned_region_obs.reshape(-1, assigned_region_obs.shape[-1])
     flat_actor_h = actor_h.reshape(-1, actor_h.shape[-1])
 
     if "rule_visible_target_ids" in batch:
@@ -304,6 +318,7 @@ def sample_actions(model, batch, device, deterministic: bool = False, args=None)
         flat_screen,
         flat_actor_h,
         mode_actions=mode_actions,
+        assigned_region_obs=flat_assigned_region_obs,
     )
     course_logits = sanitize_logits(course_logits)
     course_dist = Categorical(logits=course_logits)
@@ -452,6 +467,7 @@ def build_worker_buffer_shapes(rollout_steps: int, env_count: int, env_spec: dic
     local_screen_c = int(env_spec["local_screen_shape"][2])
     global_state_dim = int(env_spec["global_state_dim"])
     attack_dim = int(env_spec["attack_dim"])
+    assigned_region_dim = int(env_spec.get("assigned_region_dim", 5))
     priority_map_dim = int(env_spec["priority_map_dim"])
     actor_hidden_dim = int(env_spec["actor_hidden_dim"])
     return {
@@ -460,6 +476,7 @@ def build_worker_buffer_shapes(rollout_steps: int, env_count: int, env_spec: dic
         "global_state": (rollout_steps, env_count, global_state_dim),
         "attack_masks": (rollout_steps, env_count, num_agents, attack_dim),
         "alive_mask": (rollout_steps, env_count, num_agents),
+        "assigned_region_obs": (rollout_steps, env_count, num_agents, assigned_region_dim),
         "priority_map_teacher": (rollout_steps, env_count, num_agents, priority_map_dim),
         "actor_h": (rollout_steps, env_count, num_agents, actor_hidden_dim),
         "course_action": (rollout_steps, env_count, num_agents),
@@ -565,6 +582,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                 disable_high_level_mode = bool(getattr(args, "disable_high_level_mode", False))
                 mode_interval = int(env_spec.get("mode_interval", 8))
                 attack_dim = int(env_spec["attack_dim"])
+                assigned_region_dim = int(env_spec.get("assigned_region_dim", 5))
                 priority_map_dim = int(env_spec["priority_map_dim"])
                 final_local_obs_dim = int(env_spec["local_obs_dim"])
                 local_screen_shape = tuple(env_spec["local_screen_shape"])
@@ -576,6 +594,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                 global_state_batch = np.empty((env_count, global_state_dim), dtype=np.float32)
                 attack_masks_batch = np.empty((env_count, num_agents, attack_dim), dtype=np.bool_)
                 alive_mask_batch = np.empty((env_count, num_agents), dtype=np.float32)
+                assigned_region_obs_batch = np.empty((env_count, num_agents, assigned_region_dim), dtype=np.float32)
                 priority_map_teacher_batch = np.empty((env_count, num_agents, priority_map_dim), dtype=np.float32)
                 rule_visible_target_ids_batch = np.zeros((env_count, num_agents, visible_target_slots), dtype=np.int64)
                 env_actions_batch = np.empty((env_count, num_agents, 2), dtype=np.int64)
@@ -598,6 +617,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                 global_state_tensor = torch.from_numpy(global_state_batch)
                 attack_masks_tensor = torch.from_numpy(attack_masks_batch)
                 alive_mask_tensor = torch.from_numpy(alive_mask_batch)
+                assigned_region_obs_tensor = torch.from_numpy(assigned_region_obs_batch)
                 rule_visible_target_ids_tensor = torch.from_numpy(rule_visible_target_ids_batch)
 
                 actor_h_batch = np.zeros((env_count, num_agents, actor_hidden_dim), dtype=np.float32)
@@ -617,6 +637,10 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                         global_state_batch[env_idx] = obs["global_state"]
                         attack_masks_batch[env_idx] = obs["attack_masks"]
                         alive_mask_batch[env_idx] = obs["alive_mask"]
+                        assigned_region_obs_batch[env_idx] = obs.get(
+                            "assigned_region_obs",
+                            np.zeros((num_agents, assigned_region_dim), dtype=np.float32),
+                        )
                         priority_map_teacher_batch[env_idx] = obs["priority_map_teacher"]
                         if visible_target_slots > 0:
                             rule_visible_target_ids_batch[env_idx] = obs.get(
@@ -689,6 +713,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                         "global_state": global_state_tensor,
                         "attack_masks": attack_masks_tensor,
                         "alive_mask": alive_mask_tensor,
+                        "assigned_region_obs": assigned_region_obs_tensor,
                         "rule_visible_target_ids": rule_visible_target_ids_tensor,
                         "actor_h": actor_h_tensor,
                         "mode_action": torch.from_numpy(mode_action_batch),
@@ -710,6 +735,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                     shared_views["global_state"][step_idx] = global_state_batch
                     shared_views["attack_masks"][step_idx] = attack_masks_batch.astype(np.uint8, copy=False)
                     shared_views["alive_mask"][step_idx] = alive_mask_batch
+                    shared_views["assigned_region_obs"][step_idx] = assigned_region_obs_batch
                     shared_views["priority_map_teacher"][step_idx] = priority_map_teacher_batch
                     shared_views["actor_h"][step_idx] = actor_h_batch
                     shared_views["course_action"][step_idx] = course_action_np

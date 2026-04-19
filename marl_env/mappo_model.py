@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -54,7 +53,11 @@ class TeamActorCritic(nn.Module):
         self.priority_grid_w = max(2, int(cfg.priority_grid_w))
         self.priority_grid_size = int(self.priority_grid_h * self.priority_grid_w)
         self.priority_top_k = max(1, min(int(cfg.priority_top_k), self.priority_grid_size))
-        self.priority_feature_dim = int(self.priority_top_k * 4 + 1)
+        # Keep feature dimensionality stable for checkpoint compatibility while
+        # promoting assigned-region context to the primary search signal.
+        self.assigned_feature_dim = 5
+        self.global_context_slots = max(int(self.priority_top_k) - 1, 0)
+        self.priority_feature_dim = int(self.assigned_feature_dim + self.global_context_slots * 4)
 
         centers = []
         for gy in range(self.priority_grid_h):
@@ -154,30 +157,60 @@ class TeamActorCritic(nn.Module):
         screen_features = self._screen_features(local_screen)
         return self._priority_logits_from_features(screen_features)
 
-    def _priority_features(self, priority_logits: torch.Tensor, local_obs: torch.Tensor) -> torch.Tensor:
+    def _priority_features(
+        self,
+        priority_logits: torch.Tensor,
+        local_obs: torch.Tensor,
+        assigned_region_obs: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         priority_probs = torch.softmax(priority_logits, dim=-1)
         top_values, top_indices = torch.topk(priority_probs, k=self.priority_top_k, dim=-1)
-        top_centers = self.priority_cell_centers[top_indices]
 
         if local_obs.shape[-1] >= 6:
             own_xy = torch.clamp(local_obs[:, 4:6], 0.0, 1.0)
         else:
             own_xy = torch.zeros((local_obs.shape[0], 2), dtype=local_obs.dtype, device=local_obs.device)
 
-        rel_xy = top_centers - own_xy.unsqueeze(1)
-        uncertainty_proxy = 1.0 - top_values
-        topk_struct = torch.cat(
-            [
-                rel_xy,
-                top_values.unsqueeze(-1),
-                uncertainty_proxy.unsqueeze(-1),
-            ],
-            dim=-1,
-        ).reshape(priority_logits.shape[0], -1)
+        if assigned_region_obs is None:
+            assigned = torch.zeros(
+                (priority_logits.shape[0], self.assigned_feature_dim),
+                dtype=priority_logits.dtype,
+                device=priority_logits.device,
+            )
+        else:
+            assigned = assigned_region_obs.to(dtype=priority_logits.dtype, device=priority_logits.device)
+            if assigned.shape[-1] < self.assigned_feature_dim:
+                pad = torch.zeros(
+                    (assigned.shape[0], self.assigned_feature_dim - assigned.shape[-1]),
+                    dtype=assigned.dtype,
+                    device=assigned.device,
+                )
+                assigned = torch.cat([assigned, pad], dim=-1)
+            else:
+                assigned = assigned[:, : self.assigned_feature_dim]
 
-        entropy = -(priority_probs * torch.log(torch.clamp(priority_probs, min=1e-8))).sum(dim=-1, keepdim=True)
-        entropy_norm = entropy / max(math.log(float(max(self.priority_grid_size, 2))), 1e-6)
-        return torch.cat([topk_struct, entropy_norm], dim=-1)
+        if self.global_context_slots > 0:
+            global_values = top_values[:, 1 : 1 + self.global_context_slots]
+            global_indices = top_indices[:, 1 : 1 + self.global_context_slots]
+            global_centers = self.priority_cell_centers[global_indices]
+            global_rel_xy = global_centers - own_xy.unsqueeze(1)
+            global_uncertainty = 1.0 - global_values
+            global_struct = torch.cat(
+                [
+                    global_rel_xy,
+                    global_values.unsqueeze(-1),
+                    global_uncertainty.unsqueeze(-1),
+                ],
+                dim=-1,
+            ).reshape(priority_logits.shape[0], -1)
+        else:
+            global_struct = torch.zeros(
+                (priority_logits.shape[0], 0),
+                dtype=priority_logits.dtype,
+                device=priority_logits.device,
+            )
+
+        return torch.cat([assigned, global_struct], dim=-1)
 
     def _course_context(self, course_logits: torch.Tensor, course_actions: Optional[torch.Tensor] = None):
         if course_actions is None:
@@ -230,11 +263,16 @@ class TeamActorCritic(nn.Module):
         actor_h: torch.Tensor,
         course_actions: Optional[torch.Tensor] = None,
         mode_actions: Optional[torch.Tensor] = None,
+        assigned_region_obs: Optional[torch.Tensor] = None,
     ):
         screen_features = self._screen_features(local_screen)
         screen_embed = self.screen_encoder(screen_features)
         priority_logits = self._priority_logits_from_features(screen_features)
-        priority_features = self._priority_features(priority_logits, local_obs)
+        priority_features = self._priority_features(
+            priority_logits,
+            local_obs,
+            assigned_region_obs=assigned_region_obs,
+        )
 
         x = torch.cat([local_obs, screen_embed, priority_features], dim=-1)
         x = self.actor_backbone(x)
