@@ -3,7 +3,7 @@ set -euo pipefail
 
 # One-click HMARL train launcher.
 # Usage:
-#   scripts/run_hmarl_train.sh [experiment_name] [teacher_ckpt] [resume] [resume_from] [agent_variant]
+#   scripts/run_hmarl_train.sh [experiment_name] [teacher_ckpt] [resume] [resume_from] [agent_variant] [extra_train_args...]
 #
 # resume_from:
 #   - number: target env_steps (e.g. 200000)
@@ -18,12 +18,16 @@ TEACHER_CKPT="${2:-}"
 RESUME_MODE="${3:-}"
 RESUME_FROM="${4:-}"
 AGENT_VARIANT="${5:-${HMARL_AGENT_VARIANT:-baseline}}"
+EXTRA_TRAIN_ARGS=()
+if [[ $# -ge 6 ]]; then
+  EXTRA_TRAIN_ARGS=("${@:6}")
+fi
 
 echo "[run_hmarl_train] experiment=${EXP_NAME} profile=conservative_stable agent_variant=${AGENT_VARIANT}"
 
 TRAIN_ARGS=(
   --experiment "${EXP_NAME}"
-  --train_for_env_steps 4000000
+  --train_for_env_steps 10000000
   --num_envs 12
   --num_workers 4
   --rollout 96
@@ -59,12 +63,12 @@ TRAIN_ARGS=(
   --curriculum_easy_opponent fix_rule_no_att
   --curriculum_medium_opponent fix_rule
   --curriculum_full_opponent fix_rule
-  --curriculum_easy_max_step 500
-  --curriculum_medium_max_step 800
-  --curriculum_full_max_step 1200
+  --curriculum_easy_max_step 1000
+  --curriculum_medium_max_step 1200
+  --curriculum_full_max_step 1500
   --curriculum_easy_random_pos false
   --curriculum_medium_random_pos false
-  --curriculum_full_random_pos true
+  --curriculum_full_random_pos false
   --eval_every_env_steps 100000
   --eval_episodes 30
   --save_every_sec 600
@@ -122,6 +126,11 @@ if [[ "${RESUME_MODE}" == "resume" ]]; then
       )
     fi
   fi
+fi
+
+if (( ${#EXTRA_TRAIN_ARGS[@]} > 0 )); then
+  echo "[run_hmarl_train] extra_train_args=${EXTRA_TRAIN_ARGS[*]}"
+  TRAIN_ARGS+=("${EXTRA_TRAIN_ARGS[@]}")
 fi
 
 conda run --no-capture-output -n maca-py37-min python scripts/train_mappo_maca.py \

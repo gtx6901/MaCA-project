@@ -16,8 +16,8 @@ from marl_env.mappo_model import MAPPOModelConfig, TeamActorCritic
 
 ROLLOUT_BUFFER_DTYPES = {
     "local_obs": np.float32,
+    "local_screen": np.uint8,
     "global_state": np.float32,
-    "agent_ids": np.int64,
     "attack_masks": np.uint8,
     "alive_mask": np.float32,
     "actor_h": np.float32,
@@ -33,6 +33,7 @@ ROLLOUT_BUFFER_DTYPES = {
     "reward_env": np.float32,
     "reward_mode": np.float32,
     "reward_exec": np.float32,
+    "reward_terminal": np.float32,
     "contact_signal": np.float32,
     "opportunity_signal": np.float32,
     "damage_reward": np.float32,
@@ -213,6 +214,9 @@ def build_env(args, seed_offset: int) -> MAPPOMaCAEnv:
             exec_reward_scale=args.maca_exec_reward_scale,
             disengage_penalty=args.maca_disengage_penalty,
             bearing_reward_scale=args.maca_bearing_reward_scale,
+            semantic_screen_downsample=args.maca_semantic_screen_downsample,
+            terminal_ammo_fail_penalty=args.maca_terminal_ammo_fail_penalty,
+            terminal_participation_penalty=args.maca_terminal_participation_penalty,
         )
     )
 
@@ -223,10 +227,10 @@ def sample_actions(model, batch, device, deterministic: bool = False, args=None)
     else:
         local_obs = torch.as_tensor(batch["local_obs"], dtype=torch.float32, device=device)
 
-    if torch.is_tensor(batch["agent_ids"]):
-        agent_ids = batch["agent_ids"].to(device=device, dtype=torch.long)
+    if torch.is_tensor(batch["local_screen"]):
+        local_screen = batch["local_screen"].to(device=device, dtype=torch.uint8)
     else:
-        agent_ids = torch.as_tensor(batch["agent_ids"], dtype=torch.long, device=device)
+        local_screen = torch.as_tensor(batch["local_screen"], dtype=torch.uint8, device=device)
 
     if torch.is_tensor(batch["attack_masks"]):
         attack_masks = batch["attack_masks"].to(device=device, dtype=torch.bool)
@@ -239,7 +243,12 @@ def sample_actions(model, batch, device, deterministic: bool = False, args=None)
         actor_h = torch.as_tensor(batch["actor_h"], dtype=torch.float32, device=device)
 
     flat_local = local_obs.reshape(-1, local_obs.shape[-1])
-    flat_ids = agent_ids.reshape(-1)
+    flat_screen = local_screen.reshape(
+        local_screen.shape[0] * local_screen.shape[1],
+        local_screen.shape[2],
+        local_screen.shape[3],
+        local_screen.shape[4],
+    )
     flat_attack_masks = attack_masks.reshape(-1, attack_masks.shape[-1])
     flat_attack_masks = ensure_valid_action_mask(flat_attack_masks)
     flat_attack_masks_np = flat_attack_masks.cpu().numpy().astype(np.bool_, copy=False)
@@ -269,7 +278,7 @@ def sample_actions(model, batch, device, deterministic: bool = False, args=None)
 
     course_logits, _attack_logits_unused, next_actor_h = model.actor_step(
         flat_local,
-        flat_ids,
+        flat_screen,
         flat_actor_h,
         mode_actions=mode_actions,
     )
@@ -415,13 +424,16 @@ def shared_ndarray_view(raw, shape, dtype):
 def build_worker_buffer_shapes(rollout_steps: int, env_count: int, env_spec: dict):
     num_agents = int(env_spec["num_agents"])
     local_obs_dim = int(env_spec["local_obs_dim"])
+    local_screen_h = int(env_spec["local_screen_shape"][0])
+    local_screen_w = int(env_spec["local_screen_shape"][1])
+    local_screen_c = int(env_spec["local_screen_shape"][2])
     global_state_dim = int(env_spec["global_state_dim"])
     attack_dim = int(env_spec["attack_dim"])
     actor_hidden_dim = int(env_spec["actor_hidden_dim"])
     return {
         "local_obs": (rollout_steps, env_count, num_agents, local_obs_dim),
+        "local_screen": (rollout_steps, env_count, num_agents, local_screen_h, local_screen_w, local_screen_c),
         "global_state": (rollout_steps, env_count, global_state_dim),
-        "agent_ids": (rollout_steps, env_count, num_agents),
         "attack_masks": (rollout_steps, env_count, num_agents, attack_dim),
         "alive_mask": (rollout_steps, env_count, num_agents),
         "actor_h": (rollout_steps, env_count, num_agents, actor_hidden_dim),
@@ -437,6 +449,7 @@ def build_worker_buffer_shapes(rollout_steps: int, env_count: int, env_spec: dic
         "reward_env": (rollout_steps, env_count),
         "reward_mode": (rollout_steps, env_count),
         "reward_exec": (rollout_steps, env_count),
+        "reward_terminal": (rollout_steps, env_count),
         "contact_signal": (rollout_steps, env_count),
         "opportunity_signal": (rollout_steps, env_count),
         "damage_reward": (rollout_steps, env_count),
@@ -498,15 +511,17 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
 
                 if worker_model is None:
                     local_obs_dim = int(env_spec["local_obs_dim"])
+                    local_screen_shape = tuple(env_spec["local_screen_shape"])
                     global_state_dim = obs_batch[0]["global_state"].shape[0]
                     num_agents = obs_batch[0]["local_obs"].shape[0]
                     worker_model = TeamActorCritic(
                         MAPPOModelConfig(
                             local_obs_dim=local_obs_dim,
+                            local_screen_shape=local_screen_shape,
                             global_state_dim=global_state_dim,
                             num_agents=num_agents,
                             hidden_size=args.hidden_size,
-                            role_embed_dim=args.role_embed_dim,
+                            screen_embed_dim=args.screen_embed_dim,
                             course_embed_dim=args.course_embed_dim,
                         )
                     )
@@ -519,22 +534,19 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
 
                 actor_hidden_dim = worker_model.actor_hidden_dim
                 num_agents = int(env_spec["num_agents"])
-                use_obs_id_onehot = bool(env_spec.get("use_obs_id_onehot", False))
                 disable_high_level_mode = bool(getattr(args, "disable_high_level_mode", False))
                 mode_interval = int(env_spec.get("mode_interval", 8))
                 attack_dim = int(env_spec["attack_dim"])
                 final_local_obs_dim = int(env_spec["local_obs_dim"])
-                base_local_obs_dim = int(obs_batch[0]["local_obs"].shape[1])
+                local_screen_shape = tuple(env_spec["local_screen_shape"])
                 global_state_dim = int(obs_batch[0]["global_state"].shape[0])
                 visible_target_slots = int(obs_batch[0].get("rule_visible_target_ids", np.zeros((num_agents, 0))).shape[1])
-                agent_id_eye = np.eye(num_agents, dtype=np.float32)
 
-                raw_local_obs_batch = np.empty((env_count, num_agents, base_local_obs_dim), dtype=np.float32)
                 local_obs_batch = np.empty((env_count, num_agents, final_local_obs_dim), dtype=np.float32)
+                local_screen_batch = np.empty((env_count, num_agents) + local_screen_shape, dtype=np.uint8)
                 global_state_batch = np.empty((env_count, global_state_dim), dtype=np.float32)
                 attack_masks_batch = np.empty((env_count, num_agents, attack_dim), dtype=np.bool_)
                 alive_mask_batch = np.empty((env_count, num_agents), dtype=np.float32)
-                agent_ids_batch = np.empty((env_count, num_agents), dtype=np.int64)
                 rule_visible_target_ids_batch = np.zeros((env_count, num_agents, visible_target_slots), dtype=np.int64)
                 env_actions_batch = np.empty((env_count, num_agents, 2), dtype=np.int64)
 
@@ -542,6 +554,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                 rewards_env = np.zeros((env_count,), dtype=np.float32)
                 rewards_mode = np.zeros((env_count,), dtype=np.float32)
                 rewards_exec = np.zeros((env_count,), dtype=np.float32)
+                rewards_terminal = np.zeros((env_count,), dtype=np.float32)
                 contact_signals = np.zeros((env_count,), dtype=np.float32)
                 opportunity_signals = np.zeros((env_count,), dtype=np.float32)
                 damage_rewards = np.zeros((env_count,), dtype=np.float32)
@@ -551,10 +564,10 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                 dones = np.zeros((env_count,), dtype=np.float32)
                 aux_rewards = np.zeros((env_count, num_agents), dtype=np.float32)
                 local_obs_tensor = torch.from_numpy(local_obs_batch)
+                local_screen_tensor = torch.from_numpy(local_screen_batch)
                 global_state_tensor = torch.from_numpy(global_state_batch)
                 attack_masks_tensor = torch.from_numpy(attack_masks_batch)
                 alive_mask_tensor = torch.from_numpy(alive_mask_batch)
-                agent_ids_tensor = torch.from_numpy(agent_ids_batch)
                 rule_visible_target_ids_tensor = torch.from_numpy(rule_visible_target_ids_batch)
 
                 actor_h_batch = np.zeros((env_count, num_agents, actor_hidden_dim), dtype=np.float32)
@@ -569,22 +582,16 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
 
                 for step_idx in range(rollout_steps):
                     for env_idx, obs in enumerate(obs_batch):
-                        raw_local_obs_batch[env_idx] = obs["local_obs"]
+                        local_obs_batch[env_idx] = obs["local_obs"]
+                        local_screen_batch[env_idx] = obs["local_screen"]
                         global_state_batch[env_idx] = obs["global_state"]
                         attack_masks_batch[env_idx] = obs["attack_masks"]
                         alive_mask_batch[env_idx] = obs["alive_mask"]
-                        agent_ids_batch[env_idx] = obs["agent_ids"]
                         if visible_target_slots > 0:
                             rule_visible_target_ids_batch[env_idx] = obs.get(
                                 "rule_visible_target_ids",
                                 np.zeros((num_agents, visible_target_slots), dtype=np.int64),
                             )
-
-                    if use_obs_id_onehot:
-                        local_obs_batch[:, :, :base_local_obs_dim] = raw_local_obs_batch
-                        local_obs_batch[:, :, base_local_obs_dim:] = agent_id_eye[agent_ids_batch]
-                    else:
-                        local_obs_batch[:] = raw_local_obs_batch
 
                     alive_bool = alive_mask_batch > 0.5
                     alive_count = np.maximum(np.sum(alive_bool, axis=1), 1)
@@ -647,10 +654,10 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
 
                     stacked = {
                         "local_obs": local_obs_tensor,
+                        "local_screen": local_screen_tensor,
                         "global_state": global_state_tensor,
                         "attack_masks": attack_masks_tensor,
                         "alive_mask": alive_mask_tensor,
-                        "agent_ids": agent_ids_tensor,
                         "rule_visible_target_ids": rule_visible_target_ids_tensor,
                         "actor_h": actor_h_tensor,
                         "mode_action": torch.from_numpy(mode_action_batch),
@@ -668,10 +675,10 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                     env_actions_batch[:, :, 1] = attack_action_np
 
                     shared_views["local_obs"][step_idx] = local_obs_batch
+                    shared_views["local_screen"][step_idx] = local_screen_batch
                     shared_views["global_state"][step_idx] = global_state_batch
                     shared_views["attack_masks"][step_idx] = attack_masks_batch.astype(np.uint8, copy=False)
                     shared_views["alive_mask"][step_idx] = alive_mask_batch
-                    shared_views["agent_ids"][step_idx] = agent_ids_batch
                     shared_views["actor_h"][step_idx] = actor_h_batch
                     shared_views["course_action"][step_idx] = course_action_np
                     shared_views["attack_action"][step_idx] = attack_action_np
@@ -687,6 +694,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                     rewards_env.fill(0.0)
                     rewards_mode.fill(0.0)
                     rewards_exec.fill(0.0)
+                    rewards_terminal.fill(0.0)
                     damage_rewards.fill(0.0)
                     kill_rewards.fill(0.0)
                     survival_rewards.fill(0.0)
@@ -700,6 +708,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                         rewards_env[env_idx] = float(info.get("reward_env", 0.0))
                         rewards_mode[env_idx] = float(info.get("reward_mode", 0.0))
                         rewards_exec[env_idx] = float(info.get("reward_exec", 0.0))
+                        rewards_terminal[env_idx] = float(info.get("reward_terminal", 0.0))
                         damage_rewards[env_idx] = float(info.get("damage_reward", 0.0))
                         kill_rewards[env_idx] = float(info.get("kill_reward", 0.0))
                         survival_rewards[env_idx] = float(info.get("survival_reward", 0.0))
@@ -721,6 +730,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                     shared_views["reward_env"][step_idx] = rewards_env
                     shared_views["reward_mode"][step_idx] = rewards_mode
                     shared_views["reward_exec"][step_idx] = rewards_exec
+                    shared_views["reward_terminal"][step_idx] = rewards_terminal
                     shared_views["contact_signal"][step_idx] = contact_signals
                     shared_views["opportunity_signal"][step_idx] = opportunity_signals
                     shared_views["damage_reward"][step_idx] = damage_rewards

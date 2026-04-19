@@ -90,8 +90,8 @@ def parse_args(argv=None):
     parser.add_argument("--imitation_warmup_updates", type=int, default=0)
 
     parser.add_argument("--hidden_size", type=int, default=256)
-    parser.add_argument("--role_embed_dim", type=int, default=8)
     parser.add_argument("--course_embed_dim", type=int, default=16)
+    parser.add_argument("--screen_embed_dim", type=int, default=64)
 
     parser.add_argument("--save_every_sec", type=int, default=900)
     parser.add_argument("--log_every_sec", type=int, default=30)
@@ -102,9 +102,11 @@ def parse_args(argv=None):
     parser.add_argument("--eval_every_env_steps", type=int, default=1_000_000)
     parser.add_argument("--eval_episodes", type=int, default=20)
     parser.add_argument("--eval_deterministic", type=str2bool, default=True)
+    parser.add_argument("--eval_maca_render", type=str2bool, default=True)
     parser.add_argument("--eval_opponent", type=str, default=None)
     parser.add_argument("--save_best_checkpoint", type=str2bool, default=True)
     parser.add_argument("--best_checkpoint_source", type=str, default="eval_then_train")
+    parser.add_argument("--best_metric_name", type=str, default="total_win_rate")
     parser.add_argument("--debug_freeze_update_after_env_steps", type=int, default=-1)
     parser.add_argument("--freeze_value_normalizer_after_env_steps", type=int, default=-1)
 
@@ -135,8 +137,9 @@ def parse_args(argv=None):
     parser.add_argument("--maca_exec_reward_scale", type=float, default=0.2)
     parser.add_argument("--maca_disengage_penalty", type=float, default=0.05)
     parser.add_argument("--maca_bearing_reward_scale", type=float, default=0.05)
-
-    parser.add_argument("--concat_agent_id_onehot", type=str2bool, default=True)
+    parser.add_argument("--maca_semantic_screen_downsample", type=int, default=4)
+    parser.add_argument("--maca_terminal_ammo_fail_penalty", type=float, default=80.0)
+    parser.add_argument("--maca_terminal_participation_penalty", type=float, default=40.0)
 
     parser.add_argument("--curriculum_enabled", type=str2bool, default=False)
     parser.add_argument("--curriculum_easy_frac", type=float, default=0.3)
@@ -182,6 +185,10 @@ def parse_args(argv=None):
         raise ValueError("attack_policy_mode must be one of: full_discrete, fire_or_not")
     if float(args.aux_value_loss_coeff) < 0.0:
         raise ValueError("aux_value_loss_coeff must be >= 0")
+    if str(args.best_metric_name).lower() not in {"total_win_rate", "win_rate", "blue_alive_zero_rate"}:
+        raise ValueError("best_metric_name must be one of: total_win_rate, win_rate, blue_alive_zero_rate")
+    if int(args.maca_semantic_screen_downsample) <= 0:
+        raise ValueError("maca_semantic_screen_downsample must be > 0")
     return args
 
 
@@ -304,6 +311,21 @@ def set_optimizer_lr(optimizer, lr: float) -> None:
         group["lr"] = float(lr)
 
 
+def resolve_metric(summary: dict, metric_name: str) -> float:
+    key = str(metric_name).strip()
+    aliases = {
+        "win_rate": ["win_rate", "win_flag_mean"],
+        "total_win_rate": ["total_win_rate", "total_win_flag_mean"],
+        "blue_alive_zero_rate": ["blue_alive_zero_rate", "blue_alive_zero_flag_mean"],
+    }
+    for candidate in aliases.get(key, [key]):
+        if candidate in summary:
+            value = float(summary.get(candidate, float("nan")))
+            if np.isfinite(value):
+                return value
+    return float("-inf")
+
+
 def frozen_update_stats(returns: np.ndarray, values: np.ndarray, value_normalizer: ValueNormalizer):
     returns_np = np.asarray(returns, dtype=np.float32)
     values_np = np.asarray(values, dtype=np.float32)
@@ -357,30 +379,32 @@ def main(argv=None):
     try:
         initial_obs = probe_env.reset(seed=args.seed)
         base_local_obs_dim = initial_obs["local_obs"].shape[1]
+        local_screen_shape = tuple(initial_obs["local_screen"].shape[1:])
         global_state_dim = initial_obs["global_state"].shape[0]
         num_agents = initial_obs["local_obs"].shape[0]
         attack_dim = initial_obs["attack_masks"].shape[1]
     finally:
         probe_env.close()
 
-    local_obs_dim = int(base_local_obs_dim + (num_agents if args.concat_agent_id_onehot else 0))
+    local_obs_dim = int(base_local_obs_dim)
 
     env_spec = {
         "local_obs_dim": int(local_obs_dim),
+        "local_screen_shape": tuple(local_screen_shape),
         "global_state_dim": int(global_state_dim),
         "num_agents": int(num_agents),
         "attack_dim": int(attack_dim),
         "actor_hidden_dim": int(args.hidden_size),
-        "use_obs_id_onehot": bool(args.concat_agent_id_onehot),
         "mode_interval": int(args.mode_interval),
     }
 
     model_cfg = MAPPOModelConfig(
         local_obs_dim=local_obs_dim,
+        local_screen_shape=tuple(local_screen_shape),
         global_state_dim=global_state_dim,
         num_agents=num_agents,
         hidden_size=args.hidden_size,
-        role_embed_dim=args.role_embed_dim,
+        screen_embed_dim=args.screen_embed_dim,
         course_embed_dim=args.course_embed_dim,
     )
     model = TeamActorCritic(model_cfg).to(device)
@@ -405,14 +429,13 @@ def main(argv=None):
 
     save_config(args, local_obs_dim, global_state_dim, num_agents, collectors.worker_env_counts)
     print(
-        "[collector] num_workers=%d num_envs=%d worker_env_counts=%s obs_id_onehot=%s base_obs_dim=%d final_obs_dim=%d curriculum_stage=%s attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%s"
+        "[collector] num_workers=%d num_envs=%d worker_env_counts=%s base_obs_dim=%d local_screen_shape=%s curriculum_stage=%s attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%s"
         % (
             collectors.num_workers,
             collectors.num_envs,
             collectors.worker_env_counts,
-            str(bool(args.concat_agent_id_onehot)),
             int(base_local_obs_dim),
-            int(local_obs_dim),
+            str(tuple(local_screen_shape)),
             str(getattr(args, "runtime_curriculum_name", "full")),
             str(args.attack_rule_mode),
             str(args.attack_policy_mode),
@@ -423,7 +446,7 @@ def main(argv=None):
 
     writer = build_summary_writer(args, purge_step=env_steps if args.resume else None)
 
-    best_metric_name = "win_rate"
+    best_metric_name = str(args.best_metric_name)
     best_metric = load_best_metric(args, metric_name=best_metric_name) if bool(args.save_best_checkpoint) else float("-inf")
     if bool(args.save_best_checkpoint):
         print("[checkpoint] best metric init %s=%.4f" % (best_metric_name, float(best_metric)), flush=True)
@@ -581,6 +604,9 @@ def main(argv=None):
                 summary = summarize_episode_stats(list(episode_stats))
                 reward_mean = summary.get("round_reward_mean", 0.0)
                 win_rate = summary.get("win_rate", 0.0)
+                stats["total_win_rate"] = float(summary.get("total_win_rate", 0.0))
+                stats["blue_alive_zero_rate"] = float(summary.get("blue_alive_zero_rate", 0.0))
+                stats["timeout_rate"] = float(summary.get("timeout_rate", 0.0))
                 damage_reward_mean = float(rollout_diag.get("damage_reward_mean", 0.0))
                 log_summary(writer, "train_episode", summary, env_steps)
                 log_train_scalars(
@@ -591,7 +617,6 @@ def main(argv=None):
                     action_stats=action_stats,
                     sample_fps=sample_fps,
                     timing_stats=timing_stats,
-                    concat_agent_id_onehot=bool(args.concat_agent_id_onehot),
                     stage_id=int(getattr(args, "runtime_curriculum_id", 3)),
                     current_lr=current_lr,
                     reward_mean=reward_mean,
@@ -601,13 +626,16 @@ def main(argv=None):
                     disable_high_level_mode=bool(args.disable_high_level_mode),
                 )
                 print(
-                    "[train] env_steps=%d update=%d stage=%s reward_mean=%.2f win_rate=%.3f fps=%.1f lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d policy=%.4f low=%.4f high=%.4f value_loss=%.4f v_team=%.4f v_aux=%.4f entropy=%.4f imitation=%.4f coef=%.4f ev=%.4f actor_gn=%.4f critic_gn=%.4f active=%.3f skipped_nf=%d repaired_nf=%d hidden_err=%.6f rnn_mismatch=%d grad_steps=%d"
+                    "[train] env_steps=%d update=%d stage=%s reward_mean=%.2f win_rate=%.3f total_win_rate=%.3f blue_alive_zero_rate=%.3f timeout_rate=%.3f fps=%.1f lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d policy=%.4f low=%.4f high=%.4f value_loss=%.4f v_team=%.4f v_aux=%.4f entropy=%.4f imitation=%.4f coef=%.4f ev=%.4f actor_gn=%.4f critic_gn=%.4f active=%.3f skipped_nf=%d repaired_nf=%d hidden_err=%.6f rnn_mismatch=%d grad_steps=%d"
                     % (
                         env_steps,
                         update_idx,
                         str(getattr(args, "runtime_curriculum_name", "full")),
                         reward_mean,
                         win_rate,
+                        stats.get("total_win_rate", 0.0),
+                        stats.get("blue_alive_zero_rate", 0.0),
+                        stats.get("timeout_rate", 0.0),
                         sample_fps,
                         current_lr,
                         str(args.attack_rule_mode),
@@ -635,7 +663,7 @@ def main(argv=None):
                     flush=True,
                 )
                 print(
-                    "[stability] env_steps=%d update=%d lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d actor_gn=%.4f critic_gn=%.4f value_loss=%.4f v_team=%.4f v_contact=%.4f v_opp=%.4f v_surv=%.4f aux_v_coef=%.3f aux_v_off=%d policy_loss=%.4f entropy=%.4f value_target_std=%.4f value_target_norm_std=%.4f value_norm_std=%.4f value_norm_updated=%d active_mask_ratio=%.4f reward_mean=%.2f win_rate=%.3f damage_reward_mean=%.4f attack_opportunity_frac=%.4f executed_fire_action_frac=%.4f no_fire_when_legal_frac=%.4f opportunity_to_fire_ratio=%.4f fire_decision_freq_00=%.4f fire_decision_freq_01=%.4f rule_selected_attack_nonzero_freq=%.4f freeze_update=%d"
+                    "[stability] env_steps=%d update=%d lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d actor_gn=%.4f critic_gn=%.4f value_loss=%.4f v_team=%.4f v_contact=%.4f v_opp=%.4f v_surv=%.4f aux_v_coef=%.3f aux_v_off=%d policy_loss=%.4f entropy=%.4f value_target_std=%.4f value_target_norm_std=%.4f value_norm_std=%.4f value_norm_updated=%d active_mask_ratio=%.4f reward_mean=%.2f win_rate=%.3f total_win_rate=%.3f blue_alive_zero_rate=%.3f timeout_rate=%.3f damage_reward_mean=%.4f attack_opportunity_frac=%.4f executed_fire_action_frac=%.4f no_fire_when_legal_frac=%.4f opportunity_to_fire_ratio=%.4f fire_decision_freq_00=%.4f fire_decision_freq_01=%.4f rule_selected_attack_nonzero_freq=%.4f freeze_update=%d"
                     % (
                         env_steps,
                         update_idx,
@@ -661,6 +689,9 @@ def main(argv=None):
                         stats.get("active_mask_ratio", 0.0),
                         reward_mean,
                         win_rate,
+                        stats.get("total_win_rate", 0.0),
+                        stats.get("blue_alive_zero_rate", 0.0),
+                        stats.get("timeout_rate", 0.0),
                         damage_reward_mean,
                         action_stats.get("attack_opportunity_frac", 0.0),
                         action_stats.get("executed_fire_action_frac", 0.0),
@@ -678,7 +709,7 @@ def main(argv=None):
                     "train",
                     "eval_then_train",
                 }:
-                    train_metric = float(win_rate)
+                    train_metric = resolve_metric(summary, best_metric_name)
                     if np.isfinite(train_metric) and train_metric > float(best_metric):
                         if save_best_checkpoint(
                             args,
@@ -706,10 +737,13 @@ def main(argv=None):
                     writer.add_scalar("eval/eval_wall_time_sec", float(payload["eval_wall_time_sec"]), env_steps)
                     writer.flush()
                 print(
-                    "[eval] env_steps=%d win_rate=%.3f destroy_balance=%.3f red_down=%.3f blue_down=%.3f saved=%s"
+                    "[eval] env_steps=%d win_rate=%.3f total_win_rate=%.3f blue_alive_zero_rate=%.3f timeout_rate=%.3f destroy_balance=%.3f red_down=%.3f blue_down=%.3f saved=%s"
                     % (
                         env_steps,
                         float(eval_summary.get("win_rate", 0.0)),
+                        float(eval_summary.get("total_win_rate", 0.0)),
+                        float(eval_summary.get("blue_alive_zero_rate", 0.0)),
+                        float(eval_summary.get("timeout_rate", 0.0)),
                         float(eval_summary.get("fighter_destroy_balance_end_mean", 0.0)),
                         float(eval_summary.get("red_fighter_destroyed_end_mean", 0.0)),
                         float(eval_summary.get("blue_fighter_destroyed_end_mean", 0.0)),
@@ -721,7 +755,7 @@ def main(argv=None):
                     "eval",
                     "eval_then_train",
                 }:
-                    eval_metric = float(eval_summary.get("win_rate", 0.0))
+                    eval_metric = resolve_metric(eval_summary, best_metric_name)
                     if np.isfinite(eval_metric) and eval_metric > float(best_metric):
                         if save_best_checkpoint(
                             args,

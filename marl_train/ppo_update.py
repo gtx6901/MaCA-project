@@ -110,8 +110,8 @@ def pack_recurrent_minibatch(
     chunk_indices,
     chunks,
     local_obs,
+    local_screen,
     global_state,
-    agent_ids,
     attack_masks,
     alive_mask,
     actor_h,
@@ -135,6 +135,9 @@ def pack_recurrent_minibatch(
     batch_size = len(chunk_indices)
     hidden_dim = actor_h.shape[-1]
     obs_dim = local_obs.shape[-1]
+    screen_h = local_screen.shape[-3]
+    screen_w = local_screen.shape[-2]
+    screen_c = local_screen.shape[-1]
     global_dim = global_state.shape[-1]
     attack_dim = attack_masks.shape[-1]
 
@@ -150,8 +153,8 @@ def pack_recurrent_minibatch(
         max_total_len = max(max_total_len, total_len)
 
     local_batch = local_obs.new_zeros((max_total_len, batch_size, obs_dim))
+    local_screen_batch = local_screen.new_zeros((max_total_len, batch_size, screen_h, screen_w, screen_c))
     global_batch = global_state.new_zeros((max_total_len, batch_size, global_dim))
-    agent_id_batch = agent_ids.new_zeros((max_total_len, batch_size))
     attack_mask_batch = attack_masks.new_zeros((max_total_len, batch_size, attack_dim))
     actor_h_batch = actor_h.new_zeros((max_total_len, batch_size, hidden_dim))
     course_batch = course_action.new_zeros((max_total_len, batch_size))
@@ -184,8 +187,8 @@ def pack_recurrent_minibatch(
         seq_valid_mask[:total_len, batch_col] = True
 
         local_batch[:total_len, batch_col] = local_obs[burn_start:end, env_idx, agent_idx]
+        local_screen_batch[:total_len, batch_col] = local_screen[burn_start:end, env_idx, agent_idx]
         global_batch[:total_len, batch_col] = global_state[burn_start:end, env_idx]
-        agent_id_batch[:total_len, batch_col] = agent_ids[burn_start:end, env_idx, agent_idx]
         attack_mask_batch[:total_len, batch_col] = attack_masks[burn_start:end, env_idx, agent_idx]
         actor_h_batch[:total_len, batch_col] = actor_h[burn_start:end, env_idx, agent_idx]
         course_batch[:total_len, batch_col] = course_action[burn_start:end, env_idx, agent_idx]
@@ -211,8 +214,8 @@ def pack_recurrent_minibatch(
     return {
         "init_h": init_h.detach(),
         "local_obs": local_batch,
+        "local_screen": local_screen_batch,
         "global_state": global_batch,
-        "agent_ids": agent_id_batch,
         "attack_masks": attack_mask_batch,
         "actor_h": actor_h_batch,
         "course_action": course_batch,
@@ -251,8 +254,8 @@ def ppo_update(
     update_idx: int = 0,
 ):
     local_obs = torch.as_tensor(buffer["local_obs"], dtype=torch.float32, device=device)
+    local_screen = torch.as_tensor(buffer["local_screen"], dtype=torch.uint8, device=device)
     global_state = torch.as_tensor(buffer["global_state"], dtype=torch.float32, device=device)
-    agent_ids = torch.as_tensor(buffer["agent_ids"], dtype=torch.long, device=device)
     attack_masks = torch.as_tensor(buffer["attack_masks"], dtype=torch.bool, device=device)
     alive_mask = torch.as_tensor(buffer["alive_mask"], dtype=torch.float32, device=device)
     actor_h = torch.as_tensor(buffer["actor_h"], dtype=torch.float32, device=device)
@@ -366,8 +369,8 @@ def ppo_update(
                 mini_batch_indices,
                 chunks,
                 local_obs,
+                local_screen,
                 global_state,
-                agent_ids,
                 attack_masks,
                 alive_mask,
                 actor_h,
@@ -451,14 +454,14 @@ def ppo_update(
                     continue
 
                 seq_local = packed["local_obs"][seq_idx, seq_valid]
-                seq_ids = packed["agent_ids"][seq_idx, seq_valid]
+                seq_screen = packed["local_screen"][seq_idx, seq_valid]
                 seq_h = h[seq_valid]
                 seq_course = packed["course_action"][seq_idx, seq_valid]
                 seq_mode = packed["mode_action"][seq_idx, seq_valid]
 
                 course_logits, attack_logits, next_h_valid = model.actor_step(
                     seq_local,
-                    seq_ids,
+                    seq_screen,
                     seq_h,
                     course_actions=seq_course,
                     mode_actions=seq_mode,
@@ -518,7 +521,7 @@ def ppo_update(
                         with torch.no_grad():
                             teacher_course_logits, teacher_attack_logits, _teacher_next_h = teacher_model.actor_step(
                                 seq_local,
-                                seq_ids,
+                                seq_screen,
                                 seq_h.detach(),
                                 course_actions=packed["course_action"][seq_idx, seq_valid],
                                 mode_actions=packed["mode_action"][seq_idx, seq_valid],

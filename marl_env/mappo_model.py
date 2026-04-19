@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -12,13 +12,14 @@ from torch import nn
 @dataclass
 class MAPPOModelConfig:
     local_obs_dim: int
+    local_screen_shape: Tuple[int, int, int]
     global_state_dim: int
     num_agents: int
     hidden_size: int = 256
     mode_dim: int = 4
     mode_embed_dim: int = 8
-    role_embed_dim: int = 8
     course_embed_dim: int = 16
+    screen_embed_dim: int = 64
     course_dim: int = 16
     attack_dim: int = 21
 
@@ -37,11 +38,29 @@ class TeamActorCritic(nn.Module):
     def __init__(self, cfg: MAPPOModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.role_embedding = nn.Embedding(cfg.num_agents, cfg.role_embed_dim)
         self.mode_embedding = nn.Embedding(cfg.mode_dim, cfg.mode_embed_dim)
 
+        if len(cfg.local_screen_shape) != 3:
+            raise ValueError("local_screen_shape must be (H, W, C)")
+        screen_h, screen_w, screen_c = cfg.local_screen_shape
+        if min(int(screen_h), int(screen_w), int(screen_c)) <= 0:
+            raise ValueError("local_screen_shape entries must be positive")
+
+        self.screen_encoder = nn.Sequential(
+            nn.Conv2d(int(screen_c), 16, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(32, cfg.screen_embed_dim),
+            nn.ReLU(),
+        )
+
         self.actor_backbone = nn.Sequential(
-            nn.Linear(cfg.local_obs_dim + cfg.role_embed_dim, cfg.hidden_size),
+            nn.Linear(cfg.local_obs_dim + cfg.screen_embed_dim, cfg.hidden_size),
             nn.ReLU(),
             nn.Linear(cfg.hidden_size, cfg.hidden_size),
             nn.ReLU(),
@@ -84,6 +103,16 @@ class TeamActorCritic(nn.Module):
     @property
     def actor_hidden_dim(self) -> int:
         return int(self.cfg.hidden_size)
+
+    def _encode_screen(self, local_screen: torch.Tensor) -> torch.Tensor:
+        # local_screen: [N, H, W, C] uint8/float32
+        if local_screen.dim() != 4:
+            raise ValueError("Expected local_screen rank 4 [N,H,W,C], got %d" % local_screen.dim())
+        x = local_screen.to(dtype=torch.float32)
+        if torch.max(x) > 1.0:
+            x = x / 255.0
+        x = x.permute(0, 3, 1, 2).contiguous()
+        return self.screen_encoder(x)
 
     def _course_context(self, course_logits: torch.Tensor, course_actions: Optional[torch.Tensor] = None):
         if course_actions is None:
@@ -132,13 +161,13 @@ class TeamActorCritic(nn.Module):
     def actor_step(
         self,
         local_obs: torch.Tensor,
-        agent_ids: torch.Tensor,
+        local_screen: torch.Tensor,
         actor_h: torch.Tensor,
         course_actions: Optional[torch.Tensor] = None,
         mode_actions: Optional[torch.Tensor] = None,
     ):
-        role_embed = self.role_embedding(agent_ids)
-        x = torch.cat([local_obs, role_embed], dim=-1)
+        screen_embed = self._encode_screen(local_screen)
+        x = torch.cat([local_obs, screen_embed], dim=-1)
         x = self.actor_backbone(x)
         next_h = self.actor_rnn(x, actor_h)
 
@@ -155,13 +184,13 @@ class TeamActorCritic(nn.Module):
         # Return recurrent hidden state for temporal credit assignment.
         return course_logits, attack_logits, next_h
 
-    def actor(self, local_obs: torch.Tensor, agent_ids: torch.Tensor):
+    def actor(self, local_obs: torch.Tensor, local_screen: torch.Tensor):
         actor_h = torch.zeros(
             (local_obs.shape[0], self.actor_hidden_dim),
             dtype=local_obs.dtype,
             device=local_obs.device,
         )
-        course_logits, attack_logits, _ = self.actor_step(local_obs, agent_ids, actor_h)
+        course_logits, attack_logits, _ = self.actor_step(local_obs, local_screen, actor_h)
         return course_logits, attack_logits
 
     def _critic_mode_context(

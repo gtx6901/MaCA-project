@@ -35,18 +35,13 @@ def parse_args(argv=None):
     parser.add_argument("--progress", type=str, default="True")
     parser.add_argument("--deterministic", type=str, default="True")
     parser.add_argument("--maca_opponent", type=str, default=None)
-    parser.add_argument("--maca_render", type=str, default="False")
+    parser.add_argument("--maca_render", type=str, default="True")
     parser.add_argument("--seed", type=int, default=1)
     return parser.parse_args(argv)
 
 
 def str2bool(value: str) -> bool:
     return str(value).strip().lower() not in {"0", "false", "no", "off"}
-
-
-def append_agent_id_onehot(local_obs: np.ndarray, agent_ids: np.ndarray, num_agents: int) -> np.ndarray:
-    one_hot = np.eye(num_agents, dtype=np.float32)[agent_ids]
-    return np.concatenate([local_obs.astype(np.float32, copy=False), one_hot], axis=-1)
 
 
 def ensure_valid_action_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -89,6 +84,12 @@ def summarize_episode_stats(episodes):
             summary[summary_key] = float(np.mean(values))
     if "win_flag_mean" in summary:
         summary["win_rate"] = summary["win_flag_mean"]
+    if "total_win_flag_mean" in summary:
+        summary["total_win_rate"] = summary["total_win_flag_mean"]
+    if "blue_alive_zero_flag_mean" in summary:
+        summary["blue_alive_zero_rate"] = summary["blue_alive_zero_flag_mean"]
+    if "timeout_flag_mean" in summary:
+        summary["timeout_rate"] = summary["timeout_flag_mean"]
     return summary
 
 
@@ -126,22 +127,24 @@ def build_env(train_cfg: dict, args) -> MAPPOMaCAEnv:
             exec_reward_scale=float(train_cfg.get("maca_exec_reward_scale", 0.2)),
             disengage_penalty=float(train_cfg.get("maca_disengage_penalty", 0.05)),
             bearing_reward_scale=float(train_cfg.get("maca_bearing_reward_scale", 0.05)),
+            semantic_screen_downsample=int(train_cfg.get("maca_semantic_screen_downsample", 4)),
+            terminal_ammo_fail_penalty=float(train_cfg.get("maca_terminal_ammo_fail_penalty", 80.0)),
+            terminal_participation_penalty=float(train_cfg.get("maca_terminal_participation_penalty", 40.0)),
         )
     )
 
 
-def select_actions(model, obs, actor_h, device, deterministic: bool, concat_agent_id_onehot: bool, num_agents: int):
+def select_actions(model, obs, actor_h, device, deterministic: bool):
     local_obs_np = obs["local_obs"]
-    if concat_agent_id_onehot:
-        local_obs_np = append_agent_id_onehot(local_obs_np[None, ...], obs["agent_ids"][None, ...], num_agents)[0]
+    local_screen_np = obs["local_screen"]
     local_obs = torch.as_tensor(local_obs_np, dtype=torch.float32, device=device)
-    agent_ids = torch.as_tensor(obs["agent_ids"], dtype=torch.long, device=device)
+    local_screen = torch.as_tensor(local_screen_np, dtype=torch.uint8, device=device)
     attack_masks = torch.as_tensor(obs["attack_masks"], dtype=torch.bool, device=device)
     attack_masks = ensure_valid_action_mask(attack_masks)
     actor_h_t = torch.as_tensor(actor_h, dtype=torch.float32, device=device)
 
     with torch.no_grad():
-        course_logits, _attack_logits_unused, next_actor_h = model.actor_step(local_obs, agent_ids, actor_h_t)
+        course_logits, _attack_logits_unused, next_actor_h = model.actor_step(local_obs, local_screen, actor_h_t)
         course_logits = sanitize_logits(course_logits)
         if deterministic:
             course_action = torch.argmax(course_logits, dim=-1)
@@ -174,15 +177,15 @@ def main(argv=None):
 
     env = build_env(train_cfg, args)
     obs = env.reset(seed=args.seed)
-    concat_agent_id_onehot = bool(train_cfg.get("concat_agent_id_onehot", False))
     base_local_obs_dim = int(env.local_obs_dim)
-    local_obs_dim = int(base_local_obs_dim + (env.num_agents if concat_agent_id_onehot else 0))
+    local_obs_dim = int(base_local_obs_dim)
     model_cfg = MAPPOModelConfig(
         local_obs_dim=local_obs_dim,
+        local_screen_shape=tuple(env.local_screen_shape),
         global_state_dim=env.global_state_dim,
         num_agents=env.num_agents,
         hidden_size=int(train_cfg.get("hidden_size", 256)),
-        role_embed_dim=int(train_cfg.get("role_embed_dim", 8)),
+        screen_embed_dim=int(train_cfg.get("screen_embed_dim", 64)),
         course_embed_dim=int(train_cfg.get("course_embed_dim", 16)),
     )
     model = TeamActorCritic(model_cfg).to(device)
@@ -200,8 +203,8 @@ def main(argv=None):
     episode_results = []
     start_time = time.time()
     print(
-        "[eval] obs_agent_id_concat=%s base_obs_dim=%d final_obs_dim=%d"
-        % (str(concat_agent_id_onehot), base_local_obs_dim, local_obs_dim),
+        "[eval] base_obs_dim=%d final_obs_dim=%d local_screen_shape=%s"
+        % (base_local_obs_dim, local_obs_dim, str(tuple(env.local_screen_shape))),
         flush=True,
     )
     try:
@@ -212,8 +215,6 @@ def main(argv=None):
                 actor_h,
                 device,
                 deterministic,
-                concat_agent_id_onehot=concat_agent_id_onehot,
-                num_agents=env.num_agents,
             )
             obs, _reward, done, info = env.step(actions)
             actor_h = next_actor_h

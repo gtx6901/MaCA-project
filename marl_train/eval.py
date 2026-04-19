@@ -12,13 +12,6 @@ from marl_train.checkpoint import eval_dir
 from marl_train.logging_utils import summarize_episode_stats
 
 
-def append_agent_id_onehot(local_obs: np.ndarray, agent_ids: np.ndarray, num_agents: int) -> np.ndarray:
-    if local_obs.ndim != 3:
-        raise ValueError("Expected local_obs shape [env, agent, dim], got %s" % (local_obs.shape,))
-    one_hot = np.eye(num_agents, dtype=np.float32)[agent_ids]
-    return np.concatenate([local_obs.astype(np.float32, copy=False), one_hot], axis=-1)
-
-
 def sanitize_logits(logits: torch.Tensor, clamp_abs: float = 30.0) -> torch.Tensor:
     logits = torch.nan_to_num(logits, nan=0.0, posinf=clamp_abs, neginf=-clamp_abs)
     return torch.clamp(logits, -clamp_abs, clamp_abs)
@@ -82,24 +75,22 @@ def select_eval_actions(
     actor_h,
     device,
     deterministic: bool,
-    concat_agent_id_onehot: bool,
     num_agents: int,
     attack_rule_mode: str,
     attack_policy_mode: str,
     attack_rule_prefer_long: bool,
 ):
     local_obs_np = obs["local_obs"]
-    if concat_agent_id_onehot:
-        local_obs_np = append_agent_id_onehot(local_obs_np[None, ...], obs["agent_ids"][None, ...], num_agents)[0]
+    local_screen_np = obs["local_screen"]
     local_obs = torch.as_tensor(local_obs_np, dtype=torch.float32, device=device)
-    agent_ids = torch.as_tensor(obs["agent_ids"], dtype=torch.long, device=device)
+    local_screen = torch.as_tensor(local_screen_np, dtype=torch.uint8, device=device)
     attack_masks = torch.as_tensor(obs["attack_masks"], dtype=torch.bool, device=device)
     attack_masks = ensure_valid_action_mask(attack_masks)
     visible_target_ids = np.asarray(obs.get("rule_visible_target_ids", np.zeros((num_agents, 0), dtype=np.int64)), dtype=np.int64)
     actor_h_t = torch.as_tensor(actor_h, dtype=torch.float32, device=device)
 
     with torch.no_grad():
-        course_logits, _attack_logits_unused, next_actor_h = model.actor_step(local_obs, agent_ids, actor_h_t)
+        course_logits, _attack_logits_unused, next_actor_h = model.actor_step(local_obs, local_screen, actor_h_t)
         course_logits = sanitize_logits(course_logits)
         if deterministic:
             course_action = torch.argmax(course_logits, dim=-1)
@@ -176,7 +167,7 @@ def run_evaluation(model, device, args, env_steps: int):
         red_obs_ind=args.maca_red_obs_ind,
         opponent=eval_opponent,
         max_step=runtime_max_step,
-        render=False,
+        render=bool(getattr(args, "eval_maca_render", True)),
         random_pos=runtime_random_pos,
         random_seed=args.seed + 900000 + int(env_steps),
         adaptive_support_policy=args.maca_adaptive_support_policy,
@@ -196,6 +187,9 @@ def run_evaluation(model, device, args, env_steps: int):
         exec_reward_scale=args.maca_exec_reward_scale,
         disengage_penalty=args.maca_disengage_penalty,
         bearing_reward_scale=args.maca_bearing_reward_scale,
+        semantic_screen_downsample=args.maca_semantic_screen_downsample,
+        terminal_ammo_fail_penalty=args.maca_terminal_ammo_fail_penalty,
+        terminal_participation_penalty=args.maca_terminal_participation_penalty,
     )
     env = MAPPOMaCAEnv(eval_config)
     actor_h = np.zeros((env.num_agents, model.actor_hidden_dim), dtype=np.float32)
@@ -211,7 +205,6 @@ def run_evaluation(model, device, args, env_steps: int):
                 actor_h,
                 device,
                 args.eval_deterministic,
-                concat_agent_id_onehot=bool(args.concat_agent_id_onehot),
                 num_agents=env.num_agents,
                 attack_rule_mode=str(getattr(args, "attack_rule_mode", "none")),
                 attack_policy_mode=str(getattr(args, "attack_policy_mode", "full_discrete")),

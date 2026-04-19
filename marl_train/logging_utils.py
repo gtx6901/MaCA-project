@@ -32,6 +32,12 @@ def summarize_episode_stats(episodes):
         summary[summary_key] = float(np.mean(values))
     if "win_flag_mean" in summary:
         summary["win_rate"] = summary["win_flag_mean"]
+    if "total_win_flag_mean" in summary:
+        summary["total_win_rate"] = summary["total_win_flag_mean"]
+    if "blue_alive_zero_flag_mean" in summary:
+        summary["blue_alive_zero_rate"] = summary["blue_alive_zero_flag_mean"]
+    if "timeout_flag_mean" in summary:
+        summary["timeout_rate"] = summary["timeout_flag_mean"]
     return summary
 
 
@@ -56,7 +62,6 @@ def log_train_scalars(
     action_stats: Dict[str, float],
     sample_fps: float,
     timing_stats: Dict[str, float],
-    concat_agent_id_onehot: bool,
     stage_id: int,
     current_lr: float,
     reward_mean: float,
@@ -115,6 +120,7 @@ def log_train_scalars(
     writer.add_scalar("train/reward_env_mean", float(rollout_diag.get("reward_env_mean", 0.0)), env_steps)
     writer.add_scalar("train/reward_mode_mean", float(rollout_diag.get("reward_mode_mean", 0.0)), env_steps)
     writer.add_scalar("train/reward_exec_mean", float(rollout_diag.get("reward_exec_mean", 0.0)), env_steps)
+    writer.add_scalar("train/reward_terminal_mean", float(rollout_diag.get("reward_terminal_mean", 0.0)), env_steps)
     writer.add_scalar("train/contact_signal_mean", float(rollout_diag.get("contact_signal_mean", 0.0)), env_steps)
     writer.add_scalar("train/opportunity_signal_mean", float(rollout_diag.get("opportunity_signal_mean", 0.0)), env_steps)
     writer.add_scalar("train/kill_reward_mean", float(rollout_diag.get("kill_reward_mean", 0.0)), env_steps)
@@ -126,7 +132,9 @@ def log_train_scalars(
     writer.add_scalar("train/rnn_hidden_mismatch_count", float(rollout_diag.get("rnn_hidden_mismatch_count", 0)), env_steps)
     writer.add_scalar("train/rnn_hidden_max_abs_diff", float(rollout_diag.get("rnn_hidden_max_abs_diff", 0.0)), env_steps)
 
-    writer.add_scalar("train/obs_agent_id_concat_enabled", 1.0 if concat_agent_id_onehot else 0.0, env_steps)
+    writer.add_scalar("train/total_win_rate", float(stats.get("total_win_rate", 0.0)), env_steps)
+    writer.add_scalar("train/blue_alive_zero_rate", float(stats.get("blue_alive_zero_rate", 0.0)), env_steps)
+    writer.add_scalar("train/timeout_rate", float(stats.get("timeout_rate", 0.0)), env_steps)
     for key, value in action_stats.items():
         writer.add_scalar("train_action/%s" % key, float(value), env_steps)
 

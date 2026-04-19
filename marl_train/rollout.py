@@ -15,8 +15,8 @@ def rollout(collectors, model, device, args, episode_stats, value_normalizer=Non
 
     buffer_keys = [
         "local_obs",
+        "local_screen",
         "global_state",
-        "agent_ids",
         "attack_masks",
         "alive_mask",
         "actor_h",
@@ -32,6 +32,7 @@ def rollout(collectors, model, device, args, episode_stats, value_normalizer=Non
         "reward_env",
         "reward_mode",
         "reward_exec",
+        "reward_terminal",
         "contact_signal",
         "opportunity_signal",
         "damage_reward",
@@ -93,6 +94,7 @@ def rollout(collectors, model, device, args, episode_stats, value_normalizer=Non
         "reward_env_mean": float(np.mean(buffer["reward_env"])),
         "reward_mode_mean": float(np.mean(buffer["reward_mode"])),
         "reward_exec_mean": float(np.mean(buffer["reward_exec"])),
+        "reward_terminal_mean": float(np.mean(buffer["reward_terminal"])),
         "contact_signal_mean": float(np.mean(buffer["contact_signal"])),
         "opportunity_signal_mean": float(np.mean(buffer["opportunity_signal"])),
         "kill_reward_mean": float(np.mean(buffer["kill_reward"])),
