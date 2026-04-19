@@ -137,6 +137,10 @@ def parse_args(argv=None):
     parser.add_argument("--maca_exec_reward_scale", type=float, default=0.2)
     parser.add_argument("--maca_disengage_penalty", type=float, default=0.05)
     parser.add_argument("--maca_bearing_reward_scale", type=float, default=0.05)
+    parser.add_argument("--maca_boundary_penalty_margin", type=float, default=120.0)
+    parser.add_argument("--maca_boundary_penalty_scale", type=float, default=0.03)
+    parser.add_argument("--maca_boundary_stuck_penalty_enabled", type=str2bool, default=True)
+    parser.add_argument("--maca_boundary_stuck_ramp_steps", type=int, default=20)
     parser.add_argument("--maca_semantic_screen_downsample", type=int, default=4)
     parser.add_argument("--maca_terminal_ammo_fail_penalty", type=float, default=80.0)
     parser.add_argument("--maca_terminal_participation_penalty", type=float, default=40.0)
@@ -187,6 +191,12 @@ def parse_args(argv=None):
         raise ValueError("aux_value_loss_coeff must be >= 0")
     if str(args.best_metric_name).lower() not in {"total_win_rate", "win_rate", "blue_alive_zero_rate"}:
         raise ValueError("best_metric_name must be one of: total_win_rate, win_rate, blue_alive_zero_rate")
+    if float(args.maca_boundary_penalty_margin) <= 0.0:
+        raise ValueError("maca_boundary_penalty_margin must be > 0")
+    if float(args.maca_boundary_penalty_scale) < 0.0:
+        raise ValueError("maca_boundary_penalty_scale must be >= 0")
+    if int(args.maca_boundary_stuck_ramp_steps) <= 0:
+        raise ValueError("maca_boundary_stuck_ramp_steps must be > 0")
     if int(args.maca_semantic_screen_downsample) <= 0:
         raise ValueError("maca_semantic_screen_downsample must be > 0")
     return args
@@ -607,6 +617,8 @@ def main(argv=None):
                 stats["total_win_rate"] = float(summary.get("total_win_rate", 0.0))
                 stats["blue_alive_zero_rate"] = float(summary.get("blue_alive_zero_rate", 0.0))
                 stats["timeout_rate"] = float(summary.get("timeout_rate", 0.0))
+                boundary_penalty_mean = float(summary.get("boundary_penalty_mean", 0.0))
+                near_boundary_frac = float(summary.get("near_boundary_frac_mean", 0.0))
                 damage_reward_mean = float(rollout_diag.get("damage_reward_mean", 0.0))
                 log_summary(writer, "train_episode", summary, env_steps)
                 log_train_scalars(
@@ -626,7 +638,7 @@ def main(argv=None):
                     disable_high_level_mode=bool(args.disable_high_level_mode),
                 )
                 print(
-                    "[train] env_steps=%d update=%d stage=%s reward_mean=%.2f win_rate=%.3f total_win_rate=%.3f blue_alive_zero_rate=%.3f timeout_rate=%.3f fps=%.1f lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d policy=%.4f low=%.4f high=%.4f value_loss=%.4f v_team=%.4f v_aux=%.4f entropy=%.4f imitation=%.4f coef=%.4f ev=%.4f actor_gn=%.4f critic_gn=%.4f active=%.3f skipped_nf=%d repaired_nf=%d hidden_err=%.6f rnn_mismatch=%d grad_steps=%d"
+                    "[train] env_steps=%d update=%d stage=%s reward_mean=%.2f win_rate=%.3f total_win_rate=%.3f blue_alive_zero_rate=%.3f timeout_rate=%.3f boundary_penalty_mean=%.4f near_boundary_frac=%.3f fps=%.1f lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d policy=%.4f low=%.4f high=%.4f value_loss=%.4f v_team=%.4f v_aux=%.4f entropy=%.4f imitation=%.4f coef=%.4f ev=%.4f actor_gn=%.4f critic_gn=%.4f active=%.3f skipped_nf=%d repaired_nf=%d hidden_err=%.6f rnn_mismatch=%d grad_steps=%d"
                     % (
                         env_steps,
                         update_idx,
@@ -636,6 +648,8 @@ def main(argv=None):
                         stats.get("total_win_rate", 0.0),
                         stats.get("blue_alive_zero_rate", 0.0),
                         stats.get("timeout_rate", 0.0),
+                        boundary_penalty_mean,
+                        near_boundary_frac,
                         sample_fps,
                         current_lr,
                         str(args.attack_rule_mode),
@@ -663,7 +677,7 @@ def main(argv=None):
                     flush=True,
                 )
                 print(
-                    "[stability] env_steps=%d update=%d lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d actor_gn=%.4f critic_gn=%.4f value_loss=%.4f v_team=%.4f v_contact=%.4f v_opp=%.4f v_surv=%.4f aux_v_coef=%.3f aux_v_off=%d policy_loss=%.4f entropy=%.4f value_target_std=%.4f value_target_norm_std=%.4f value_norm_std=%.4f value_norm_updated=%d active_mask_ratio=%.4f reward_mean=%.2f win_rate=%.3f total_win_rate=%.3f blue_alive_zero_rate=%.3f timeout_rate=%.3f damage_reward_mean=%.4f attack_opportunity_frac=%.4f executed_fire_action_frac=%.4f no_fire_when_legal_frac=%.4f opportunity_to_fire_ratio=%.4f fire_decision_freq_00=%.4f fire_decision_freq_01=%.4f rule_selected_attack_nonzero_freq=%.4f freeze_update=%d"
+                    "[stability] env_steps=%d update=%d lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d actor_gn=%.4f critic_gn=%.4f value_loss=%.4f v_team=%.4f v_contact=%.4f v_opp=%.4f v_surv=%.4f aux_v_coef=%.3f aux_v_off=%d policy_loss=%.4f entropy=%.4f value_target_std=%.4f value_target_norm_std=%.4f value_norm_std=%.4f value_norm_updated=%d active_mask_ratio=%.4f reward_mean=%.2f win_rate=%.3f total_win_rate=%.3f blue_alive_zero_rate=%.3f timeout_rate=%.3f boundary_penalty_mean=%.4f near_boundary_frac=%.3f damage_reward_mean=%.4f attack_opportunity_frac=%.4f executed_fire_action_frac=%.4f no_fire_when_legal_frac=%.4f opportunity_to_fire_ratio=%.4f fire_decision_freq_00=%.4f fire_decision_freq_01=%.4f rule_selected_attack_nonzero_freq=%.4f freeze_update=%d"
                     % (
                         env_steps,
                         update_idx,
@@ -692,6 +706,8 @@ def main(argv=None):
                         stats.get("total_win_rate", 0.0),
                         stats.get("blue_alive_zero_rate", 0.0),
                         stats.get("timeout_rate", 0.0),
+                        boundary_penalty_mean,
+                        near_boundary_frac,
                         damage_reward_mean,
                         action_stats.get("attack_opportunity_frac", 0.0),
                         action_stats.get("executed_fire_action_frac", 0.0),

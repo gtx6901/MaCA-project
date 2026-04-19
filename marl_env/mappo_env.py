@@ -55,6 +55,10 @@ class MAPPOMaCAConfig:
     exec_reward_scale: float = 0.2
     disengage_penalty: float = 0.05
     bearing_reward_scale: float = 0.05
+    boundary_penalty_margin: float = 120.0
+    boundary_penalty_scale: float = 0.03
+    boundary_stuck_penalty_enabled: bool = True
+    boundary_stuck_ramp_steps: int = 20
     semantic_screen_downsample: int = 4
     terminal_ammo_fail_penalty: float = 80.0
     terminal_participation_penalty: float = 40.0
@@ -203,14 +207,20 @@ class MAPPOMaCAEnv:
         agent_mode_reward = np.zeros((self.num_agents,), dtype=np.float32)
         agent_exec_reward = np.zeros((self.num_agents,), dtype=np.float32)
         agent_progress_reward = np.zeros((self.num_agents,), dtype=np.float32)
+        agent_boundary_penalty = np.zeros((self.num_agents,), dtype=np.float32)
+        agent_near_boundary = np.zeros((self.num_agents,), dtype=np.float32)
+        agent_alive_next = np.zeros((self.num_agents,), dtype=np.float32)
         if red_raw_obs_next is not None:
             for idx in range(self.num_agents):
                 next_state = self._extract_agent_state(red_raw_obs_next["fighter_obs_list"][idx])
-                aux_components = self._agent_aux_reward_components(pre_states[idx], next_state)
+                aux_components = self._agent_aux_reward_components(idx, pre_states[idx], next_state)
                 agent_aux_reward[idx] = aux_components["total"]
                 agent_mode_reward[idx] = aux_components["mode_total"]
                 agent_exec_reward[idx] = aux_components["exec_total"]
                 agent_progress_reward[idx] = aux_components["range_improve"]
+                agent_boundary_penalty[idx] = aux_components["boundary_penalty"]
+                agent_near_boundary[idx] = aux_components["near_boundary"]
+                agent_alive_next[idx] = 1.0 if next_state["alive"] else 0.0
 
         damage_reward = float(np.mean(list(reward_dict.values())))
         reward_env = damage_reward + attrition_reward
@@ -275,6 +285,9 @@ class MAPPOMaCAEnv:
         self._episode_len += 1
         self._episode_agent_aux_return += agent_aux_reward
         self._episode_engagement_progress_return += agent_progress_reward
+        self._episode_boundary_penalty_return += agent_boundary_penalty
+        self._near_boundary_counts += agent_near_boundary * agent_alive_next
+        self._alive_step_counts += agent_alive_next
         self._attack_opportunity_count += attack_opportunity_count
         self._missed_attack_count += missed_attack_count
         self._fire_action_count += fire_count
@@ -291,7 +304,11 @@ class MAPPOMaCAEnv:
             "reward_env": reward_env,
             "reward_mode": reward_mode,
             "reward_exec": reward_exec,
+            "reward_boundary": float(np.mean(agent_boundary_penalty)),
             "reward_terminal": float(reward_terminal),
+            "near_boundary_frac": float(
+                np.sum(agent_near_boundary * agent_alive_next) / max(float(np.sum(agent_alive_next)), 1.0)
+            ),
             "win_indicator": 0.0,
             "is_active": True,
             "round_reward": float(raw_info.get("round_reward", 0.0)),
@@ -333,9 +350,13 @@ class MAPPOMaCAEnv:
         self._track_bearing_deg = np.zeros((self.num_agents,), dtype=np.float32)
         self._track_heading_diff = np.zeros((self.num_agents,), dtype=np.float32)
         self._track_age = np.full((self.num_agents,), self._track_memory_steps, dtype=np.int32)
+        self._near_boundary_streak = np.zeros((self.num_agents,), dtype=np.int32)
+        self._near_boundary_counts = np.zeros((self.num_agents,), dtype=np.float32)
+        self._alive_step_counts = np.zeros((self.num_agents,), dtype=np.float32)
         self._agent_fire_counts = np.zeros((self.num_agents,), dtype=np.float32)
         self._agent_attack_opportunity_counts = np.zeros((self.num_agents,), dtype=np.float32)
         self._agent_destroy_contribution = np.zeros((self.num_agents,), dtype=np.float32)
+        self._episode_boundary_penalty_return = np.zeros((self.num_agents,), dtype=np.float32)
         self._initial_team_missile_total = 1.0
         self._terminal_ammo_fail_penalty = 0.0
         self._terminal_participation_penalty = 0.0
@@ -532,8 +553,7 @@ class MAPPOMaCAEnv:
             prev_heading_diff = 0.0
         return 0.0, 0.0, prev_heading_diff, last_seen_age
 
-    @staticmethod
-    def _extract_agent_state(fighter_raw_obs: Dict[str, object]) -> Dict[str, float]:
+    def _extract_agent_state(self, fighter_raw_obs: Dict[str, object]) -> Dict[str, float]:
         alive = bool(fighter_raw_obs.get("alive", False))
         if not alive:
             return {
@@ -542,13 +562,23 @@ class MAPPOMaCAEnv:
                 "nearest_enemy_distance": 0.0,
                 "nearest_enemy_bearing_abs": 1.0,
                 "has_attack_opportunity": False,
+                "nearest_boundary_dist": 0.0,
             }
+
+        own_x = float(np.clip(float(fighter_raw_obs.get("pos_x", 0.0)), 0.0, float(max(self._size_x, 1.0))))
+        own_y = float(np.clip(float(fighter_raw_obs.get("pos_y", 0.0)), 0.0, float(max(self._size_y, 1.0))))
+        nearest_boundary_dist = float(
+            min(
+                own_x,
+                max(float(self._size_x) - own_x, 0.0),
+                own_y,
+                max(float(self._size_y) - own_y, 0.0),
+            )
+        )
 
         visible_targets = list(fighter_raw_obs.get("r_visible_list", []))
         has_contact = len(visible_targets) > 0
         if has_contact:
-            own_x = float(fighter_raw_obs["pos_x"])
-            own_y = float(fighter_raw_obs["pos_y"])
             nearest = min(
                 visible_targets,
                 key=lambda t: (own_x - float(t.get("pos_x", own_x))) ** 2 + (own_y - float(t.get("pos_y", own_y))) ** 2,
@@ -571,16 +601,25 @@ class MAPPOMaCAEnv:
             "nearest_enemy_distance": nearest_distance,
             "nearest_enemy_bearing_abs": nearest_bearing_abs,
             "has_attack_opportunity": bool(attack_mask[1:].any()),
+            "nearest_boundary_dist": nearest_boundary_dist,
         }
 
-    def _agent_aux_reward_components(self, prev_state: Dict[str, float], next_state: Dict[str, float]) -> Dict[str, float]:
+    def _agent_aux_reward_components(
+        self,
+        agent_idx: int,
+        prev_state: Dict[str, float],
+        next_state: Dict[str, float],
+    ) -> Dict[str, float]:
         if not prev_state["alive"]:
+            self._near_boundary_streak[agent_idx] = 0
             return {
                 "contact": 0.0,
                 "attack_window": 0.0,
                 "disengage": 0.0,
                 "range_improve": 0.0,
                 "bearing_improve": 0.0,
+                "boundary_penalty": 0.0,
+                "near_boundary": 0.0,
                 "mode_total": 0.0,
                 "exec_total": 0.0,
                 "total": 0.0,
@@ -591,6 +630,8 @@ class MAPPOMaCAEnv:
         disengage_penalty = 0.0
         range_improve_reward = 0.0
         bearing_improve_reward = 0.0
+        boundary_penalty = 0.0
+        near_boundary = 0.0
         if next_state["has_contact"] and not prev_state["has_contact"]:
             contact_reward += float(self.config.contact_reward)
 
@@ -621,7 +662,25 @@ class MAPPOMaCAEnv:
         if next_state["has_attack_opportunity"] and not prev_state["has_attack_opportunity"]:
             attack_window_reward += float(self.config.attack_window_reward)
 
-        mode_total = contact_reward + attack_window_reward + disengage_penalty
+        margin = float(max(float(self.config.boundary_penalty_margin), 1e-6))
+        scale = float(max(float(self.config.boundary_penalty_scale), 0.0))
+        dist_to_boundary = float(next_state.get("nearest_boundary_dist", margin))
+        if next_state["alive"] and scale > 0.0 and dist_to_boundary < margin:
+            near_boundary = 1.0
+            self._near_boundary_streak[agent_idx] += 1
+            edge_ratio = float(np.clip(1.0 - dist_to_boundary / margin, 0.0, 1.0))
+            smooth_edge = edge_ratio * edge_ratio
+            idle_multiplier = 1.0 if (not next_state["has_contact"] and not next_state["has_attack_opportunity"]) else 0.35
+            stuck_multiplier = 1.0
+            if bool(self.config.boundary_stuck_penalty_enabled):
+                ramp_steps = int(max(int(self.config.boundary_stuck_ramp_steps), 1))
+                stuck_ratio = float(np.clip(float(self._near_boundary_streak[agent_idx]) / float(ramp_steps), 0.0, 1.0))
+                stuck_multiplier += 0.75 * stuck_ratio
+            boundary_penalty = -scale * smooth_edge * idle_multiplier * stuck_multiplier
+        else:
+            self._near_boundary_streak[agent_idx] = 0
+
+        mode_total = contact_reward + attack_window_reward + disengage_penalty + boundary_penalty
         exec_total = range_improve_reward + bearing_improve_reward
         total_reward = mode_total + exec_total
         return {
@@ -630,13 +689,15 @@ class MAPPOMaCAEnv:
             "disengage": float(disengage_penalty),
             "range_improve": float(range_improve_reward),
             "bearing_improve": float(bearing_improve_reward),
+            "boundary_penalty": float(boundary_penalty),
+            "near_boundary": float(near_boundary),
             "mode_total": float(mode_total),
             "exec_total": float(exec_total),
             "total": float(total_reward),
         }
 
-    def _compute_agent_aux_reward(self, prev_state: Dict[str, float], next_state: Dict[str, float]) -> float:
-        return float(self._agent_aux_reward_components(prev_state, next_state)["total"])
+    def _compute_agent_aux_reward(self, prev_state: Dict[str, float], next_state: Dict[str, float], agent_idx: int = 0) -> float:
+        return float(self._agent_aux_reward_components(agent_idx, prev_state, next_state)["total"])
 
     @staticmethod
     def _recv_summary(fighter_raw_obs: Dict[str, object]) -> Tuple[float, float, float]:
@@ -710,6 +771,9 @@ class MAPPOMaCAEnv:
         agent_missile_left_end_std = float(np.std(self._agent_missile_left_end))
         agent_destroy_contribution_std = float(np.std(self._agent_destroy_contribution))
         agent_attack_opportunity_count_std = float(np.std(self._agent_attack_opportunity_counts))
+        alive_steps_total = float(max(np.sum(self._alive_step_counts), 1.0))
+        near_boundary_frac = float(np.sum(self._near_boundary_counts) / alive_steps_total)
+        boundary_penalty_mean = float(np.sum(self._episode_boundary_penalty_return) / alive_steps_total)
 
         return {
             "round_reward": float(raw_info.get("round_reward", 0.0)),
@@ -731,6 +795,8 @@ class MAPPOMaCAEnv:
             "nearest_enemy_distance_min": nearest_min,
             "engagement_progress_reward_mean": float(np.mean(self._episode_engagement_progress_return)) / episode_len,
             "agent_aux_reward_mean": float(np.mean(self._episode_agent_aux_return)) / episode_len,
+            "boundary_penalty_mean": boundary_penalty_mean,
+            "near_boundary_frac": near_boundary_frac,
             "reward_env_mean": float(self._episode_env_return) / episode_len,
             "reward_mode_mean": float(self._episode_mode_return) / episode_len,
             "reward_exec_mean": float(self._episode_exec_return) / episode_len,
