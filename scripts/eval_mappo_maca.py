@@ -127,8 +127,46 @@ def build_env(train_cfg: dict, args) -> MAPPOMaCAEnv:
             boundary_stuck_penalty_enabled=bool(train_cfg.get("maca_boundary_stuck_penalty_enabled", True)),
             boundary_stuck_trigger_steps=int(train_cfg.get("maca_boundary_stuck_trigger_steps", 24)),
             boundary_stuck_ramp_steps=int(train_cfg.get("maca_boundary_stuck_ramp_steps", 20)),
-            search_reward_scale=float(train_cfg.get("maca_search_reward_scale", 0.015)),
-            reacquire_reward_scale=float(train_cfg.get("maca_reacquire_reward_scale", 0.02)),
+            search_reward_scale=float(train_cfg.get("maca_search_reward_scale", 0.01)),
+            reacquire_reward_scale=float(train_cfg.get("maca_reacquire_reward_scale", 0.015)),
+            search_progress_aux_scale=float(train_cfg.get("maca_search_progress_aux_scale", 0.05)),
+            reacquire_success_bonus=float(train_cfg.get("maca_reacquire_success_bonus", 0.04)),
+            post_contact_no_contact_penalty=float(train_cfg.get("maca_post_contact_no_contact_penalty", 0.005)),
+            post_contact_no_contact_grace=int(train_cfg.get("maca_post_contact_no_contact_grace", 6)),
+            isolation_penalty_scale=float(train_cfg.get("maca_isolation_penalty_scale", 0.01)),
+            finish_sweep_stall_penalty=float(train_cfg.get("maca_finish_sweep_stall_penalty", 0.005)),
+            team_reacquire_success_bonus=float(train_cfg.get("maca_team_reacquire_success_bonus", 20.0)),
+            team_post_contact_no_contact_penalty=float(train_cfg.get("maca_team_post_contact_no_contact_penalty", 4.0)),
+            team_post_contact_no_contact_grace=int(train_cfg.get("maca_team_post_contact_no_contact_grace", 6)),
+            team_isolation_penalty=float(train_cfg.get("maca_team_isolation_penalty", 3.0)),
+            team_overexpand_penalty=float(train_cfg.get("maca_team_overexpand_penalty", 2.0)),
+            team_finish_stall_penalty=float(train_cfg.get("maca_team_finish_stall_penalty", 2.0)),
+            opening_max_expand_radius=float(train_cfg.get("maca_opening_max_expand_radius", 0.42)),
+            contact_max_expand_radius=float(train_cfg.get("maca_contact_max_expand_radius", 0.28)),
+            reacquire_max_expand_radius=float(train_cfg.get("maca_reacquire_max_expand_radius", 0.36)),
+            finish_max_expand_radius=float(train_cfg.get("maca_finish_max_expand_radius", 0.30)),
+            opening_max_support_dist=float(train_cfg.get("maca_opening_max_support_dist", 0.30)),
+            contact_max_support_dist=float(train_cfg.get("maca_contact_max_support_dist", 0.22)),
+            reacquire_max_support_dist=float(train_cfg.get("maca_reacquire_max_support_dist", 0.28)),
+            finish_max_support_dist=float(train_cfg.get("maca_finish_max_support_dist", 0.24)),
+            assignment_support_speed_norm=float(train_cfg.get("maca_assignment_support_speed_norm", 0.055)),
+            assignment_max_support_time=float(train_cfg.get("maca_assignment_max_support_time", 5.0)),
+            assignment_hard_slack=float(train_cfg.get("maca_assignment_hard_slack", 1.25)),
+            assignment_distance_cost=float(train_cfg.get("maca_assignment_distance_cost", 0.24)),
+            assignment_crowding_cost=float(train_cfg.get("maca_assignment_crowding_cost", 0.28)),
+            assignment_support_cost=float(train_cfg.get("maca_assignment_support_cost", 0.45)),
+            assignment_support_time_cost=float(train_cfg.get("maca_assignment_support_time_cost", 0.25)),
+            assignment_expand_cost=float(train_cfg.get("maca_assignment_expand_cost", 0.40)),
+            opening_priority_uncertainty_mult=float(train_cfg.get("maca_opening_priority_uncertainty_mult", 1.1)),
+            contact_priority_uncertainty_mult=float(train_cfg.get("maca_contact_priority_uncertainty_mult", 0.3)),
+            reacquire_priority_uncertainty_mult=float(train_cfg.get("maca_reacquire_priority_uncertainty_mult", 0.8)),
+            finish_priority_uncertainty_mult=float(train_cfg.get("maca_finish_priority_uncertainty_mult", 0.4)),
+            opening_priority_known_enemy_mult=float(train_cfg.get("maca_opening_priority_known_enemy_mult", 0.5)),
+            contact_priority_known_enemy_mult=float(train_cfg.get("maca_contact_priority_known_enemy_mult", 1.4)),
+            reacquire_priority_known_enemy_mult=float(train_cfg.get("maca_reacquire_priority_known_enemy_mult", 1.1)),
+            finish_priority_known_enemy_mult=float(train_cfg.get("maca_finish_priority_known_enemy_mult", 1.5)),
+            reacquire_event_min_gap=int(train_cfg.get("maca_reacquire_event_min_gap", 2)),
+            finish_sweep_enemy_threshold=int(train_cfg.get("maca_finish_sweep_enemy_threshold", 2)),
             priority_grid_h=int(train_cfg.get("maca_priority_grid_h", 4)),
             priority_grid_w=int(train_cfg.get("maca_priority_grid_w", 4)),
             priority_top_k=int(train_cfg.get("maca_priority_top_k", 2)),
@@ -147,6 +185,9 @@ def build_env(train_cfg: dict, args) -> MAPPOMaCAEnv:
             semantic_screen_downsample=int(train_cfg.get("maca_semantic_screen_downsample", 4)),
             terminal_ammo_fail_penalty=float(train_cfg.get("maca_terminal_ammo_fail_penalty", 80.0)),
             terminal_participation_penalty=float(train_cfg.get("maca_terminal_participation_penalty", 40.0)),
+            terminal_survivor_penalty=float(train_cfg.get("maca_terminal_survivor_penalty", 80.0)),
+            terminal_timeout_survivor_penalty=float(train_cfg.get("maca_terminal_timeout_survivor_penalty", 120.0)),
+            terminal_total_win_bonus=float(train_cfg.get("maca_terminal_total_win_bonus", 80.0)),
         )
     )
 
@@ -159,6 +200,14 @@ def main(argv=None):
 
     exp_dir = Path(args.train_dir) / args.experiment
     train_cfg = load_train_cfg(exp_dir)
+
+    assigned_semantics = str(train_cfg.get("maca_assigned_region_semantics", "")).strip().lower()
+    if assigned_semantics != "support_v2":
+        raise RuntimeError(
+            "Unsupported cfg semantics for assigned_region_obs[4]: expected maca_assigned_region_semantics='support_v2', got '%s'. "
+            "Old configs are intentionally rejected."
+            % assigned_semantics
+        )
 
     def _resolve_bool_optional(value, fallback: bool) -> bool:
         if value is None:

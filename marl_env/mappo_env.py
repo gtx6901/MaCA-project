@@ -60,14 +60,20 @@ class MAPPOMaCAConfig:
     boundary_stuck_penalty_enabled: bool = True
     boundary_stuck_trigger_steps: int = 24
     boundary_stuck_ramp_steps: int = 20
-    search_reward_scale: float = 0.015
-    reacquire_reward_scale: float = 0.02
-    search_progress_aux_scale: float = 0.2
-    reacquire_success_bonus: float = 0.18
-    post_contact_no_contact_penalty: float = 0.03
+    search_reward_scale: float = 0.01
+    reacquire_reward_scale: float = 0.015
+    search_progress_aux_scale: float = 0.05
+    reacquire_success_bonus: float = 0.04
+    post_contact_no_contact_penalty: float = 0.005
     post_contact_no_contact_grace: int = 6
-    isolation_penalty_scale: float = 0.05
-    finish_sweep_stall_penalty: float = 0.02
+    isolation_penalty_scale: float = 0.01
+    finish_sweep_stall_penalty: float = 0.005
+    team_reacquire_success_bonus: float = 20.0
+    team_post_contact_no_contact_penalty: float = 4.0
+    team_post_contact_no_contact_grace: int = 6
+    team_isolation_penalty: float = 3.0
+    team_overexpand_penalty: float = 2.0
+    team_finish_stall_penalty: float = 2.0
     opening_max_expand_radius: float = 0.42
     contact_max_expand_radius: float = 0.28
     reacquire_max_expand_radius: float = 0.36
@@ -112,7 +118,9 @@ class MAPPOMaCAConfig:
     semantic_screen_downsample: int = 4
     terminal_ammo_fail_penalty: float = 80.0
     terminal_participation_penalty: float = 40.0
-    terminal_timeout_survivor_penalty: float = 50.0
+    terminal_survivor_penalty: float = 80.0
+    terminal_timeout_survivor_penalty: float = 120.0
+    terminal_total_win_bonus: float = 80.0
 
 
 class MAPPOMaCAEnv:
@@ -296,6 +304,7 @@ class MAPPOMaCAEnv:
         agent_reacquire_reward = np.zeros((self.num_agents,), dtype=np.float32)
         agent_post_contact_no_contact = np.zeros((self.num_agents,), dtype=np.float32)
         agent_post_contact_alive = np.zeros((self.num_agents,), dtype=np.float32)
+        team_context = None
         if red_raw_obs_next is not None:
             team_context = self._build_team_priority_context(
                 fighter_obs_list=red_raw_obs_next["fighter_obs_list"],
@@ -339,13 +348,46 @@ class MAPPOMaCAEnv:
         if self.config.agent_aux_reward_scale != 0.0:
             team_reward += float(np.mean(agent_aux_reward)) * float(self.config.agent_aux_reward_scale)
 
+        reward_result = 0.0
+        if team_context is not None:
+            if bool(team_context.get("reacquire_event", False)):
+                reward_result += float(self.config.team_reacquire_success_bonus)
+
+            if bool(team_context.get("post_contact_phase", False)) and float(team_context.get("blue_alive_count", 0.0)) > 0.0:
+                grace = int(max(int(self.config.team_post_contact_no_contact_grace), 1))
+                no_contact_streak = int(team_context.get("no_contact_streak", 0))
+                excess = max(no_contact_streak - grace, 0)
+                if excess > 0:
+                    reward_result -= float(self.config.team_post_contact_no_contact_penalty) * float(
+                        np.clip(excess / float(grace), 0.0, 2.0)
+                    )
+
+            support_violation_frac_step = float(np.clip(team_context.get("support_violation_frac_step", 0.0), 0.0, 1.0))
+            reward_result -= float(self.config.team_isolation_penalty) * support_violation_frac_step
+
+            max_expand_radius = float(max(float(team_context.get("max_expand_radius", 1.0)), 1e-6))
+            expand_violation_mean = float(max(float(team_context.get("expand_violation_mean", 0.0)), 0.0))
+            expand_violation_ratio = float(np.clip(expand_violation_mean / max_expand_radius, 0.0, 2.0))
+            reward_result -= float(self.config.team_overexpand_penalty) * expand_violation_ratio
+
+            if (
+                str(team_context.get("tactical_phase", "opening_search")) == "finish_sweep"
+                and float(team_context.get("blue_alive_count", 0.0)) > 0.0
+                and not bool(team_context.get("any_contact_now", False))
+            ):
+                reward_result -= float(self.config.team_finish_stall_penalty)
+
+        team_reward += reward_result
+
         for idx, agent_id in enumerate(self.base_env.agents):
             self._agent_destroy_contribution[idx] += float(reward_dict.get(agent_id, 0.0))
 
         reward_terminal = 0.0
         self._terminal_ammo_fail_penalty = 0.0
         self._terminal_participation_penalty = 0.0
+        self._terminal_survivor_penalty = 0.0
         self._terminal_timeout_survivor_penalty = 0.0
+        self._terminal_total_win_bonus = 0.0
         if done and red_raw_obs_next is not None:
             fighter_obs_end = red_raw_obs_next["fighter_obs_list"]
             team_missile_left_end = self._compute_team_missile_total(fighter_obs_end)
@@ -381,16 +423,23 @@ class MAPPOMaCAEnv:
                     * float(np.clip(collapse_index, 0.0, 1.0))
                 )
 
+                self._terminal_survivor_penalty = -float(self.config.terminal_survivor_penalty) * self._enemy_alive_ratio_end
+
             if self._episode_len >= int(self.config.max_step) and blue_alive_count > 0:
                 self._terminal_timeout_survivor_penalty = (
                     -float(self.config.terminal_timeout_survivor_penalty)
                     * float(blue_alive_count / float(max(self.blue_fighter_num, 1)))
                 )
 
+            if blue_alive_count <= 0 and float(raw_info.get("red_fighter_alive_count", 0.0)) > 0.0 and self._episode_len < int(self.config.max_step):
+                self._terminal_total_win_bonus = float(self.config.terminal_total_win_bonus)
+
             reward_terminal = (
                 self._terminal_ammo_fail_penalty
                 + self._terminal_participation_penalty
+                + self._terminal_survivor_penalty
                 + self._terminal_timeout_survivor_penalty
+                + self._terminal_total_win_bonus
             )
             team_reward += reward_terminal
 
@@ -398,6 +447,7 @@ class MAPPOMaCAEnv:
         self._episode_env_return += reward_env
         self._episode_mode_return += reward_mode
         self._episode_exec_return += reward_exec
+        self._episode_result_reward_return += reward_result
         self._episode_len += 1
         self._episode_agent_aux_return += agent_aux_reward
         self._episode_engagement_progress_return += agent_progress_reward
@@ -424,6 +474,7 @@ class MAPPOMaCAEnv:
             "reward_env": reward_env,
             "reward_mode": reward_mode,
             "reward_exec": reward_exec,
+            "reward_result": float(reward_result),
             "reward_boundary": float(reward_boundary),
             "reward_terminal": float(reward_terminal),
             "near_boundary_frac": float(
@@ -448,6 +499,7 @@ class MAPPOMaCAEnv:
         self._episode_env_return = 0.0
         self._episode_mode_return = 0.0
         self._episode_exec_return = 0.0
+        self._episode_result_reward_return = 0.0
         self._episode_len = 0
         self._episode_agent_aux_return = np.zeros((self.num_agents,), dtype=np.float32)
         self._episode_engagement_progress_return = np.zeros((self.num_agents,), dtype=np.float32)
@@ -515,7 +567,9 @@ class MAPPOMaCAEnv:
         self._initial_team_missile_total = 1.0
         self._terminal_ammo_fail_penalty = 0.0
         self._terminal_participation_penalty = 0.0
+        self._terminal_survivor_penalty = 0.0
         self._terminal_timeout_survivor_penalty = 0.0
+        self._terminal_total_win_bonus = 0.0
         self._team_missile_left_ratio_end = 1.0
         self._enemy_alive_ratio_end = 0.0
         self._agent_missile_left_end = np.zeros((self.num_agents,), dtype=np.float32)
@@ -956,6 +1010,8 @@ class MAPPOMaCAEnv:
         max_expand_radius = float(max(float(profile["max_expand"]), 1e-6))
         max_support_dist = float(max(float(profile["max_support"]), 1e-6))
         hard_slack = float(max(float(self.config.assignment_hard_slack), 1.0))
+        soft_expand_limit = hard_slack * max_expand_radius
+        soft_support_limit = hard_slack * max_support_dist
 
         no_contact_indices = np.flatnonzero(agent_alive & agent_no_contact)
         alive_indices = np.flatnonzero(agent_alive)
@@ -981,7 +1037,7 @@ class MAPPOMaCAEnv:
         for agent_idx in no_contact_indices.tolist():
             dist_to_cells = np.linalg.norm(self._priority_cell_centers - agent_pos_norm[agent_idx], axis=1)
             expand_dist = np.linalg.norm(self._priority_cell_centers - search_anchor[None, :], axis=1)
-            expand_over = np.clip(expand_dist - max_expand_radius, 0.0, None)
+            expand_over = np.clip(expand_dist - soft_expand_limit, 0.0, None)
 
             nearest_support_dist = np.zeros((self._priority_grid_size,), dtype=np.float32)
             for cell_idx in range(self._priority_grid_size):
@@ -991,7 +1047,7 @@ class MAPPOMaCAEnv:
                     alive_indices=alive_indices,
                     projected_positions=projected_positions,
                 )
-            support_over = np.clip(nearest_support_dist - max_support_dist, 0.0, None)
+            support_over = np.clip(nearest_support_dist - soft_support_limit, 0.0, None)
             support_time_over = np.clip(nearest_support_dist / support_speed - max_support_time, 0.0, None)
             crowding_term = crowding_map + assigned_counts / float(max(no_contact_indices.size, 1))
 
@@ -1004,17 +1060,6 @@ class MAPPOMaCAEnv:
                 - support_time_cost * support_time_over
                 - expand_cost * expand_over
             )
-
-            if alive_indices.size <= 1:
-                feasible_mask = expand_dist <= (hard_slack * max_expand_radius)
-            else:
-                feasible_mask = (expand_dist <= (hard_slack * max_expand_radius)) & (
-                    nearest_support_dist <= (hard_slack * max_support_dist)
-                )
-            if np.any(feasible_mask):
-                masked = np.full_like(score, -1e9)
-                masked[feasible_mask] = score[feasible_mask]
-                score = masked
 
             best_idx = int(np.argmax(score))
             assigned_region_idx[agent_idx] = best_idx
@@ -1063,6 +1108,13 @@ class MAPPOMaCAEnv:
         if update_episode_metrics and alive_indices.size > 0:
             self._support_violation_steps += float(np.sum(self._agent_support_margin[alive_indices] < 0.0))
             self._support_check_steps += float(alive_indices.size)
+
+        if alive_indices.size > 0:
+            support_violation_frac_step = float(np.mean(self._agent_support_margin[alive_indices] < 0.0))
+            expand_violation_mean = float(np.mean(self._agent_expand_violation[alive_indices]))
+        else:
+            support_violation_frac_step = 0.0
+            expand_violation_mean = 0.0
 
         topk_idx = self._topk_indices(priority_map, self._priority_top_k)
         top1_idx = int(topk_idx[0]) if topk_idx.size > 0 else -1
@@ -1114,8 +1166,11 @@ class MAPPOMaCAEnv:
             "no_contact_streak": int(self._team_no_contact_streak),
             "reacquire_event": bool(reacquire_event),
             "blue_alive_count": float(max(blue_alive_count, 0)),
+            "any_contact_now": bool(any_contact_now),
             "max_support_dist": float(max_support_dist),
             "max_expand_radius": float(max_expand_radius),
+            "support_violation_frac_step": float(support_violation_frac_step),
+            "expand_violation_mean": float(expand_violation_mean),
             "progress_aux_scale": float(
                 max(0.0, float(self.config.search_progress_aux_scale) * float(profile["progress_aux_scale_mult"]))
             ),
@@ -1679,6 +1734,7 @@ class MAPPOMaCAEnv:
             "reward_env_mean": float(self._episode_env_return) / episode_len,
             "reward_mode_mean": float(self._episode_mode_return) / episode_len,
             "reward_exec_mean": float(self._episode_exec_return) / episode_len,
+            "reward_result_mean": float(self._episode_result_reward_return) / episode_len,
             "episode_len": float(self._episode_len),
             "win_flag": float(raw_info.get("round_reward", 0.0) > raw_info.get("opponent_round_reward", 0.0)),
             "total_win_flag": total_win_flag,
@@ -1692,7 +1748,9 @@ class MAPPOMaCAEnv:
             "team_missile_left_ratio_end": float(self._team_missile_left_ratio_end),
             "terminal_ammo_fail_penalty": float(self._terminal_ammo_fail_penalty),
             "terminal_participation_penalty": float(self._terminal_participation_penalty),
+            "terminal_survivor_penalty": float(self._terminal_survivor_penalty),
             "terminal_timeout_survivor_penalty": float(self._terminal_timeout_survivor_penalty),
+            "terminal_total_win_bonus": float(self._terminal_total_win_bonus),
             "enemy_alive_ratio_end": float(self._enemy_alive_ratio_end),
             "agent_fire_count_std": agent_fire_count_std,
             "agent_contact_count_std": agent_contact_count_std,

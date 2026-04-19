@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from collections import deque
@@ -143,8 +144,46 @@ def parse_args(argv=None):
     parser.add_argument("--maca_boundary_stuck_penalty_enabled", type=str2bool, default=True)
     parser.add_argument("--maca_boundary_stuck_trigger_steps", type=int, default=24)
     parser.add_argument("--maca_boundary_stuck_ramp_steps", type=int, default=20)
-    parser.add_argument("--maca_search_reward_scale", type=float, default=0.015)
-    parser.add_argument("--maca_reacquire_reward_scale", type=float, default=0.02)
+    parser.add_argument("--maca_search_reward_scale", type=float, default=0.01)
+    parser.add_argument("--maca_reacquire_reward_scale", type=float, default=0.015)
+    parser.add_argument("--maca_search_progress_aux_scale", type=float, default=0.05)
+    parser.add_argument("--maca_reacquire_success_bonus", type=float, default=0.04)
+    parser.add_argument("--maca_post_contact_no_contact_penalty", type=float, default=0.005)
+    parser.add_argument("--maca_post_contact_no_contact_grace", type=int, default=6)
+    parser.add_argument("--maca_isolation_penalty_scale", type=float, default=0.01)
+    parser.add_argument("--maca_finish_sweep_stall_penalty", type=float, default=0.005)
+    parser.add_argument("--maca_team_reacquire_success_bonus", type=float, default=20.0)
+    parser.add_argument("--maca_team_post_contact_no_contact_penalty", type=float, default=4.0)
+    parser.add_argument("--maca_team_post_contact_no_contact_grace", type=int, default=6)
+    parser.add_argument("--maca_team_isolation_penalty", type=float, default=3.0)
+    parser.add_argument("--maca_team_overexpand_penalty", type=float, default=2.0)
+    parser.add_argument("--maca_team_finish_stall_penalty", type=float, default=2.0)
+    parser.add_argument("--maca_opening_max_expand_radius", type=float, default=0.42)
+    parser.add_argument("--maca_contact_max_expand_radius", type=float, default=0.28)
+    parser.add_argument("--maca_reacquire_max_expand_radius", type=float, default=0.36)
+    parser.add_argument("--maca_finish_max_expand_radius", type=float, default=0.30)
+    parser.add_argument("--maca_opening_max_support_dist", type=float, default=0.30)
+    parser.add_argument("--maca_contact_max_support_dist", type=float, default=0.22)
+    parser.add_argument("--maca_reacquire_max_support_dist", type=float, default=0.28)
+    parser.add_argument("--maca_finish_max_support_dist", type=float, default=0.24)
+    parser.add_argument("--maca_assignment_support_speed_norm", type=float, default=0.055)
+    parser.add_argument("--maca_assignment_max_support_time", type=float, default=5.0)
+    parser.add_argument("--maca_assignment_hard_slack", type=float, default=1.25)
+    parser.add_argument("--maca_assignment_distance_cost", type=float, default=0.24)
+    parser.add_argument("--maca_assignment_crowding_cost", type=float, default=0.28)
+    parser.add_argument("--maca_assignment_support_cost", type=float, default=0.45)
+    parser.add_argument("--maca_assignment_support_time_cost", type=float, default=0.25)
+    parser.add_argument("--maca_assignment_expand_cost", type=float, default=0.40)
+    parser.add_argument("--maca_opening_priority_uncertainty_mult", type=float, default=1.1)
+    parser.add_argument("--maca_contact_priority_uncertainty_mult", type=float, default=0.3)
+    parser.add_argument("--maca_reacquire_priority_uncertainty_mult", type=float, default=0.8)
+    parser.add_argument("--maca_finish_priority_uncertainty_mult", type=float, default=0.4)
+    parser.add_argument("--maca_opening_priority_known_enemy_mult", type=float, default=0.5)
+    parser.add_argument("--maca_contact_priority_known_enemy_mult", type=float, default=1.4)
+    parser.add_argument("--maca_reacquire_priority_known_enemy_mult", type=float, default=1.1)
+    parser.add_argument("--maca_finish_priority_known_enemy_mult", type=float, default=1.5)
+    parser.add_argument("--maca_reacquire_event_min_gap", type=int, default=2)
+    parser.add_argument("--maca_finish_sweep_enemy_threshold", type=int, default=2)
     parser.add_argument("--maca_priority_grid_h", type=int, default=5)
     parser.add_argument("--maca_priority_grid_w", type=int, default=5)
     parser.add_argument("--maca_priority_top_k", type=int, default=3)
@@ -163,6 +202,9 @@ def parse_args(argv=None):
     parser.add_argument("--maca_semantic_screen_downsample", type=int, default=4)
     parser.add_argument("--maca_terminal_ammo_fail_penalty", type=float, default=80.0)
     parser.add_argument("--maca_terminal_participation_penalty", type=float, default=40.0)
+    parser.add_argument("--maca_terminal_survivor_penalty", type=float, default=80.0)
+    parser.add_argument("--maca_terminal_timeout_survivor_penalty", type=float, default=120.0)
+    parser.add_argument("--maca_terminal_total_win_bonus", type=float, default=80.0)
 
     parser.add_argument("--curriculum_enabled", type=str2bool, default=False)
     parser.add_argument("--curriculum_easy_frac", type=float, default=0.3)
@@ -226,6 +268,73 @@ def parse_args(argv=None):
         raise ValueError("maca_search_reward_scale must be >= 0")
     if float(args.maca_reacquire_reward_scale) < 0.0:
         raise ValueError("maca_reacquire_reward_scale must be >= 0")
+    if float(args.maca_search_progress_aux_scale) < 0.0:
+        raise ValueError("maca_search_progress_aux_scale must be >= 0")
+    if float(args.maca_reacquire_success_bonus) < 0.0:
+        raise ValueError("maca_reacquire_success_bonus must be >= 0")
+    if float(args.maca_post_contact_no_contact_penalty) < 0.0:
+        raise ValueError("maca_post_contact_no_contact_penalty must be >= 0")
+    if int(args.maca_post_contact_no_contact_grace) <= 0:
+        raise ValueError("maca_post_contact_no_contact_grace must be > 0")
+    if float(args.maca_isolation_penalty_scale) < 0.0:
+        raise ValueError("maca_isolation_penalty_scale must be >= 0")
+    if float(args.maca_finish_sweep_stall_penalty) < 0.0:
+        raise ValueError("maca_finish_sweep_stall_penalty must be >= 0")
+    if float(args.maca_team_reacquire_success_bonus) < 0.0:
+        raise ValueError("maca_team_reacquire_success_bonus must be >= 0")
+    if float(args.maca_team_post_contact_no_contact_penalty) < 0.0:
+        raise ValueError("maca_team_post_contact_no_contact_penalty must be >= 0")
+    if int(args.maca_team_post_contact_no_contact_grace) <= 0:
+        raise ValueError("maca_team_post_contact_no_contact_grace must be > 0")
+    if float(args.maca_team_isolation_penalty) < 0.0:
+        raise ValueError("maca_team_isolation_penalty must be >= 0")
+    if float(args.maca_team_overexpand_penalty) < 0.0:
+        raise ValueError("maca_team_overexpand_penalty must be >= 0")
+    if float(args.maca_team_finish_stall_penalty) < 0.0:
+        raise ValueError("maca_team_finish_stall_penalty must be >= 0")
+    if min(
+        float(args.maca_opening_max_expand_radius),
+        float(args.maca_contact_max_expand_radius),
+        float(args.maca_reacquire_max_expand_radius),
+        float(args.maca_finish_max_expand_radius),
+    ) <= 0.0:
+        raise ValueError("maca_*_max_expand_radius must be > 0")
+    if min(
+        float(args.maca_opening_max_support_dist),
+        float(args.maca_contact_max_support_dist),
+        float(args.maca_reacquire_max_support_dist),
+        float(args.maca_finish_max_support_dist),
+    ) <= 0.0:
+        raise ValueError("maca_*_max_support_dist must be > 0")
+    if float(args.maca_assignment_support_speed_norm) <= 0.0:
+        raise ValueError("maca_assignment_support_speed_norm must be > 0")
+    if float(args.maca_assignment_max_support_time) < 0.0:
+        raise ValueError("maca_assignment_max_support_time must be >= 0")
+    if float(args.maca_assignment_hard_slack) < 1.0:
+        raise ValueError("maca_assignment_hard_slack must be >= 1")
+    if min(
+        float(args.maca_assignment_distance_cost),
+        float(args.maca_assignment_crowding_cost),
+        float(args.maca_assignment_support_cost),
+        float(args.maca_assignment_support_time_cost),
+        float(args.maca_assignment_expand_cost),
+    ) < 0.0:
+        raise ValueError("maca_assignment_*_cost must be >= 0")
+    if min(
+        float(args.maca_opening_priority_uncertainty_mult),
+        float(args.maca_contact_priority_uncertainty_mult),
+        float(args.maca_reacquire_priority_uncertainty_mult),
+        float(args.maca_finish_priority_uncertainty_mult),
+        float(args.maca_opening_priority_known_enemy_mult),
+        float(args.maca_contact_priority_known_enemy_mult),
+        float(args.maca_reacquire_priority_known_enemy_mult),
+        float(args.maca_finish_priority_known_enemy_mult),
+    ) < 0.0:
+        raise ValueError("maca_*_priority_*_mult must be >= 0")
+    if int(args.maca_reacquire_event_min_gap) <= 0:
+        raise ValueError("maca_reacquire_event_min_gap must be > 0")
+    if int(args.maca_finish_sweep_enemy_threshold) <= 0:
+        raise ValueError("maca_finish_sweep_enemy_threshold must be > 0")
     if int(args.maca_priority_grid_h) < 2 or int(args.maca_priority_grid_w) < 2:
         raise ValueError("maca_priority_grid_h and maca_priority_grid_w must be >= 2")
     if int(args.maca_priority_top_k) <= 0:
@@ -242,6 +351,14 @@ def parse_args(argv=None):
         raise ValueError("maca_priority_known_enemy_boost must be >= 0")
     if not (0.0 <= float(args.maca_priority_unseen_threshold) <= 1.0):
         raise ValueError("maca_priority_unseen_threshold must be in [0,1]")
+    if min(
+        float(args.maca_terminal_ammo_fail_penalty),
+        float(args.maca_terminal_participation_penalty),
+        float(args.maca_terminal_survivor_penalty),
+        float(args.maca_terminal_timeout_survivor_penalty),
+        float(args.maca_terminal_total_win_bonus),
+    ) < 0.0:
+        raise ValueError("maca terminal reward parameters must be >= 0")
     return args
 
 
@@ -421,6 +538,21 @@ def frozen_update_stats(returns: np.ndarray, values: np.ndarray, value_normalize
 
 def main(argv=None):
     args = parse_args(argv)
+    args.maca_assigned_region_semantics = "support_v2"
+    if bool(args.resume):
+        cfg_path = Path(args.train_dir) / args.experiment / "cfg.json"
+        if cfg_path.exists():
+            try:
+                prev_cfg = json.loads(cfg_path.read_text())
+            except Exception as exc:
+                raise RuntimeError("Failed to parse resume cfg: %s" % cfg_path) from exc
+            prev_semantics = str(prev_cfg.get("maca_assigned_region_semantics", "")).strip().lower()
+            if prev_semantics != "support_v2":
+                raise RuntimeError(
+                    "Unsupported resume cfg semantics for assigned_region_obs[4]: expected maca_assigned_region_semantics='support_v2', got '%s'. "
+                    "Old configs are intentionally rejected."
+                    % prev_semantics
+                )
     device = device_from_arg(args.device)
     set_seed(args.seed)
 
