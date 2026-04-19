@@ -8,7 +8,14 @@ set -euo pipefail
 #   scripts/hmarl_ctl.sh stop <exp_name>
 #   scripts/hmarl_ctl.sh status <exp_name>
 #   scripts/hmarl_ctl.sh logs <exp_name>
-#   scripts/hmarl_ctl.sh tb [port]
+#   scripts/hmarl_ctl.sh tb [port] [exp_name|all]
+#
+# Behavior:
+#   - If resume_from is omitted: fresh start (no --resume)
+#   - If resume_from is provided: resume from target env steps / checkpoint path
+#
+# Agent variant selection:
+#   - Export HMARL_AGENT_VARIANT=baseline|rule_fire before invoking this script.
 
 LOG_ROOT="train_dir/mappo/_manual_logs"
 mkdir -p "${LOG_ROOT}"
@@ -29,9 +36,13 @@ is_running() {
 
 start_bg() {
   local exp_name="$1"
-  local resume_from="${2:-200000}"
+  local resume_from="${2:-}"
   local pid_file="${LOG_ROOT}/${exp_name}.pid"
-  local log_file="${LOG_ROOT}/train_${exp_name}_resume_${resume_from}_$(date +%Y%m%d_%H%M%S).log"
+  local run_tag="fresh"
+  if [[ -n "${resume_from}" ]]; then
+    run_tag="resume_${resume_from}"
+  fi
+  local log_file="${LOG_ROOT}/train_${exp_name}_${run_tag}_$(date +%Y%m%d_%H%M%S).log"
 
   if [[ -f "${pid_file}" ]]; then
     local old_pid
@@ -43,7 +54,13 @@ start_bg() {
     fi
   fi
 
-  nohup bash scripts/run_hmarl_train.sh "${exp_name}" "" resume "${resume_from}" > "${log_file}" 2>&1 &
+  if [[ -n "${resume_from}" ]]; then
+    echo "[hmarl_ctl] mode=resume exp=${exp_name} resume_from=${resume_from}"
+    nohup bash scripts/run_hmarl_train.sh "${exp_name}" "" resume "${resume_from}" > "${log_file}" 2>&1 &
+  else
+    echo "[hmarl_ctl] mode=fresh exp=${exp_name}"
+    nohup bash scripts/run_hmarl_train.sh "${exp_name}" > "${log_file}" 2>&1 &
+  fi
   local new_pid=$!
   echo "${new_pid}" > "${pid_file}"
 
@@ -53,9 +70,13 @@ start_bg() {
 
 start_fg() {
   local exp_name="$1"
-  local resume_from="${2:-200000}"
-  echo "[hmarl_ctl] foreground run exp=${exp_name} resume_from=${resume_from}"
-  exec bash scripts/run_hmarl_train.sh "${exp_name}" "" resume "${resume_from}"
+  local resume_from="${2:-}"
+  if [[ -n "${resume_from}" ]]; then
+    echo "[hmarl_ctl] foreground run exp=${exp_name} mode=resume resume_from=${resume_from}"
+    exec bash scripts/run_hmarl_train.sh "${exp_name}" "" resume "${resume_from}"
+  fi
+  echo "[hmarl_ctl] foreground run exp=${exp_name} mode=fresh"
+  exec bash scripts/run_hmarl_train.sh "${exp_name}"
 }
 
 stop_run() {
@@ -118,8 +139,40 @@ logs_run() {
 
 run_tb() {
   local port="${1:-6007}"
-  echo "[hmarl_ctl] tensorboard port=${port}"
-  exec conda run -n maca-py37-min python -m tensorboard.main --logdir train_dir/mappo --port "${port}" --host 0.0.0.0
+  local exp_name="${2:-all}"
+
+  if [[ "${exp_name}" != "all" ]]; then
+    local single_dir="train_dir/mappo/${exp_name}/tb"
+    if [[ ! -d "${single_dir}" ]]; then
+      echo "[hmarl_ctl] tb dir not found: ${single_dir}"
+      exit 1
+    fi
+    echo "[hmarl_ctl] tensorboard mode=single exp=${exp_name} port=${port} logdir=${single_dir}"
+    exec conda run -n maca-py37-min python -m tensorboard.main --logdir "${single_dir}" --port "${port}" --host 0.0.0.0
+  fi
+
+  local specs=()
+  local tb_dir
+  for tb_dir in train_dir/mappo/*/tb; do
+    if [[ ! -d "${tb_dir}" ]]; then
+      continue
+    fi
+    if ls -1 "${tb_dir}"/events.out.tfevents.* >/dev/null 2>&1; then
+      local exp
+      exp="$(basename "$(dirname "${tb_dir}")")"
+      specs+=("${exp}:${tb_dir}")
+    fi
+  done
+
+  if [[ ${#specs[@]} -le 0 ]]; then
+    echo "[hmarl_ctl] no event files found, fallback logdir=train_dir/mappo"
+    exec conda run -n maca-py37-min python -m tensorboard.main --logdir train_dir/mappo --port "${port}" --host 0.0.0.0
+  fi
+
+  local logdir_spec
+  logdir_spec="$(IFS=,; echo "${specs[*]}")"
+  echo "[hmarl_ctl] tensorboard mode=all port=${port} runs=${#specs[@]}"
+  exec conda run -n maca-py37-min python -m tensorboard.main --logdir_spec "${logdir_spec}" --port "${port}" --host 0.0.0.0
 }
 
 case "${cmd}" in
@@ -128,14 +181,14 @@ case "${cmd}" in
       echo "Usage: scripts/hmarl_ctl.sh start <exp_name> [resume_from]"
       exit 1
     fi
-    start_bg "$2" "${3:-200000}"
+    start_bg "$2" "${3:-}"
     ;;
   start-fg)
     if [[ $# -lt 2 ]]; then
       echo "Usage: scripts/hmarl_ctl.sh start-fg <exp_name> [resume_from]"
       exit 1
     fi
-    start_fg "$2" "${3:-200000}"
+    start_fg "$2" "${3:-}"
     ;;
   stop)
     if [[ $# -lt 2 ]]; then
@@ -159,7 +212,7 @@ case "${cmd}" in
     logs_run "$2"
     ;;
   tb)
-    run_tb "${2:-6007}"
+    run_tb "${2:-6007}" "${3:-all}"
     ;;
   *)
     echo "Unknown command: ${cmd}"

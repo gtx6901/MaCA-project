@@ -28,6 +28,27 @@ Use `hmarl_ctl.sh` for daily operations.
 
 ### 3.1 Start training in background
 
+Default behavior is fresh start (no resume):
+
+```bash
+EXP_NAME="hmarl_fresh_$(date +%m%d_%H%M%S)"
+bash scripts/hmarl_ctl.sh start "$EXP_NAME"
+```
+
+Start different agent variants with the same unified script:
+
+```bash
+# Version A: baseline (full_discrete + no rule attack)
+EXP_NAME="hmarl_baseline_$(date +%m%d_%H%M%S)"
+HMARL_AGENT_VARIANT=baseline bash scripts/hmarl_ctl.sh start "$EXP_NAME"
+
+# Version B: rule_fire (nearest_target + fire_or_not + disable high-level mode)
+EXP_NAME="hmarl_rulefire_$(date +%m%d_%H%M%S)"
+HMARL_AGENT_VARIANT=rule_fire bash scripts/hmarl_ctl.sh start "$EXP_NAME"
+```
+
+Resume only when explicitly passing `resume_from`:
+
 ```bash
 EXP_NAME="hmarl_recover_from226944_0417_151702"
 bash scripts/hmarl_ctl.sh start "$EXP_NAME" 200000
@@ -35,11 +56,21 @@ bash scripts/hmarl_ctl.sh start "$EXP_NAME" 200000
 
 Notes:
 
-- The second argument (`200000`) is `resume_from`.
+- If the second argument is omitted, training starts fresh.
+- The second argument (`200000`) is `resume_from` when provided.
 - If no exact checkpoint at `200000` exists, trainer automatically falls back to the latest checkpoint `<= target`.
 - If no checkpoint is `<= target`, it falls back to the earliest checkpoint.
 
 ### 3.2 Start training in foreground
+
+Default fresh start:
+
+```bash
+EXP_NAME="hmarl_fresh_$(date +%m%d_%H%M%S)"
+bash scripts/hmarl_ctl.sh start-fg "$EXP_NAME"
+```
+
+Foreground resume:
 
 ```bash
 EXP_NAME="hmarl_recover_from226944_0417_151702"
@@ -72,12 +103,21 @@ bash scripts/hmarl_ctl.sh stop "$EXP_NAME"
 ### 4.1 Start TensorBoard
 
 ```bash
+# Default: aggregate all experiments (each experiment appears as an individual run name)
 bash scripts/hmarl_ctl.sh tb 6007
+
+# Single experiment view
+bash scripts/hmarl_ctl.sh tb 6007 hmarl_0417_172930
 ```
 
 Open in browser:
 
 - `http://localhost:6007`
+
+Notes:
+
+- `tb 6007` uses multi-run mode via `--logdir_spec` and shows one run per experiment.
+- `tb 6007 <exp_name>` uses single-run mode; TensorBoard may display run name as `.` (this is expected because logdir points directly to one `tb/` folder).
 
 ### 4.2 Resume behavior and curve cleanup
 
@@ -91,7 +131,7 @@ You can call `run_hmarl_train.sh` directly when needed.
 Usage:
 
 ```bash
-bash scripts/run_hmarl_train.sh [experiment_name] [teacher_ckpt] [resume] [resume_from]
+bash scripts/run_hmarl_train.sh [experiment_name] [teacher_ckpt] [resume] [resume_from] [agent_variant]
 ```
 
 Examples:
@@ -105,6 +145,9 @@ bash scripts/run_hmarl_train.sh hmarl_recover_from226944_0417_151702 "" resume t
 
 # New run (no resume)
 bash scripts/run_hmarl_train.sh hmarl_new_run
+
+# New run with explicit variant
+bash scripts/run_hmarl_train.sh hmarl_rulefire_run "" "" "" rule_fire
 ```
 
 `resume_from` meaning:

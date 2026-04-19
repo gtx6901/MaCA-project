@@ -3,18 +3,23 @@ set -euo pipefail
 
 # One-click HMARL train launcher.
 # Usage:
-#   scripts/run_hmarl_train.sh [experiment_name] [teacher_ckpt] [resume] [resume_from]
+#   scripts/run_hmarl_train.sh [experiment_name] [teacher_ckpt] [resume] [resume_from] [agent_variant]
 #
 # resume_from:
 #   - number: target env_steps (e.g. 200000)
 #   - path: specific checkpoint file path
+#
+# agent_variant:
+#   - baseline: full_discrete + no rule attack
+#   - rule_fire: nearest_target + fire_or_not + disable high-level mode
 
 EXP_NAME="${1:-hmarl_main_$(date +%Y%m%d_%H%M%S)}"
 TEACHER_CKPT="${2:-}"
 RESUME_MODE="${3:-}"
 RESUME_FROM="${4:-}"
+AGENT_VARIANT="${5:-${HMARL_AGENT_VARIANT:-baseline}}"
 
-echo "[run_hmarl_train] experiment=${EXP_NAME} profile=aggressive"
+echo "[run_hmarl_train] experiment=${EXP_NAME} profile=conservative_stable agent_variant=${AGENT_VARIANT}"
 
 TRAIN_ARGS=(
   --experiment "${EXP_NAME}"
@@ -24,21 +29,30 @@ TRAIN_ARGS=(
   --rollout 96
   --chunk_len 24
   --burn_in 8
-  --ppo_epochs 8
-  --num_mini_batches 8
-  --learning_rate 4e-4
+  --ppo_epochs 6
+  --num_mini_batches 6
+  --learning_rate 2e-4
+  --lr_schedule linear
+  --lr_min_ratio 0.33
+  --lr_second_half_start_frac 0.5
+  --lr_second_half_ratio 0.33
   --clip_ratio 0.12
   --entropy_coeff 0.015
-  --mode_interval 4
-  --high_level_loss_coeff 0.45
-  --high_level_entropy_coeff 0.003
+  --max_grad_norm 3.5
+  --max_actor_grad_norm 1.5
+  --max_critic_grad_norm 2.0
+  --save_best_checkpoint true
+  --best_checkpoint_source eval_then_train
+  --mode_interval 6
+  --high_level_loss_coeff 0.3
+  --high_level_entropy_coeff 0.002
   --maca_mode_reward_scale 0.8
   --maca_exec_reward_scale 0.35
   --maca_disengage_penalty 0.08
   --maca_bearing_reward_scale 0.08
   --maca_progress_reward_scale 0.003
   --maca_attack_window_reward 0.15
-  --maca_agent_aux_reward_scale 0.05
+  --maca_agent_aux_reward_scale 0.08
   --curriculum_enabled true
   --curriculum_easy_frac 0.15
   --curriculum_medium_frac 0.5
@@ -57,6 +71,27 @@ TRAIN_ARGS=(
   --log_every_sec 20
   --tensorboard true
 )
+
+case "${AGENT_VARIANT}" in
+  baseline)
+    TRAIN_ARGS+=(
+      --attack_rule_mode none
+      --attack_policy_mode full_discrete
+      --disable_high_level_mode false
+    )
+    ;;
+  rule_fire)
+    TRAIN_ARGS+=(
+      --attack_rule_mode nearest_target
+      --attack_policy_mode fire_or_not
+      --disable_high_level_mode true
+    )
+    ;;
+  *)
+    echo "[run_hmarl_train] unknown agent_variant=${AGENT_VARIANT}, expected: baseline | rule_fire"
+    exit 1
+    ;;
+esac
 
 if [[ -n "${TEACHER_CKPT}" ]]; then
   echo "[run_hmarl_train] teacher_ckpt=${TEACHER_CKPT} imitation=enabled"

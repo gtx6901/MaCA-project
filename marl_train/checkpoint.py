@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -67,8 +67,32 @@ def checkpoint_dir(args) -> Path:
     return experiment_dir(args) / "checkpoint"
 
 
+def best_checkpoint_path(args) -> Path:
+    return checkpoint_dir(args) / "checkpoint_best.pt"
+
+
+def best_checkpoint_meta_path(args) -> Path:
+    return checkpoint_dir(args) / "checkpoint_best.json"
+
+
 def eval_dir(args) -> Path:
     return experiment_dir(args) / "eval"
+
+
+def load_best_metric(args, metric_name: str = "win_rate") -> float:
+    meta_path = best_checkpoint_meta_path(args)
+    if not meta_path.exists():
+        return float("-inf")
+    try:
+        payload = json.loads(meta_path.read_text())
+    except Exception:
+        return float("-inf")
+    value = float(payload.get("metric_value", float("-inf")))
+    if str(payload.get("metric_name", metric_name)) != str(metric_name):
+        return float("-inf")
+    if not np.isfinite(value):
+        return float("-inf")
+    return value
 
 
 def latest_checkpoint(args) -> Optional[Path]:
@@ -153,11 +177,15 @@ def save_config(args, local_obs_dim: int, global_state_dim: int, num_agents: int
     (exp_dir / "cfg.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
 
 
-def save_checkpoint(args, model, optimizer, env_steps, update_idx, value_normalizer=None):
-    ckpt_dir = checkpoint_dir(args)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    path = ckpt_dir / ("checkpoint_%09d_%d.pt" % (update_idx, env_steps))
-    payload = {
+def _build_checkpoint_payload(
+    model,
+    optimizer,
+    env_steps,
+    update_idx,
+    value_normalizer=None,
+    extra: Optional[Dict[str, object]] = None,
+):
+    payload: Dict[str, object] = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "env_steps": int(env_steps),
@@ -165,8 +193,76 @@ def save_checkpoint(args, model, optimizer, env_steps, update_idx, value_normali
     }
     if value_normalizer is not None:
         payload["value_normalizer"] = value_normalizer.state_dict()
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def save_checkpoint(args, model, optimizer, env_steps, update_idx, value_normalizer=None):
+    ckpt_dir = checkpoint_dir(args)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    path = ckpt_dir / ("checkpoint_%09d_%d.pt" % (update_idx, env_steps))
+    payload = _build_checkpoint_payload(
+        model=model,
+        optimizer=optimizer,
+        env_steps=env_steps,
+        update_idx=update_idx,
+        value_normalizer=value_normalizer,
+    )
     torch.save(payload, path)
     print("[checkpoint] saved %s" % path, flush=True)
+
+
+def save_best_checkpoint(
+    args,
+    model,
+    optimizer,
+    env_steps,
+    update_idx,
+    metric_value: float,
+    metric_name: str,
+    source: str,
+    value_normalizer=None,
+) -> bool:
+    metric_value = float(metric_value)
+    if not np.isfinite(metric_value):
+        return False
+
+    ckpt_dir = checkpoint_dir(args)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_path = best_checkpoint_path(args)
+    meta_path = best_checkpoint_meta_path(args)
+
+    payload = _build_checkpoint_payload(
+        model=model,
+        optimizer=optimizer,
+        env_steps=env_steps,
+        update_idx=update_idx,
+        value_normalizer=value_normalizer,
+        extra={
+            "best_metric_name": str(metric_name),
+            "best_metric_value": metric_value,
+            "best_metric_source": str(source),
+        },
+    )
+    torch.save(payload, best_path)
+
+    meta_payload = {
+        "metric_name": str(metric_name),
+        "metric_value": metric_value,
+        "source": str(source),
+        "env_steps": int(env_steps),
+        "update_idx": int(update_idx),
+        "updated_at_unix": float(time.time()),
+        "checkpoint_path": str(best_path),
+    }
+    meta_path.write_text(json.dumps(meta_payload, ensure_ascii=False, indent=2))
+    print(
+        "[checkpoint] best updated metric=%s value=%.4f source=%s path=%s"
+        % (str(metric_name), metric_value, str(source), best_path),
+        flush=True,
+    )
+    return True
 
 
 def load_checkpoint(args, model, optimizer, value_normalizer=None, root_dir: Optional[Path] = None):

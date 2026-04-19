@@ -9,6 +9,7 @@ import time
 from collections import deque
 from pathlib import Path
 
+import numpy as np
 import torch
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -19,7 +20,14 @@ if str(ENV_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_DIR))
 
 from marl_env.mappo_model import MAPPOModelConfig, TeamActorCritic
-from marl_train.checkpoint import ValueNormalizer, load_checkpoint, save_checkpoint, save_config
+from marl_train.checkpoint import (
+    ValueNormalizer,
+    load_best_metric,
+    load_checkpoint,
+    save_best_checkpoint,
+    save_checkpoint,
+    save_config,
+)
 from marl_train.collector import CollectorPool, allocate_shared_actor_params, build_env, write_shared_actor_params
 from marl_train.eval import run_evaluation
 from marl_train.logging_utils import (
@@ -54,13 +62,23 @@ def parse_args(argv=None):
 
     parser.add_argument("--ppo_epochs", type=int, default=5)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--lr_schedule", type=str, default="linear")
+    parser.add_argument("--lr_min_ratio", type=float, default=0.33)
+    parser.add_argument("--lr_second_half_start_frac", type=float, default=0.5)
+    parser.add_argument("--lr_second_half_ratio", type=float, default=0.33)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae_lambda", type=float, default=0.95)
     parser.add_argument("--clip_ratio", type=float, default=0.1)
     parser.add_argument("--value_loss_coeff", type=float, default=0.5)
     parser.add_argument("--entropy_coeff", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=5.0)
+    parser.add_argument("--max_actor_grad_norm", type=float, default=2.5)
+    parser.add_argument("--max_critic_grad_norm", type=float, default=2.5)
     parser.add_argument("--num_mini_batches", type=int, default=4)
+    parser.add_argument("--attack_rule_mode", type=str, default="none")
+    parser.add_argument("--attack_policy_mode", type=str, default="full_discrete")
+    parser.add_argument("--attack_rule_prefer_long", type=str2bool, default=True)
+    parser.add_argument("--disable_high_level_mode", type=str2bool, default=False)
 
     parser.add_argument("--mode_interval", type=int, default=8)
     parser.add_argument("--high_level_loss_coeff", type=float, default=0.25)
@@ -83,6 +101,9 @@ def parse_args(argv=None):
     parser.add_argument("--eval_episodes", type=int, default=20)
     parser.add_argument("--eval_deterministic", type=str2bool, default=True)
     parser.add_argument("--eval_opponent", type=str, default=None)
+    parser.add_argument("--save_best_checkpoint", type=str2bool, default=True)
+    parser.add_argument("--best_checkpoint_source", type=str, default="eval_then_train")
+    parser.add_argument("--debug_freeze_update_after_env_steps", type=int, default=-1)
 
     parser.add_argument("--team_adv_weight", type=float, default=1.0)
     parser.add_argument("--aux_adv_weight", type=float, default=1.0)
@@ -142,6 +163,20 @@ def parse_args(argv=None):
         raise ValueError("curriculum_medium_frac must be in [0,1]")
     if args.curriculum_easy_frac > args.curriculum_medium_frac:
         raise ValueError("curriculum_easy_frac must be <= curriculum_medium_frac")
+    if str(args.lr_schedule).lower() not in {"constant", "linear"}:
+        raise ValueError("lr_schedule must be one of: constant, linear")
+    if not (0.0 < float(args.lr_min_ratio) <= 1.0):
+        raise ValueError("lr_min_ratio must be in (0,1]")
+    if not (0.0 <= float(args.lr_second_half_start_frac) <= 1.0):
+        raise ValueError("lr_second_half_start_frac must be in [0,1]")
+    if not (0.0 < float(args.lr_second_half_ratio) <= 1.0):
+        raise ValueError("lr_second_half_ratio must be in (0,1]")
+    if str(args.best_checkpoint_source).lower() not in {"eval", "train", "eval_then_train"}:
+        raise ValueError("best_checkpoint_source must be one of: eval, train, eval_then_train")
+    if str(args.attack_rule_mode).lower() not in {"none", "nearest_target"}:
+        raise ValueError("attack_rule_mode must be one of: none, nearest_target")
+    if str(args.attack_policy_mode).lower() not in {"full_discrete", "fire_or_not"}:
+        raise ValueError("attack_policy_mode must be one of: full_discrete, fire_or_not")
     return args
 
 
@@ -231,6 +266,79 @@ def apply_curriculum_profile(args, profile):
     args.runtime_curriculum_id = int(profile["id"])
 
 
+def compute_scheduled_lr(args, env_steps: int) -> float:
+    base_lr = float(args.learning_rate)
+    if base_lr <= 0.0:
+        return 0.0
+
+    progress = min(1.0, max(0.0, float(env_steps) / float(max(1, int(args.train_for_env_steps)))))
+    schedule = str(args.lr_schedule).lower()
+    min_ratio = float(args.lr_min_ratio)
+
+    if schedule == "constant":
+        lr = base_lr
+        start_lr = base_lr
+    else:
+        min_lr = base_lr * min_ratio
+        lr = base_lr + (min_lr - base_lr) * progress
+        start_frac = float(args.lr_second_half_start_frac)
+        start_lr = base_lr + (min_lr - base_lr) * start_frac
+
+    tail_start = float(args.lr_second_half_start_frac)
+    tail_ratio = float(args.lr_second_half_ratio)
+    if tail_ratio < 1.0 and progress >= tail_start and tail_start < 1.0:
+        tail_progress = (progress - tail_start) / max(1e-6, 1.0 - tail_start)
+        target_lr = base_lr * tail_ratio
+        lr = start_lr + (target_lr - start_lr) * tail_progress
+
+    return max(0.0, float(lr))
+
+
+def set_optimizer_lr(optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(lr)
+
+
+def frozen_update_stats(returns: np.ndarray, values: np.ndarray, value_normalizer: ValueNormalizer):
+    returns_np = np.asarray(returns, dtype=np.float32)
+    values_np = np.asarray(values, dtype=np.float32)
+
+    valid = np.isfinite(returns_np) & np.isfinite(values_np)
+    explained_var = 0.0
+    if np.any(valid):
+        r = returns_np[valid]
+        v = values_np[valid]
+        var_r = float(np.var(r))
+        if r.size > 1 and var_r > 1e-8:
+            explained_var = float(1.0 - np.var(r - v) / var_r)
+
+    norm_returns = value_normalizer.normalize(returns_np)
+    return {
+        "policy_loss": 0.0,
+        "policy_loss_low": 0.0,
+        "policy_loss_high": 0.0,
+        "value_loss": 0.0,
+        "entropy": 0.0,
+        "entropy_low": 0.0,
+        "entropy_high": 0.0,
+        "imitation_loss": 0.0,
+        "imitation_coef": 0.0,
+        "active_samples": 0,
+        "grad_steps": 0,
+        "explained_variance": explained_var,
+        "actor_grad_norm": 0.0,
+        "critic_grad_norm": 0.0,
+        "active_mask_ratio": 0.0,
+        "hidden_state_init_abs_error": 0.0,
+        "skipped_non_finite_batches": 0,
+        "repaired_non_finite_params": 0,
+        "value_target_mean": float(np.mean(returns_np)),
+        "value_target_std": float(np.std(returns_np)),
+        "value_target_norm_mean": float(np.mean(norm_returns)),
+        "value_target_norm_std": float(np.std(norm_returns)),
+    }
+
+
 def main(argv=None):
     args = parse_args(argv)
     device = device_from_arg(args.device)
@@ -282,6 +390,8 @@ def main(argv=None):
     if args.resume:
         env_steps, update_idx = load_checkpoint(args, model, optimizer, value_normalizer, root_dir=ROOT_DIR)
 
+    set_optimizer_lr(optimizer, compute_scheduled_lr(args, env_steps))
+
     shared_actor = allocate_shared_actor_params(model)
     write_shared_actor_params(model, shared_actor)
 
@@ -290,7 +400,7 @@ def main(argv=None):
 
     save_config(args, local_obs_dim, global_state_dim, num_agents, collectors.worker_env_counts)
     print(
-        "[collector] num_workers=%d num_envs=%d worker_env_counts=%s obs_id_onehot=%s base_obs_dim=%d final_obs_dim=%d curriculum_stage=%s"
+        "[collector] num_workers=%d num_envs=%d worker_env_counts=%s obs_id_onehot=%s base_obs_dim=%d final_obs_dim=%d curriculum_stage=%s attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%s"
         % (
             collectors.num_workers,
             collectors.num_envs,
@@ -299,11 +409,19 @@ def main(argv=None):
             int(base_local_obs_dim),
             int(local_obs_dim),
             str(getattr(args, "runtime_curriculum_name", "full")),
+            str(args.attack_rule_mode),
+            str(args.attack_policy_mode),
+            str(bool(args.disable_high_level_mode)),
         ),
         flush=True,
     )
 
     writer = build_summary_writer(args, purge_step=env_steps if args.resume else None)
+
+    best_metric_name = "win_rate"
+    best_metric = load_best_metric(args, metric_name=best_metric_name) if bool(args.save_best_checkpoint) else float("-inf")
+    if bool(args.save_best_checkpoint):
+        print("[checkpoint] best metric init %s=%.4f" % (best_metric_name, float(best_metric)), flush=True)
 
     last_log_time = time.time()
     last_save_time = time.time()
@@ -367,20 +485,34 @@ def main(argv=None):
                 flush=True,
             )
 
-            ppo_start = time.time()
-            stats = ppo_update(
-                model,
-                optimizer,
-                buffer,
-                advantages_team,
-                advantages_aux,
-                returns,
-                device,
-                args,
-                value_normalizer,
-                teacher_model=teacher_model,
-                update_idx=update_idx,
+            current_lr = compute_scheduled_lr(args, env_steps)
+            set_optimizer_lr(optimizer, current_lr)
+            freeze_update = int(args.debug_freeze_update_after_env_steps) >= 0 and env_steps >= int(
+                args.debug_freeze_update_after_env_steps
             )
+
+            ppo_start = time.time()
+            if freeze_update:
+                stats = frozen_update_stats(returns, buffer["value"], value_normalizer)
+                print(
+                    "[debug] update frozen env_steps=%d threshold=%d"
+                    % (env_steps, int(args.debug_freeze_update_after_env_steps)),
+                    flush=True,
+                )
+            else:
+                stats = ppo_update(
+                    model,
+                    optimizer,
+                    buffer,
+                    advantages_team,
+                    advantages_aux,
+                    returns,
+                    device,
+                    args,
+                    value_normalizer,
+                    teacher_model=teacher_model,
+                    update_idx=update_idx,
+                )
             ppo_update_time = time.time() - ppo_start
             total_update_time = time.time() - update_start
 
@@ -401,6 +533,9 @@ def main(argv=None):
                 attack_masks=buffer["attack_masks"].astype(bool, copy=False),
                 course_dim=model_cfg.course_dim,
                 attack_dim=model_cfg.attack_dim,
+                policy_attack_actions=buffer.get("policy_attack_action", None),
+                attack_policy_mode=str(args.attack_policy_mode),
+                attack_rule_mode=str(args.attack_rule_mode),
             )
             print(
                 "[stage] update=%d env_steps=%d ppo_update_finished"
@@ -432,6 +567,7 @@ def main(argv=None):
                 summary = summarize_episode_stats(list(episode_stats))
                 reward_mean = summary.get("round_reward_mean", 0.0)
                 win_rate = summary.get("win_rate", 0.0)
+                damage_reward_mean = float(rollout_diag.get("damage_reward_mean", 0.0))
                 log_summary(writer, "train_episode", summary, env_steps)
                 log_train_scalars(
                     writer,
@@ -443,9 +579,15 @@ def main(argv=None):
                     timing_stats=timing_stats,
                     concat_agent_id_onehot=bool(args.concat_agent_id_onehot),
                     stage_id=int(getattr(args, "runtime_curriculum_id", 3)),
+                    current_lr=current_lr,
+                    reward_mean=reward_mean,
+                    win_rate=win_rate,
+                    attack_rule_mode=str(args.attack_rule_mode),
+                    attack_policy_mode=str(args.attack_policy_mode),
+                    disable_high_level_mode=bool(args.disable_high_level_mode),
                 )
                 print(
-                    "[train] env_steps=%d update=%d stage=%s reward_mean=%.2f win_rate=%.3f fps=%.1f policy=%.4f low=%.4f high=%.4f value_loss=%.4f entropy=%.4f imitation=%.4f coef=%.4f ev=%.4f actor_gn=%.4f critic_gn=%.4f active=%.3f skipped_nf=%d repaired_nf=%d hidden_err=%.6f rnn_mismatch=%d grad_steps=%d"
+                    "[train] env_steps=%d update=%d stage=%s reward_mean=%.2f win_rate=%.3f fps=%.1f lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d policy=%.4f low=%.4f high=%.4f value_loss=%.4f entropy=%.4f imitation=%.4f coef=%.4f ev=%.4f actor_gn=%.4f critic_gn=%.4f active=%.3f skipped_nf=%d repaired_nf=%d hidden_err=%.6f rnn_mismatch=%d grad_steps=%d"
                     % (
                         env_steps,
                         update_idx,
@@ -453,6 +595,10 @@ def main(argv=None):
                         reward_mean,
                         win_rate,
                         sample_fps,
+                        current_lr,
+                        str(args.attack_rule_mode),
+                        str(args.attack_policy_mode),
+                        int(bool(args.disable_high_level_mode)),
                         stats.get("policy_loss", 0.0),
                         stats.get("policy_loss_low", 0.0),
                         stats.get("policy_loss_high", 0.0),
@@ -472,6 +618,56 @@ def main(argv=None):
                     ),
                     flush=True,
                 )
+                print(
+                    "[stability] env_steps=%d update=%d lr=%.6g attack_rule_mode=%s attack_policy_mode=%s disable_high_level_mode=%d actor_gn=%.4f critic_gn=%.4f value_loss=%.4f policy_loss=%.4f entropy=%.4f value_target_std=%.4f value_target_norm_std=%.4f active_mask_ratio=%.4f reward_mean=%.2f win_rate=%.3f damage_reward_mean=%.4f attack_opportunity_frac=%.4f executed_fire_action_frac=%.4f no_fire_when_legal_frac=%.4f opportunity_to_fire_ratio=%.4f fire_decision_freq_00=%.4f fire_decision_freq_01=%.4f rule_selected_attack_nonzero_freq=%.4f freeze_update=%d"
+                    % (
+                        env_steps,
+                        update_idx,
+                        current_lr,
+                        str(args.attack_rule_mode),
+                        str(args.attack_policy_mode),
+                        int(bool(args.disable_high_level_mode)),
+                        stats.get("actor_grad_norm", 0.0),
+                        stats.get("critic_grad_norm", 0.0),
+                        stats.get("value_loss", 0.0),
+                        stats.get("policy_loss", 0.0),
+                        stats.get("entropy", 0.0),
+                        stats.get("value_target_std", 0.0),
+                        stats.get("value_target_norm_std", 0.0),
+                        stats.get("active_mask_ratio", 0.0),
+                        reward_mean,
+                        win_rate,
+                        damage_reward_mean,
+                        action_stats.get("attack_opportunity_frac", 0.0),
+                        action_stats.get("executed_fire_action_frac", 0.0),
+                        action_stats.get("no_fire_when_legal_frac", 0.0),
+                        action_stats.get("opportunity_to_fire_ratio", 0.0),
+                        action_stats.get("fire_decision_freq_00", 0.0),
+                        action_stats.get("fire_decision_freq_01", 0.0),
+                        action_stats.get("rule_selected_attack_nonzero_freq", 0.0),
+                        int(freeze_update),
+                    ),
+                    flush=True,
+                )
+
+                if bool(args.save_best_checkpoint) and str(args.best_checkpoint_source).lower() in {
+                    "train",
+                    "eval_then_train",
+                }:
+                    train_metric = float(win_rate)
+                    if np.isfinite(train_metric) and train_metric > float(best_metric):
+                        if save_best_checkpoint(
+                            args,
+                            model,
+                            optimizer,
+                            env_steps,
+                            update_idx,
+                            metric_value=train_metric,
+                            metric_name=best_metric_name,
+                            source="train",
+                            value_normalizer=value_normalizer,
+                        ):
+                            best_metric = train_metric
                 last_log_time = time.time()
 
             if time.time() - last_save_time >= args.save_every_sec:
@@ -497,6 +693,24 @@ def main(argv=None):
                     ),
                     flush=True,
                 )
+                if bool(args.save_best_checkpoint) and str(args.best_checkpoint_source).lower() in {
+                    "eval",
+                    "eval_then_train",
+                }:
+                    eval_metric = float(eval_summary.get("win_rate", 0.0))
+                    if np.isfinite(eval_metric) and eval_metric > float(best_metric):
+                        if save_best_checkpoint(
+                            args,
+                            model,
+                            optimizer,
+                            env_steps,
+                            update_idx,
+                            metric_value=eval_metric,
+                            metric_name=best_metric_name,
+                            source="eval",
+                            value_normalizer=value_normalizer,
+                        ):
+                            best_metric = eval_metric
                 next_eval_env_steps += int(args.eval_every_env_steps)
 
         save_checkpoint(args, model, optimizer, env_steps, update_idx, value_normalizer)

@@ -6,6 +6,7 @@ import time
 import numpy as np
 import torch
 
+from fighter_action_utils import FIGHTER_NUM
 from marl_env.mappo_env import MAPPOMaCAConfig, MAPPOMaCAEnv
 from marl_train.checkpoint import eval_dir
 from marl_train.logging_utils import summarize_episode_stats
@@ -32,7 +33,61 @@ def ensure_valid_action_mask(masks: torch.Tensor) -> torch.Tensor:
     return safe_masks
 
 
-def select_eval_actions(model, obs, actor_h, device, deterministic: bool, concat_agent_id_onehot: bool, num_agents: int):
+def fire_decision_logits_from_attack_logits(attack_logits: torch.Tensor, attack_masks: torch.Tensor) -> torch.Tensor:
+    invalid_logit = torch.finfo(attack_logits.dtype).min
+    masked_logits = attack_logits.masked_fill(~attack_masks, invalid_logit)
+    no_fire_logit = masked_logits[:, 0]
+    fire_logit = torch.logsumexp(masked_logits[:, 1:], dim=-1)
+    has_legal_nonzero = torch.any(attack_masks[:, 1:], dim=-1)
+    fire_logit = torch.where(has_legal_nonzero, fire_logit, torch.full_like(fire_logit, invalid_logit))
+    return torch.stack([no_fire_logit, fire_logit], dim=-1)
+
+
+def choose_nearest_target_attack(mask_row: np.ndarray, visible_target_ids_row: np.ndarray, prefer_long: bool) -> int:
+    legal_nonzero = np.flatnonzero(mask_row[1:]) + 1
+    if legal_nonzero.size <= 0:
+        return 0
+
+    for target_id_raw in visible_target_ids_row:
+        target_id = int(target_id_raw)
+        if target_id <= 0 or target_id > FIGHTER_NUM:
+            continue
+        long_idx = int(target_id)
+        short_idx = int(target_id + FIGHTER_NUM)
+        long_legal = long_idx < mask_row.shape[0] and bool(mask_row[long_idx])
+        short_legal = short_idx < mask_row.shape[0] and bool(mask_row[short_idx])
+        if prefer_long:
+            if long_legal:
+                return long_idx
+            if short_legal:
+                return short_idx
+        else:
+            if short_legal:
+                return short_idx
+            if long_legal:
+                return long_idx
+
+    long_candidates = legal_nonzero[(legal_nonzero >= 1) & (legal_nonzero <= FIGHTER_NUM)]
+    short_candidates = legal_nonzero[(legal_nonzero > FIGHTER_NUM)]
+    if prefer_long and long_candidates.size > 0:
+        return int(np.min(long_candidates))
+    if (not prefer_long) and short_candidates.size > 0:
+        return int(np.min(short_candidates))
+    return int(np.min(legal_nonzero))
+
+
+def select_eval_actions(
+    model,
+    obs,
+    actor_h,
+    device,
+    deterministic: bool,
+    concat_agent_id_onehot: bool,
+    num_agents: int,
+    attack_rule_mode: str,
+    attack_policy_mode: str,
+    attack_rule_prefer_long: bool,
+):
     local_obs_np = obs["local_obs"]
     if concat_agent_id_onehot:
         local_obs_np = append_agent_id_onehot(local_obs_np[None, ...], obs["agent_ids"][None, ...], num_agents)[0]
@@ -40,6 +95,7 @@ def select_eval_actions(model, obs, actor_h, device, deterministic: bool, concat
     agent_ids = torch.as_tensor(obs["agent_ids"], dtype=torch.long, device=device)
     attack_masks = torch.as_tensor(obs["attack_masks"], dtype=torch.bool, device=device)
     attack_masks = ensure_valid_action_mask(attack_masks)
+    visible_target_ids = np.asarray(obs.get("rule_visible_target_ids", np.zeros((num_agents, 0), dtype=np.int64)), dtype=np.int64)
     actor_h_t = torch.as_tensor(actor_h, dtype=torch.float32, device=device)
 
     with torch.no_grad():
@@ -52,12 +108,59 @@ def select_eval_actions(model, obs, actor_h, device, deterministic: bool, concat
 
         attack_logits = model.attack_logits(next_actor_h, course_action)
         attack_logits = sanitize_logits(attack_logits)
-        invalid_logit = torch.finfo(attack_logits.dtype).min
-        attack_logits = attack_logits.masked_fill(~attack_masks, invalid_logit)
-        if deterministic:
-            attack_action = torch.argmax(attack_logits, dim=-1)
+        attack_policy_mode = str(attack_policy_mode).lower()
+        attack_rule_mode = str(attack_rule_mode).lower()
+
+        if attack_policy_mode == "fire_or_not":
+            fire_logits = fire_decision_logits_from_attack_logits(attack_logits, attack_masks)
+            if deterministic:
+                fire_decision = torch.argmax(fire_logits, dim=-1).cpu().numpy().astype(np.int64, copy=False)
+            else:
+                fire_decision = (
+                    torch.distributions.Categorical(logits=fire_logits).sample().cpu().numpy().astype(np.int64, copy=False)
+                )
+
+            attack_masks_np = attack_masks.cpu().numpy().astype(np.bool_, copy=False)
+            attack_logits_cpu = attack_logits.detach().cpu()
+            attack_action_np = np.zeros((num_agents,), dtype=np.int64)
+            for idx in range(num_agents):
+                if not np.any(attack_masks_np[idx, 1:]) or int(fire_decision[idx]) <= 0:
+                    attack_action_np[idx] = 0
+                    continue
+                if attack_rule_mode == "nearest_target":
+                    attack_action_np[idx] = choose_nearest_target_attack(
+                        mask_row=attack_masks_np[idx],
+                        visible_target_ids_row=visible_target_ids[idx],
+                        prefer_long=bool(attack_rule_prefer_long),
+                    )
+                else:
+                    legal_nonzero = np.flatnonzero(attack_masks_np[idx, 1:]) + 1
+                    legal_idx_t = torch.as_tensor(legal_nonzero, dtype=torch.long)
+                    best_rel = int(torch.argmax(attack_logits_cpu[idx][legal_idx_t]).item())
+                    attack_action_np[idx] = int(legal_nonzero[best_rel])
+            attack_action = torch.as_tensor(attack_action_np, dtype=torch.long, device=device)
         else:
-            attack_action = torch.distributions.Categorical(logits=attack_logits).sample()
+            invalid_logit = torch.finfo(attack_logits.dtype).min
+            masked_attack_logits = attack_logits.masked_fill(~attack_masks, invalid_logit)
+            if deterministic:
+                attack_action = torch.argmax(masked_attack_logits, dim=-1)
+            else:
+                attack_action = torch.distributions.Categorical(logits=masked_attack_logits).sample()
+
+            if attack_rule_mode == "nearest_target":
+                attack_masks_np = attack_masks.cpu().numpy().astype(np.bool_, copy=False)
+                sampled_np = attack_action.cpu().numpy().astype(np.int64, copy=False)
+                remap_np = sampled_np.copy()
+                for idx in range(num_agents):
+                    if int(sampled_np[idx]) <= 0 or not np.any(attack_masks_np[idx, 1:]):
+                        remap_np[idx] = 0
+                    else:
+                        remap_np[idx] = choose_nearest_target_attack(
+                            mask_row=attack_masks_np[idx],
+                            visible_target_ids_row=visible_target_ids[idx],
+                            prefer_long=bool(attack_rule_prefer_long),
+                        )
+                attack_action = torch.as_tensor(remap_np, dtype=torch.long, device=device)
 
     actions = np.stack([course_action.cpu().numpy(), attack_action.cpu().numpy()], axis=-1)
     return actions, next_actor_h.cpu().numpy()
@@ -110,6 +213,9 @@ def run_evaluation(model, device, args, env_steps: int):
                 args.eval_deterministic,
                 concat_agent_id_onehot=bool(args.concat_agent_id_onehot),
                 num_agents=env.num_agents,
+                attack_rule_mode=str(getattr(args, "attack_rule_mode", "none")),
+                attack_policy_mode=str(getattr(args, "attack_policy_mode", "full_discrete")),
+                attack_rule_prefer_long=bool(getattr(args, "attack_rule_prefer_long", True)),
             )
             obs, _reward, done, info = env.step(actions)
             if not done:

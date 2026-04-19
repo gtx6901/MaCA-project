@@ -58,6 +58,12 @@ def log_train_scalars(
     timing_stats: Dict[str, float],
     concat_agent_id_onehot: bool,
     stage_id: int,
+    current_lr: float,
+    reward_mean: float,
+    win_rate: float,
+    attack_rule_mode: str,
+    attack_policy_mode: str,
+    disable_high_level_mode: bool,
 ):
     if writer is None:
         return
@@ -123,5 +129,25 @@ def log_train_scalars(
 
     writer.add_scalar("train/active_samples", float(stats.get("active_samples", 0)), env_steps)
     writer.add_scalar("train/grad_steps", float(stats.get("grad_steps", 0)), env_steps)
+    writer.add_scalar("train/current_lr", float(current_lr), env_steps)
+    writer.add_scalar("train/reward_mean", float(reward_mean), env_steps)
+    writer.add_scalar("train/win_rate", float(win_rate), env_steps)
+    writer.add_scalar("train/attack_rule_mode_none", 1.0 if str(attack_rule_mode).lower() == "none" else 0.0, env_steps)
+    writer.add_scalar(
+        "train/attack_rule_mode_nearest_target",
+        1.0 if str(attack_rule_mode).lower() == "nearest_target" else 0.0,
+        env_steps,
+    )
+    writer.add_scalar(
+        "train/attack_policy_mode_full_discrete",
+        1.0 if str(attack_policy_mode).lower() == "full_discrete" else 0.0,
+        env_steps,
+    )
+    writer.add_scalar(
+        "train/attack_policy_mode_fire_or_not",
+        1.0 if str(attack_policy_mode).lower() == "fire_or_not" else 0.0,
+        env_steps,
+    )
+    writer.add_scalar("train/disable_high_level_mode", 1.0 if disable_high_level_mode else 0.0, env_steps)
     writer.add_scalar("curriculum/stage_id", float(stage_id), env_steps)
     writer.flush()

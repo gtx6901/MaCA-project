@@ -124,10 +124,8 @@ data
 /environment/encryption/.pyarmor_config
 *.macalog
 *.pkl
-/tournament/result
 
 # Local training artifacts
 log/
-model/simple/
 model/backup/
 .codex

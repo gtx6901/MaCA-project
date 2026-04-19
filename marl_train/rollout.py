@@ -22,6 +22,7 @@ def rollout(collectors, model, device, args, episode_stats, value_normalizer=Non
         "actor_h",
         "course_action",
         "attack_action",
+        "policy_attack_action",
         "mode_action",
         "log_prob",
         "mode_log_prob",

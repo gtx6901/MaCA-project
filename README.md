@@ -109,8 +109,9 @@ This keeps the warm start on the same experiment path so the trainer can resume 
 - [configs/mappo.yaml](/home/lehan/MaCA-master/configs/mappo.yaml): top-level training config
 - [run_train.sh](/home/lehan/MaCA-master/run_train.sh): one-click launcher
 - [scripts/run_mappo_fixrule_teacher_pipeline.sh](/home/lehan/MaCA-master/scripts/run_mappo_fixrule_teacher_pipeline.sh): one-click teacher-to-PPO launcher
-- [scripts/monitor_mappo.sh](/home/lehan/MaCA-master/scripts/monitor_mappo.sh): quick process, GPU, and log monitor
-- [scripts/eval_mappo_latest.sh](/home/lehan/MaCA-master/scripts/eval_mappo_latest.sh): evaluate the latest or named experiment
+- [scripts/hmarl_ctl.sh](/home/lehan/MaCA-master/scripts/hmarl_ctl.sh): HMARL process control helper
+- [scripts/run_hmarl_train.sh](/home/lehan/MaCA-master/scripts/run_hmarl_train.sh): HMARL training launcher
+- [scripts/run_hmarl_eval.sh](/home/lehan/MaCA-master/scripts/run_hmarl_eval.sh): HMARL evaluation launcher
 - [scripts/train.py](/home/lehan/MaCA-master/scripts/train.py): unified config-driven training entrypoint
 - [scripts/evaluate.py](/home/lehan/MaCA-master/scripts/evaluate.py): unified config-driven evaluation entrypoint
 - [scripts/train_mappo_maca.py](/home/lehan/MaCA-master/scripts/train_mappo_maca.py): recurrent MAPPO trainer

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -12,6 +12,16 @@ def masked_categorical(logits: torch.Tensor, masks: torch.Tensor) -> Categorical
     invalid_logit = torch.finfo(logits.dtype).min
     masked_logits = logits.masked_fill(~masks, invalid_logit)
     return Categorical(logits=masked_logits)
+
+
+def fire_decision_logits_from_attack_logits(attack_logits: torch.Tensor, attack_masks: torch.Tensor) -> torch.Tensor:
+    invalid_logit = torch.finfo(attack_logits.dtype).min
+    masked_logits = attack_logits.masked_fill(~attack_masks, invalid_logit)
+    no_fire_logit = masked_logits[:, 0]
+    fire_logit = torch.logsumexp(masked_logits[:, 1:], dim=-1)
+    has_legal_nonzero = torch.any(attack_masks[:, 1:], dim=-1)
+    fire_logit = torch.where(has_legal_nonzero, fire_logit, torch.full_like(fire_logit, invalid_logit))
+    return torch.stack([no_fire_logit, fire_logit], dim=-1)
 
 
 def tensor_explained_variance(returns_t: torch.Tensor, values_t: torch.Tensor) -> float:
@@ -112,6 +122,7 @@ def pack_recurrent_minibatch(
     mode_duration,
     course_action,
     attack_action,
+    policy_attack_action,
     damage_reward,
     survival_reward,
     aux_reward_mean,
@@ -144,6 +155,7 @@ def pack_recurrent_minibatch(
     actor_h_batch = actor_h.new_zeros((max_total_len, batch_size, hidden_dim))
     course_batch = course_action.new_zeros((max_total_len, batch_size))
     attack_batch = attack_action.new_zeros((max_total_len, batch_size))
+    policy_attack_batch = policy_attack_action.new_zeros((max_total_len, batch_size))
     mode_batch = mode_action.new_zeros((max_total_len, batch_size))
     old_log_prob_batch = old_log_prob.new_zeros((max_total_len, batch_size))
     old_mode_log_prob_batch = mode_log_prob.new_zeros((max_total_len, batch_size))
@@ -176,6 +188,7 @@ def pack_recurrent_minibatch(
         actor_h_batch[:total_len, batch_col] = actor_h[burn_start:end, env_idx, agent_idx]
         course_batch[:total_len, batch_col] = course_action[burn_start:end, env_idx, agent_idx]
         attack_batch[:total_len, batch_col] = attack_action[burn_start:end, env_idx, agent_idx]
+        policy_attack_batch[:total_len, batch_col] = policy_attack_action[burn_start:end, env_idx, agent_idx]
         mode_batch[:total_len, batch_col] = mode_action[burn_start:end, env_idx, agent_idx]
         mode_decision_batch[:total_len, batch_col] = mode_decision[burn_start:end, env_idx, agent_idx]
         mode_duration_batch[:total_len, batch_col] = mode_duration[burn_start:end, env_idx, agent_idx]
@@ -201,6 +214,7 @@ def pack_recurrent_minibatch(
         "actor_h": actor_h_batch,
         "course_action": course_batch,
         "attack_action": attack_batch,
+        "policy_attack_action": policy_attack_batch,
         "mode_action": mode_batch,
         "mode_decision": mode_decision_batch,
         "mode_duration": mode_duration_batch,
@@ -242,6 +256,7 @@ def ppo_update(
     old_mode_log_prob = torch.as_tensor(buffer["mode_log_prob"], dtype=torch.float32, device=device)
     course_action = torch.as_tensor(buffer["course_action"], dtype=torch.long, device=device)
     attack_action = torch.as_tensor(buffer["attack_action"], dtype=torch.long, device=device)
+    policy_attack_action = torch.as_tensor(buffer.get("policy_attack_action", buffer["attack_action"]), dtype=torch.long, device=device)
     mode_action = torch.as_tensor(buffer["mode_action"], dtype=torch.long, device=device)
     mode_decision = torch.as_tensor(buffer["mode_decision"], dtype=torch.float32, device=device)
     mode_duration = torch.as_tensor(buffer["mode_duration"], dtype=torch.float32, device=device)
@@ -321,6 +336,7 @@ def ppo_update(
 
     actor_params = [p for name, p in model.named_parameters() if not name.startswith("critic")]
     critic_params = [p for name, p in model.named_parameters() if name.startswith("critic")]
+    attack_policy_mode = str(getattr(args, "attack_policy_mode", "full_discrete")).lower()
 
     for _ in range(args.ppo_epochs):
         order = np.random.permutation(num_chunks)
@@ -349,6 +365,7 @@ def ppo_update(
                 mode_duration,
                 course_action,
                 attack_action,
+                policy_attack_action,
                 damage_reward_t,
                 survival_reward_t,
                 aux_reward_mean_t,
@@ -444,7 +461,6 @@ def ppo_update(
                 course_logits = course_logits[seq_train]
                 attack_logits = attack_logits[seq_train]
                 seq_course = seq_course[seq_train]
-                seq_attack = packed["attack_action"][seq_idx, seq_valid][seq_train]
                 seq_attack_mask = packed["attack_masks"][seq_idx, seq_valid][seq_train]
                 seq_attack_mask = ensure_valid_action_mask(seq_attack_mask)
                 seq_old_log_prob = packed["old_log_prob"][seq_idx, seq_valid][seq_train]
@@ -465,9 +481,17 @@ def ppo_update(
                     continue
 
                 course_dist = Categorical(logits=course_logits)
-                attack_dist = masked_categorical(attack_logits, seq_attack_mask)
-                seq_log_prob = course_dist.log_prob(seq_course) + attack_dist.log_prob(seq_attack)
-                seq_entropy = course_dist.entropy() + attack_dist.entropy()
+                if attack_policy_mode == "fire_or_not":
+                    seq_policy_attack = packed["policy_attack_action"][seq_idx, seq_valid][seq_train]
+                    fire_logits = fire_decision_logits_from_attack_logits(attack_logits, seq_attack_mask)
+                    attack_dist = Categorical(logits=fire_logits)
+                    seq_log_prob = course_dist.log_prob(seq_course) + attack_dist.log_prob(seq_policy_attack)
+                    seq_entropy = course_dist.entropy() + attack_dist.entropy()
+                else:
+                    seq_attack = packed["attack_action"][seq_idx, seq_valid][seq_train]
+                    attack_dist = masked_categorical(attack_logits, seq_attack_mask)
+                    seq_log_prob = course_dist.log_prob(seq_course) + attack_dist.log_prob(seq_attack)
+                    seq_entropy = course_dist.entropy() + attack_dist.entropy()
 
                 if torch.any(seq_active):
                     new_log_probs.append(seq_log_prob[seq_active])
@@ -581,7 +605,15 @@ def ppo_update(
                 continue
             actor_grad_norm = global_grad_norm(actor_params)
             critic_grad_norm = global_grad_norm(critic_params)
-            nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            max_actor_grad_norm = float(getattr(args, "max_actor_grad_norm", 0.0) or 0.0)
+            max_critic_grad_norm = float(getattr(args, "max_critic_grad_norm", 0.0) or 0.0)
+            max_total_grad_norm = float(getattr(args, "max_grad_norm", 0.0) or 0.0)
+            if max_actor_grad_norm > 0.0:
+                nn.utils.clip_grad_norm_(actor_params, max_actor_grad_norm)
+            if max_critic_grad_norm > 0.0:
+                nn.utils.clip_grad_norm_(critic_params, max_critic_grad_norm)
+            if max_total_grad_norm > 0.0:
+                nn.utils.clip_grad_norm_(model.parameters(), max_total_grad_norm)
             optimizer.step()
 
             repaired = repair_non_finite_parameters(model)
@@ -665,9 +697,45 @@ def action_distribution_stats(
     attack_masks: np.ndarray,
     course_dim: int,
     attack_dim: int,
+    policy_attack_actions: Optional[np.ndarray] = None,
+    attack_policy_mode: str = "full_discrete",
+    attack_rule_mode: str = "none",
 ) -> Dict[str, float]:
     alive = alive_mask > 0.5
     stats: Dict[str, float] = {}
+    attack_policy_mode = str(attack_policy_mode).lower()
+    attack_rule_mode = str(attack_rule_mode).lower()
+
+    stats["attack_policy_mode_full_discrete"] = 1.0 if attack_policy_mode == "full_discrete" else 0.0
+    stats["attack_policy_mode_fire_or_not"] = 1.0 if attack_policy_mode == "fire_or_not" else 0.0
+    stats["attack_rule_mode_none"] = 1.0 if attack_rule_mode == "none" else 0.0
+    stats["attack_rule_mode_nearest_target"] = 1.0 if attack_rule_mode == "nearest_target" else 0.0
+
+    legal_nonzero = attack_masks[..., 1:] & alive[..., None]
+    legal_opportunity = np.any(legal_nonzero, axis=-1) & alive
+    legal_count = int(np.sum(legal_opportunity))
+    alive_count = int(np.sum(alive))
+    executed_nonzero = (attack_actions > 0) & alive
+    executed_fire_on_legal = executed_nonzero & legal_opportunity
+
+    stats["attack_opportunity_frac"] = float(legal_count / max(alive_count, 1))
+    stats["executed_fire_action_frac"] = float(np.sum(executed_nonzero) / max(alive_count, 1))
+    stats["no_fire_when_legal_frac"] = float(np.sum(legal_opportunity & (~executed_nonzero)) / max(legal_count, 1))
+    stats["opportunity_to_fire_ratio"] = float(np.sum(executed_fire_on_legal) / max(legal_count, 1))
+
+    if attack_policy_mode == "fire_or_not" and policy_attack_actions is not None:
+        fire_decision = (np.asarray(policy_attack_actions) > 0) & alive
+        no_fire_decision = (~fire_decision) & alive
+        stats["fire_decision_freq_00"] = float(np.sum(no_fire_decision) / max(alive_count, 1))
+        stats["fire_decision_freq_01"] = float(np.sum(fire_decision) / max(alive_count, 1))
+        if attack_rule_mode == "nearest_target":
+            stats["rule_selected_attack_nonzero_freq"] = float(np.sum(fire_decision & executed_nonzero) / max(alive_count, 1))
+        else:
+            stats["rule_selected_attack_nonzero_freq"] = float(np.sum(executed_nonzero) / max(alive_count, 1))
+    else:
+        stats["fire_decision_freq_00"] = 0.0
+        stats["fire_decision_freq_01"] = 0.0
+        stats["rule_selected_attack_nonzero_freq"] = 0.0
 
     if np.any(alive):
         selected_course = course_actions[alive]

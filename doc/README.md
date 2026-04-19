@@ -6,7 +6,7 @@ Recommended reading order:
 
 1. `MaCA_MAPPO_Action_Plan.md`
 2. `gpu_env_setup.md`
-3. `tutorial.md`
+3. `hmarl_script_usage.md`
 4. `MaCA环境说明.pdf`
 
 Current default training lane:

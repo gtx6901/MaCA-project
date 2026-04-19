@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from torch.distributions import Categorical
 
+from fighter_action_utils import FIGHTER_NUM
 from marl_env.mappo_env import MAPPOMaCAConfig, MAPPOMaCAEnv
 from marl_env.mappo_model import MAPPOModelConfig, TeamActorCritic
 
@@ -22,6 +23,7 @@ ROLLOUT_BUFFER_DTYPES = {
     "actor_h": np.float32,
     "course_action": np.int64,
     "attack_action": np.int64,
+    "policy_attack_action": np.int64,
     "mode_action": np.int64,
     "log_prob": np.float32,
     "mode_log_prob": np.float32,
@@ -68,6 +70,117 @@ def masked_categorical(logits: torch.Tensor, masks: torch.Tensor) -> Categorical
     return Categorical(logits=masked_logits)
 
 
+def _fire_decision_logits_from_attack_logits(attack_logits: torch.Tensor, attack_masks: torch.Tensor) -> torch.Tensor:
+    invalid_logit = torch.finfo(attack_logits.dtype).min
+    masked_logits = attack_logits.masked_fill(~attack_masks, invalid_logit)
+    no_fire_logit = masked_logits[:, 0]
+    fire_logit = torch.logsumexp(masked_logits[:, 1:], dim=-1)
+    has_legal_nonzero = torch.any(attack_masks[:, 1:], dim=-1)
+    fire_logit = torch.where(has_legal_nonzero, fire_logit, torch.full_like(fire_logit, invalid_logit))
+    return torch.stack([no_fire_logit, fire_logit], dim=-1)
+
+
+def _choose_nearest_target_attack(
+    attack_mask_row: np.ndarray,
+    visible_target_ids_row: np.ndarray,
+    prefer_long: bool,
+) -> int:
+    legal_nonzero = np.flatnonzero(attack_mask_row[1:]) + 1
+    if legal_nonzero.size <= 0:
+        return 0
+
+    # Action mapping: [1..10]=long missile on target id, [11..20]=short missile on target id.
+    for target_id_raw in visible_target_ids_row:
+        target_id = int(target_id_raw)
+        if target_id <= 0 or target_id > FIGHTER_NUM:
+            continue
+        long_idx = int(target_id)
+        short_idx = int(target_id + FIGHTER_NUM)
+        long_legal = long_idx < attack_mask_row.shape[0] and bool(attack_mask_row[long_idx])
+        short_legal = short_idx < attack_mask_row.shape[0] and bool(attack_mask_row[short_idx])
+        if prefer_long:
+            if long_legal:
+                return long_idx
+            if short_legal:
+                return short_idx
+        else:
+            if short_legal:
+                return short_idx
+            if long_legal:
+                return long_idx
+
+    long_candidates = legal_nonzero[(legal_nonzero >= 1) & (legal_nonzero <= FIGHTER_NUM)]
+    short_candidates = legal_nonzero[(legal_nonzero > FIGHTER_NUM)]
+    if prefer_long and long_candidates.size > 0:
+        return int(np.min(long_candidates))
+    if (not prefer_long) and short_candidates.size > 0:
+        return int(np.min(short_candidates))
+    return int(np.min(legal_nonzero))
+
+
+def _choose_best_logit_attack(attack_logits_row: torch.Tensor, attack_mask_row: np.ndarray) -> int:
+    legal_nonzero = np.flatnonzero(attack_mask_row[1:]) + 1
+    if legal_nonzero.size <= 0:
+        return 0
+    legal_idx_t = torch.as_tensor(legal_nonzero, dtype=torch.long, device=attack_logits_row.device)
+    best_rel = int(torch.argmax(attack_logits_row[legal_idx_t]).item())
+    return int(legal_nonzero[best_rel])
+
+
+def _map_fire_or_not_to_attack_actions(
+    fire_decision: np.ndarray,
+    attack_masks: np.ndarray,
+    visible_target_ids: np.ndarray,
+    attack_logits: torch.Tensor,
+    rule_mode: str,
+    prefer_long: bool,
+) -> np.ndarray:
+    out = np.zeros((fire_decision.shape[0],), dtype=np.int64)
+    for row_idx in range(fire_decision.shape[0]):
+        mask_row = attack_masks[row_idx]
+        if not np.any(mask_row[1:]):
+            out[row_idx] = 0
+            continue
+        if int(fire_decision[row_idx]) <= 0:
+            out[row_idx] = 0
+            continue
+
+        if rule_mode == "nearest_target":
+            out[row_idx] = _choose_nearest_target_attack(
+                attack_mask_row=mask_row,
+                visible_target_ids_row=visible_target_ids[row_idx],
+                prefer_long=prefer_long,
+            )
+        else:
+            out[row_idx] = _choose_best_logit_attack(attack_logits[row_idx], mask_row)
+    return out
+
+
+def _remap_full_discrete_attack_with_rule(
+    sampled_attack_action: np.ndarray,
+    attack_masks: np.ndarray,
+    visible_target_ids: np.ndarray,
+    rule_mode: str,
+    prefer_long: bool,
+) -> np.ndarray:
+    if rule_mode != "nearest_target":
+        return sampled_attack_action.astype(np.int64, copy=False)
+
+    remapped = sampled_attack_action.astype(np.int64, copy=True)
+    for row_idx in range(remapped.shape[0]):
+        action = int(remapped[row_idx])
+        mask_row = attack_masks[row_idx]
+        if action <= 0 or not np.any(mask_row[1:]):
+            remapped[row_idx] = 0
+            continue
+        remapped[row_idx] = _choose_nearest_target_attack(
+            attack_mask_row=mask_row,
+            visible_target_ids_row=visible_target_ids[row_idx],
+            prefer_long=prefer_long,
+        )
+    return remapped
+
+
 def build_env(args, seed_offset: int) -> MAPPOMaCAEnv:
     runtime_opponent = str(getattr(args, "runtime_maca_opponent", args.maca_opponent))
     runtime_max_step = int(getattr(args, "runtime_maca_max_step", args.maca_max_step))
@@ -102,7 +215,7 @@ def build_env(args, seed_offset: int) -> MAPPOMaCAEnv:
     )
 
 
-def sample_actions(model, batch, device, deterministic: bool = False):
+def sample_actions(model, batch, device, deterministic: bool = False, args=None):
     if torch.is_tensor(batch["local_obs"]):
         local_obs = batch["local_obs"].to(device=device, dtype=torch.float32)
     else:
@@ -127,7 +240,23 @@ def sample_actions(model, batch, device, deterministic: bool = False):
     flat_ids = agent_ids.reshape(-1)
     flat_attack_masks = attack_masks.reshape(-1, attack_masks.shape[-1])
     flat_attack_masks = ensure_valid_action_mask(flat_attack_masks)
+    flat_attack_masks_np = flat_attack_masks.cpu().numpy().astype(np.bool_, copy=False)
     flat_actor_h = actor_h.reshape(-1, actor_h.shape[-1])
+
+    if "rule_visible_target_ids" in batch:
+        if torch.is_tensor(batch["rule_visible_target_ids"]):
+            rule_visible_target_ids = batch["rule_visible_target_ids"].to(device=device, dtype=torch.long)
+        else:
+            rule_visible_target_ids = torch.as_tensor(
+                batch["rule_visible_target_ids"], dtype=torch.long, device=device
+            )
+        flat_visible_target_ids = rule_visible_target_ids.reshape(
+            rule_visible_target_ids.shape[0] * rule_visible_target_ids.shape[1],
+            rule_visible_target_ids.shape[-1],
+        )
+    else:
+        flat_visible_target_ids = torch.zeros((flat_attack_masks.shape[0], 0), dtype=torch.long, device=device)
+
     mode_actions = None
     if "mode_action" in batch:
         if torch.is_tensor(batch["mode_action"]):
@@ -151,17 +280,43 @@ def sample_actions(model, batch, device, deterministic: bool = False):
 
     attack_logits = model.attack_logits(next_actor_h, course_action, mode_actions=mode_actions)
     attack_logits = sanitize_logits(attack_logits)
-    attack_dist = masked_categorical(attack_logits, flat_attack_masks)
-    if deterministic:
-        attack_action = torch.argmax(attack_dist.logits, dim=-1)
-    else:
-        attack_action = attack_dist.sample()
+    attack_policy_mode = str(getattr(args, "attack_policy_mode", "full_discrete")).lower()
+    attack_rule_mode = str(getattr(args, "attack_rule_mode", "none")).lower()
+    attack_rule_prefer_long = bool(getattr(args, "attack_rule_prefer_long", True))
 
-    log_prob = course_dist.log_prob(course_action) + attack_dist.log_prob(attack_action)
-    entropy = course_dist.entropy() + attack_dist.entropy()
+    if attack_policy_mode == "fire_or_not":
+        fire_decision_logits = _fire_decision_logits_from_attack_logits(attack_logits, flat_attack_masks)
+        fire_dist = Categorical(logits=fire_decision_logits)
+        if deterministic:
+            policy_attack_action = torch.argmax(fire_decision_logits, dim=-1)
+        else:
+            policy_attack_action = fire_dist.sample()
+
+        executed_attack_np = _map_fire_or_not_to_attack_actions(
+            fire_decision=policy_attack_action.cpu().numpy().astype(np.int64, copy=False),
+            attack_masks=flat_attack_masks_np,
+            visible_target_ids=flat_visible_target_ids.cpu().numpy().astype(np.int64, copy=False),
+            attack_logits=attack_logits,
+            rule_mode=attack_rule_mode,
+            prefer_long=attack_rule_prefer_long,
+        )
+        attack_action = torch.as_tensor(executed_attack_np, dtype=torch.long, device=device)
+        log_prob = course_dist.log_prob(course_action) + fire_dist.log_prob(policy_attack_action)
+        entropy = course_dist.entropy() + fire_dist.entropy()
+    else:
+        attack_dist = masked_categorical(attack_logits, flat_attack_masks)
+        if deterministic:
+            sampled_attack = torch.argmax(attack_dist.logits, dim=-1)
+        else:
+            sampled_attack = attack_dist.sample()
+        attack_action = sampled_attack
+        policy_attack_action = sampled_attack
+        log_prob = course_dist.log_prob(course_action) + attack_dist.log_prob(policy_attack_action)
+        entropy = course_dist.entropy() + attack_dist.entropy()
 
     course_action = course_action.reshape(local_obs.shape[0], local_obs.shape[1])
     attack_action = attack_action.reshape(local_obs.shape[0], local_obs.shape[1])
+    policy_attack_action = policy_attack_action.reshape(local_obs.shape[0], local_obs.shape[1])
     log_prob = log_prob.reshape(local_obs.shape[0], local_obs.shape[1])
     entropy = entropy.reshape(local_obs.shape[0], local_obs.shape[1])
     next_actor_h = next_actor_h.reshape(local_obs.shape[0], local_obs.shape[1], -1)
@@ -169,6 +324,7 @@ def sample_actions(model, batch, device, deterministic: bool = False):
     return {
         "course_action": course_action,
         "attack_action": attack_action,
+        "policy_attack_action": policy_attack_action,
         "log_prob": log_prob,
         "entropy": entropy,
         "next_actor_h": next_actor_h,
@@ -269,6 +425,7 @@ def build_worker_buffer_shapes(rollout_steps: int, env_count: int, env_spec: dic
         "actor_h": (rollout_steps, env_count, num_agents, actor_hidden_dim),
         "course_action": (rollout_steps, env_count, num_agents),
         "attack_action": (rollout_steps, env_count, num_agents),
+        "policy_attack_action": (rollout_steps, env_count, num_agents),
         "mode_action": (rollout_steps, env_count, num_agents),
         "log_prob": (rollout_steps, env_count, num_agents),
         "mode_log_prob": (rollout_steps, env_count, num_agents),
@@ -359,11 +516,13 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                 actor_hidden_dim = worker_model.actor_hidden_dim
                 num_agents = int(env_spec["num_agents"])
                 use_obs_id_onehot = bool(env_spec.get("use_obs_id_onehot", False))
+                disable_high_level_mode = bool(getattr(args, "disable_high_level_mode", False))
                 mode_interval = int(env_spec.get("mode_interval", 8))
                 attack_dim = int(env_spec["attack_dim"])
                 final_local_obs_dim = int(env_spec["local_obs_dim"])
                 base_local_obs_dim = int(obs_batch[0]["local_obs"].shape[1])
                 global_state_dim = int(obs_batch[0]["global_state"].shape[0])
+                visible_target_slots = int(obs_batch[0].get("rule_visible_target_ids", np.zeros((num_agents, 0))).shape[1])
                 agent_id_eye = np.eye(num_agents, dtype=np.float32)
 
                 raw_local_obs_batch = np.empty((env_count, num_agents, base_local_obs_dim), dtype=np.float32)
@@ -372,6 +531,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                 attack_masks_batch = np.empty((env_count, num_agents, attack_dim), dtype=np.bool_)
                 alive_mask_batch = np.empty((env_count, num_agents), dtype=np.float32)
                 agent_ids_batch = np.empty((env_count, num_agents), dtype=np.int64)
+                rule_visible_target_ids_batch = np.zeros((env_count, num_agents, visible_target_slots), dtype=np.int64)
                 env_actions_batch = np.empty((env_count, num_agents, 2), dtype=np.int64)
 
                 rewards = np.zeros((env_count,), dtype=np.float32)
@@ -389,6 +549,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                 attack_masks_tensor = torch.from_numpy(attack_masks_batch)
                 alive_mask_tensor = torch.from_numpy(alive_mask_batch)
                 agent_ids_tensor = torch.from_numpy(agent_ids_batch)
+                rule_visible_target_ids_tensor = torch.from_numpy(rule_visible_target_ids_batch)
 
                 actor_h_batch = np.zeros((env_count, num_agents, actor_hidden_dim), dtype=np.float32)
                 actor_h_tensor = torch.from_numpy(actor_h_batch)
@@ -407,6 +568,11 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                         attack_masks_batch[env_idx] = obs["attack_masks"]
                         alive_mask_batch[env_idx] = obs["alive_mask"]
                         agent_ids_batch[env_idx] = obs["agent_ids"]
+                        if visible_target_slots > 0:
+                            rule_visible_target_ids_batch[env_idx] = obs.get(
+                                "rule_visible_target_ids",
+                                np.zeros((num_agents, visible_target_slots), dtype=np.int64),
+                            )
 
                     if use_obs_id_onehot:
                         local_obs_batch[:, :, :base_local_obs_dim] = raw_local_obs_batch
@@ -421,41 +587,50 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                             rnn_hidden_mismatch_count += int(np.count_nonzero(diff > 1e-5))
                             rnn_hidden_max_abs_diff = max(rnn_hidden_max_abs_diff, max_diff)
 
-                    mode_decision_mask = mode_steps_to_refresh <= 0
-                    with torch.no_grad():
-                        flat_actor_h_t = torch.as_tensor(
-                            actor_h_batch.reshape(-1, actor_hidden_dim),
-                            dtype=torch.float32,
-                            device=torch.device("cpu"),
-                        )
-                        mode_logits = worker_model.mode_head(flat_actor_h_t)
-                        mode_dist = Categorical(logits=mode_logits)
-                        sampled_mode_t = mode_dist.sample()
-                        sampled_mode = sampled_mode_t.reshape(env_count, num_agents).cpu().numpy()
-                        sampled_mode_log_prob = (
-                            mode_dist.log_prob(sampled_mode_t).reshape(env_count, num_agents).cpu().numpy()
-                        )
-                        prev_mode_t = torch.as_tensor(
-                            mode_action_batch.reshape(-1),
-                            dtype=torch.long,
-                            device=torch.device("cpu"),
-                        )
-                        prev_mode_log_prob = (
-                            mode_dist.log_prob(prev_mode_t).reshape(env_count, num_agents).cpu().numpy()
-                        )
+                    if disable_high_level_mode:
+                        mode_decision_mask = np.zeros((env_count, num_agents), dtype=np.bool_)
+                        mode_action_batch.fill(0)
+                        mode_log_prob_batch = np.zeros((env_count, num_agents), dtype=np.float32)
+                        mode_duration_batch.fill(0)
+                        mode_steps_to_refresh.fill(0)
+                    else:
+                        mode_decision_mask = mode_steps_to_refresh <= 0
+                        with torch.no_grad():
+                            flat_actor_h_t = torch.as_tensor(
+                                actor_h_batch.reshape(-1, actor_hidden_dim),
+                                dtype=torch.float32,
+                                device=torch.device("cpu"),
+                            )
+                            mode_logits = worker_model.mode_head(flat_actor_h_t)
+                            mode_dist = Categorical(logits=mode_logits)
+                            sampled_mode_t = mode_dist.sample()
+                            sampled_mode = sampled_mode_t.reshape(env_count, num_agents).cpu().numpy()
+                            sampled_mode_log_prob = (
+                                mode_dist.log_prob(sampled_mode_t).reshape(env_count, num_agents).cpu().numpy()
+                            )
+                            prev_mode_t = torch.as_tensor(
+                                mode_action_batch.reshape(-1),
+                                dtype=torch.long,
+                                device=torch.device("cpu"),
+                            )
+                            prev_mode_log_prob = (
+                                mode_dist.log_prob(prev_mode_t).reshape(env_count, num_agents).cpu().numpy()
+                            )
 
-                    mode_action_batch = np.where(mode_decision_mask, sampled_mode, mode_action_batch)
-                    mode_log_prob_batch = np.where(
-                        mode_decision_mask,
-                        sampled_mode_log_prob,
-                        prev_mode_log_prob,
-                    ).astype(np.float32, copy=False)
-                    mode_duration_batch = np.where(mode_decision_mask, 1, mode_duration_batch + 1).astype(np.int64, copy=False)
-                    mode_steps_to_refresh = np.where(
-                        mode_decision_mask,
-                        max(mode_interval - 1, 0),
-                        mode_steps_to_refresh - 1,
-                    ).astype(np.int64, copy=False)
+                        mode_action_batch = np.where(mode_decision_mask, sampled_mode, mode_action_batch)
+                        mode_log_prob_batch = np.where(
+                            mode_decision_mask,
+                            sampled_mode_log_prob,
+                            prev_mode_log_prob,
+                        ).astype(np.float32, copy=False)
+                        mode_duration_batch = np.where(mode_decision_mask, 1, mode_duration_batch + 1).astype(
+                            np.int64, copy=False
+                        )
+                        mode_steps_to_refresh = np.where(
+                            mode_decision_mask,
+                            max(mode_interval - 1, 0),
+                            mode_steps_to_refresh - 1,
+                        ).astype(np.int64, copy=False)
 
                     stacked = {
                         "local_obs": local_obs_tensor,
@@ -463,15 +638,17 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                         "attack_masks": attack_masks_tensor,
                         "alive_mask": alive_mask_tensor,
                         "agent_ids": agent_ids_tensor,
+                        "rule_visible_target_ids": rule_visible_target_ids_tensor,
                         "actor_h": actor_h_tensor,
                         "mode_action": torch.from_numpy(mode_action_batch),
                     }
 
                     with torch.no_grad():
-                        actions = sample_actions(worker_model, stacked, torch.device("cpu"), deterministic=False)
+                        actions = sample_actions(worker_model, stacked, torch.device("cpu"), deterministic=False, args=args)
 
                     course_action_np = actions["course_action"].numpy()
                     attack_action_np = actions["attack_action"].numpy()
+                    policy_attack_action_np = actions["policy_attack_action"].numpy()
                     log_prob_np = actions["log_prob"].numpy()
                     next_actor_h_np = actions["next_actor_h"].numpy()
                     env_actions_batch[:, :, 0] = course_action_np
@@ -485,6 +662,7 @@ def _collector_process_main(args, worker_idx: int, env_count: int, conn, env_spe
                     shared_views["actor_h"][step_idx] = actor_h_batch
                     shared_views["course_action"][step_idx] = course_action_np
                     shared_views["attack_action"][step_idx] = attack_action_np
+                    shared_views["policy_attack_action"][step_idx] = policy_attack_action_np
                     shared_views["mode_action"][step_idx] = mode_action_batch
                     shared_views["log_prob"][step_idx] = log_prob_np
                     shared_views["mode_log_prob"][step_idx] = mode_log_prob_batch

@@ -268,12 +268,16 @@ class MAPPOMaCAEnv:
         local_obs = np.zeros((self.num_agents, self.local_obs_dim), dtype=np.float32)
         attack_masks = np.zeros((self.num_agents, ATTACK_IND_NUM), dtype=np.bool_)
         alive_mask = np.zeros((self.num_agents,), dtype=np.float32)
+        rule_visible_target_ids = np.zeros((self.num_agents, self.max_visible_enemies), dtype=np.int64)
 
         for idx, fighter_raw_obs in enumerate(fighter_obs_list):
             attack_mask = build_attack_mask_from_raw(fighter_raw_obs)
             attack_masks[idx] = attack_mask
             alive = bool(fighter_raw_obs["alive"])
             alive_mask[idx] = 1.0 if alive else 0.0
+            sorted_targets = self._sorted_visible_targets(fighter_raw_obs) if alive else []
+            for slot_idx in range(min(self.max_visible_enemies, len(sorted_targets))):
+                rule_visible_target_ids[idx, slot_idx] = int(sorted_targets[slot_idx].get("id", 0))
             local_obs[idx] = self._build_local_obs(
                 agent_idx=idx,
                 fighter_raw_obs=fighter_raw_obs,
@@ -308,6 +312,7 @@ class MAPPOMaCAEnv:
             "attack_masks": attack_masks,
             "alive_mask": alive_mask,
             "agent_ids": agent_ids,
+            "rule_visible_target_ids": rule_visible_target_ids,
         }
 
     def _build_local_obs(
